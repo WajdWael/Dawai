@@ -11,11 +11,13 @@ import SwiftUI
 public struct CaregiverPatientDetailView: View {
     let beneficiary: BeneficiarySummary
     @Environment(\.dismiss) private var dismiss
+    @EnvironmentObject private var appState: AppState
+    @ObservedObject private var medicationService = MedicationService.shared
 
-    @State private var activeMedication = HomeMockData.activeMedication
-    @State private var upcomingDoses = HomeMockData.upcomingDoses
     @State private var showingCallAlert = false
     @State private var showingReportSheet = false
+    @State private var showingAddMedicationSheet = false
+    @State private var editingMedication: MedicationItem? = nil
 
     public init(beneficiary: BeneficiarySummary) {
         self.beneficiary = beneficiary
@@ -50,6 +52,14 @@ public struct CaregiverPatientDetailView: View {
             Button("تم", role: .cancel) {}
         } message: {
             Text("سيتم تفعيل سجل تقارير الالتزام الدوائي في المرحلة القادمة.")
+        }
+        .sheet(isPresented: $showingAddMedicationSheet) {
+            let caregiverUser = appState.currentIdentity ?? UserIdentity(role: .caregiver, displayName: "مقدم الرعاية", keyFingerprint: "cg_default")
+            MedicationFormView(mode: .add, currentUser: caregiverUser, targetPatient: beneficiary)
+        }
+        .sheet(item: $editingMedication) { med in
+            let caregiverUser = appState.currentIdentity ?? UserIdentity(role: .caregiver, displayName: "مقدم الرعاية", keyFingerprint: "cg_default")
+            MedicationFormView(mode: .edit(med), currentUser: caregiverUser, targetPatient: beneficiary)
         }
     }
 
@@ -105,7 +115,7 @@ public struct CaregiverPatientDetailView: View {
                     .font(.system(size: 20))
                     .foregroundStyle(.yellow)
 
-                Text("30 د تأخير، \(activeMedication.name)")
+                Text("30 د تأخير، \(medicationService.activeMedication?.name ?? "اسبرين")")
                     .font(.system(size: 19, weight: .bold))
                     .foregroundStyle(.white)
 
@@ -170,7 +180,7 @@ public struct CaregiverPatientDetailView: View {
                 Spacer()
 
                 Button {
-                    // Add medication
+                    showingAddMedicationSheet = true
                 } label: {
                     Image(systemName: "plus")
                         .font(.system(size: 16, weight: .bold))
@@ -179,86 +189,144 @@ public struct CaregiverPatientDetailView: View {
                         .background(Color.dawaiPrimary, in: Circle())
                 }
                 .buttonStyle(.plain)
+                .accessibilityLabel("إضافة دواء جديد للمستفيد")
             }
 
-            VStack(spacing: 16) {
-                HStack(alignment: .top, spacing: 14) {
-                    ZStack {
-                        RoundedRectangle(cornerRadius: 16, style: .continuous)
-                            .fill(Color.dawaiPrimary.opacity(0.12))
-                            .frame(width: 68, height: 68)
+            if let activeMedication = medicationService.activeMedication {
+                VStack(spacing: 16) {
+                    HStack(alignment: .top, spacing: 14) {
+                        ZStack {
+                            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                                .fill(activeMedication.isTaken ? Color.green.opacity(0.18) : Color.dawaiPrimary.opacity(0.12))
+                                .frame(width: 68, height: 68)
 
-                        Image(systemName: "pill.fill")
-                            .font(.system(size: 32))
-                            .foregroundStyle(Color.dawaiPrimary)
-                            .rotationEffect(.degrees(-45))
-                    }
-
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text(activeMedication.name)
-                            .font(.system(size: 22, weight: .bold))
-                            .foregroundStyle(.primary)
-
-                        Text(activeMedication.dosage)
-                            .font(.system(size: 15, weight: .medium))
-                            .foregroundStyle(.secondary)
-
-                        Text(activeMedication.timeString)
-                            .font(.system(size: 14, weight: .semibold))
-                            .foregroundStyle(Color.dawaiPrimary)
-                    }
-
-                    Spacer()
-
-                    Button {
-                        // Edit
-                    } label: {
-                        Image(systemName: "pencil")
-                            .font(.system(size: 14, weight: .semibold))
-                            .foregroundStyle(.secondary)
-                            .frame(width: 32, height: 32)
-                            .background(.ultraThinMaterial, in: Circle())
-                            .overlay(
-                                Circle().stroke(Color.black.opacity(0.08), lineWidth: 0.8)
-                            )
-                    }
-                    .buttonStyle(.plain)
-                }
-                .padding(.horizontal, 16)
-                .padding(.top, 16)
-
-                Button {
-                    withAnimation(.spring(response: 0.35, dampingFraction: 0.7)) {
-                        activeMedication.isTaken.toggle()
-                    }
-                } label: {
-                    HStack(spacing: 8) {
-                        if activeMedication.isTaken {
-                            Image(systemName: "checkmark.circle.fill")
-                                .font(.system(size: 18, weight: .bold))
-                            Text("تم تأكيد الجرعة")
-                                .font(.system(size: 18, weight: .bold))
-                        } else {
-                            Text("اخذت الدواء")
-                                .font(.system(size: 18, weight: .bold))
+                            Image(systemName: activeMedication.isTaken ? "checkmark.circle.fill" : "pill.fill")
+                                .font(.system(size: 32))
+                                .foregroundStyle(activeMedication.isTaken ? Color.green : Color.dawaiPrimary)
+                                .rotationEffect(activeMedication.isTaken ? .degrees(0) : .degrees(-45))
                         }
+
+                        VStack(alignment: .leading, spacing: 4) {
+                            HStack(spacing: 8) {
+                                Text(activeMedication.name)
+                                    .font(.system(size: 22, weight: .bold))
+                                    .foregroundStyle(.primary)
+
+                                if activeMedication.isTaken {
+                                    Button {
+                                        withAnimation(.spring(response: 0.35, dampingFraction: 0.7)) {
+                                            medicationService.toggleTaken(id: activeMedication.id)
+                                        }
+                                    } label: {
+                                        HStack(spacing: 4) {
+                                            Image(systemName: "checkmark")
+                                                .font(.system(size: 11, weight: .bold))
+                                            Text("تم أخذ الدواء")
+                                                .font(.system(size: 12, weight: .bold))
+                                        }
+                                        .foregroundStyle(Color.green)
+                                        .padding(.horizontal, 8)
+                                        .padding(.vertical, 3)
+                                        .background(Color.green.opacity(0.14), in: Capsule())
+                                    }
+                                    .buttonStyle(.plain)
+                                    .accessibilityLabel("إلغاء تأكيد أخذ الدواء")
+                                }
+                            }
+
+                            Text(activeMedication.dosage)
+                                .font(.system(size: 15, weight: .medium))
+                                .foregroundStyle(.secondary)
+
+                            Text(activeMedication.timeString)
+                                .font(.system(size: 14, weight: .semibold))
+                                .foregroundStyle(activeMedication.isTaken ? Color.green : Color.dawaiPrimary)
+                        }
+
+                        Spacer()
+
+                        // Edit Button on LEFT (UC-3: Pencil opens Edit Medication)
+                        Button {
+                            editingMedication = activeMedication
+                        } label: {
+                            Image(systemName: "pencil")
+                                .font(.system(size: 14, weight: .semibold))
+                                .foregroundStyle(.secondary)
+                                .frame(width: 32, height: 32)
+                                .background(.ultraThinMaterial, in: Circle())
+                                .overlay(
+                                    Circle().stroke(Color.black.opacity(0.08), lineWidth: 0.8)
+                                )
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("تعديل الدواء")
                     }
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 14)
-                    .background(activeMedication.isTaken ? Color.green : Color.dawaiPrimary)
-                    .foregroundStyle(.white)
-                    .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                    .padding(.horizontal, 16)
+                    .padding(.top, 16)
+                    .padding(.bottom, activeMedication.isTaken ? 16 : 0)
+
+                    // Dose Confirmation Action Button (Shown only when NOT taken)
+                    if !activeMedication.isTaken {
+                        Button {
+                            withAnimation(.spring(response: 0.35, dampingFraction: 0.7)) {
+                                medicationService.toggleTaken(id: activeMedication.id)
+                            }
+                        } label: {
+                            HStack(spacing: 8) {
+                                Image(systemName: "checkmark")
+                                    .font(.system(size: 16, weight: .bold))
+                                Text("اخذت الدواء")
+                                    .font(.system(size: 18, weight: .bold))
+                            }
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 14)
+                            .background(Color.dawaiPrimary)
+                            .foregroundStyle(.white)
+                            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                        }
+                        .buttonStyle(.plain)
+                        .padding(.horizontal, 16)
+                        .padding(.bottom, 16)
+                    }
                 }
-                .buttonStyle(.plain)
-                .padding(.horizontal, 16)
-                .padding(.bottom, 16)
+                .background(
+                    activeMedication.isTaken
+                        ? Color.green.opacity(0.18)
+                        : Color.clear
+                )
+                .background(.ultraThinMaterial)
+                .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 22, style: .continuous)
+                        .stroke(
+                            activeMedication.isTaken ? Color.green.opacity(0.5) : Color.dawaiGlassBorder,
+                            lineWidth: activeMedication.isTaken ? 1.5 : 1
+                        )
+                )
+            } else {
+                // Empty state card
+                VStack(spacing: 12) {
+                    Image(systemName: "pill.fill")
+                        .font(.system(size: 32))
+                        .foregroundStyle(Color.dawaiPrimary)
+
+                    Text("لا توجد أدوية مسجلة")
+                        .font(.system(size: 17, weight: .bold))
+                        .foregroundStyle(.primary)
+
+                    Text("اضغط على (+) في الأعلى لإضافة دواء جديد للمستفيد.")
+                        .font(.system(size: 14))
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity)
+                .padding(24)
+                .background(.ultraThinMaterial)
+                .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 22, style: .continuous)
+                        .stroke(Color.dawaiGlassBorder, lineWidth: 1)
+                )
             }
-            .background(.ultraThinMaterial)
-            .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: 22, style: .continuous)
-                    .stroke(Color.dawaiGlassBorder, lineWidth: 1)
-            )
         }
     }
 
@@ -271,8 +339,8 @@ public struct CaregiverPatientDetailView: View {
                 .foregroundStyle(.primary)
 
             VStack(spacing: 0) {
-                ForEach(upcomingDoses.indices, id: \.self) { index in
-                    let dose = upcomingDoses[index]
+                ForEach(medicationService.upcomingDoses.indices, id: \.self) { index in
+                    let dose = medicationService.upcomingDoses[index]
                     HStack {
                         HStack(spacing: 8) {
                             Text(dose.name)
@@ -287,7 +355,11 @@ public struct CaregiverPatientDetailView: View {
                         Spacer()
 
                         Button {
-                            // Edit
+                            if let med = medicationService.medications.first(where: { $0.id == dose.id }) {
+                                editingMedication = med
+                            } else {
+                                editingMedication = MedicationItem(name: dose.name, dosage: dose.dosage, timeString: dose.timeString)
+                            }
                         } label: {
                             Image(systemName: "pencil")
                                 .font(.system(size: 13, weight: .semibold))
@@ -299,11 +371,12 @@ public struct CaregiverPatientDetailView: View {
                                 )
                         }
                         .buttonStyle(.plain)
+                        .accessibilityLabel("تعديل الجرعة")
                     }
                     .padding(.vertical, 14)
                     .padding(.horizontal, 16)
 
-                    if index < upcomingDoses.count - 1 {
+                    if index < medicationService.upcomingDoses.count - 1 {
                         Divider()
                             .padding(.horizontal, 14)
                     }

@@ -23,7 +23,7 @@ public enum InvitationError: LocalizedError, Equatable {
             return "رمز الدعوة غير صالح أو غير موجود."
             
         case .tokenExpired:
-            return "انتهت صلاحية رابط الدعوة (صالحة لمدة 48 ساعة فقط). يرجى طلب رابط جديد."
+            return "انتهت صلاحية رابط الدعوة (صالحة لمدة 15 دقيقة فقط). يرجى إنشاء رابط جديد."
             
         case .incompatibleRoles(let initiatorRole, _):
             if initiatorRole == .patient {

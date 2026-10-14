@@ -16,7 +16,6 @@ public struct CaregiverHomeView: View {
 
     // UC-2 Sheets State
     @State private var showingCreateInvitationSheet = false
-    @State private var showingReceiveInvitationSheet = false
     @State private var showingSettingsSheet = false
 
     public init(identity: UserIdentity) {
@@ -46,9 +45,6 @@ public struct CaregiverHomeView: View {
             .environment(\.layoutDirection, .rightToLeft)
             .sheet(isPresented: $showingCreateInvitationSheet) {
                 CreateInvitationSheet(currentUser: identity)
-            }
-            .sheet(isPresented: $showingReceiveInvitationSheet) {
-                ReceiveInvitationSheet(currentUser: identity)
             }
             .sheet(isPresented: $showingSettingsSheet) {
                 IdentityDetailsSheet(identity: identity)
@@ -95,37 +91,20 @@ public struct CaregiverHomeView: View {
 
                 Spacer()
 
-                HStack(spacing: 8) {
-                    Button {
-                        showingReceiveInvitationSheet = true
-                    } label: {
-                        Image(systemName: "envelope.badge")
-                            .font(.system(size: 15, weight: .semibold))
-                            .foregroundStyle(Color.dawaiPrimary)
-                            .frame(width: 36, height: 36)
-                            .background(.ultraThinMaterial, in: Circle())
-                            .overlay(
-                                Circle().stroke(Color.dawaiGlassBorder, lineWidth: 1)
-                            )
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel("قبول دعوة مستفيد واردة")
-
-                    Button {
-                        showingCreateInvitationSheet = true
-                    } label: {
-                        Image(systemName: "plus")
-                            .font(.system(size: 16, weight: .bold))
-                            .foregroundStyle(Color.dawaiPrimary)
-                            .frame(width: 36, height: 36)
-                            .background(.ultraThinMaterial, in: Circle())
-                            .overlay(
-                                Circle().stroke(Color.dawaiGlassBorder, lineWidth: 1)
-                            )
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel("إنشاء دعوة مستفيد جديد")
+                Button {
+                    showingCreateInvitationSheet = true
+                } label: {
+                    Image(systemName: "plus")
+                        .font(.system(size: 16, weight: .bold))
+                        .foregroundStyle(Color.dawaiPrimary)
+                        .frame(width: 36, height: 36)
+                        .background(.ultraThinMaterial, in: Circle())
+                        .overlay(
+                            Circle().stroke(Color.dawaiGlassBorder, lineWidth: 1)
+                        )
                 }
+                .buttonStyle(.plain)
+                .accessibilityLabel("إنشاء دعوة مستفيد جديد")
             }
 
             // A. UC-2 S#6: Invitations Accepted by Patient (Pending Caregiver Confirmation)

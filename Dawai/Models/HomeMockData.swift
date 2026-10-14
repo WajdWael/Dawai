@@ -9,42 +9,69 @@
 import Foundation
 
 // MARK: - Medication Item Model
-public struct MedicationItem: Identifiable {
+public struct MedicationItem: Identifiable, Codable, Equatable {
     public let id: UUID
     public var name: String
     public var dosage: String
     public var timeString: String
+    public var scheduledDate: Date?
+    public var days: [String]
+    public var frequency: String
+    public var duration: String
+    public var instructions: String?
+    public var imageData: Data?
     public var isTaken: Bool
+    public var createdAt: Date
 
     public init(
         id: UUID = UUID(),
         name: String,
         dosage: String,
         timeString: String,
-        isTaken: Bool = false
+        scheduledDate: Date? = nil,
+        days: [String] = ["كل يوم"],
+        frequency: String = "مرة يوميًا",
+        duration: String = "دائم",
+        instructions: String? = nil,
+        imageData: Data? = nil,
+        isTaken: Bool = false,
+        createdAt: Date = Date()
     ) {
         self.id = id
         self.name = name
         self.dosage = dosage
         self.timeString = timeString
+        self.scheduledDate = scheduledDate
+        self.days = days
+        self.frequency = frequency
+        self.duration = duration
+        self.instructions = instructions
+        self.imageData = imageData
         self.isTaken = isTaken
+        self.createdAt = createdAt
     }
 }
 
 // MARK: - Upcoming Dose Model
-public struct UpcomingDose: Identifiable {
+public struct UpcomingDose: Identifiable, Codable, Equatable {
     public let id: UUID
     public var name: String
     public var timeString: String
+    public var dosage: String
+    public var isTaken: Bool
 
     public init(
         id: UUID = UUID(),
         name: String,
-        timeString: String
+        timeString: String,
+        dosage: String = "جرعة مجدولة",
+        isTaken: Bool = false
     ) {
         self.id = id
         self.name = name
         self.timeString = timeString
+        self.dosage = dosage
+        self.isTaken = isTaken
     }
 }
 

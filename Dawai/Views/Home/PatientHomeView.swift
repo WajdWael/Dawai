@@ -13,16 +13,15 @@ public struct PatientHomeView: View {
     let identity: UserIdentity
     @EnvironmentObject private var appState: AppState
     @ObservedObject private var relationshipService = RelationshipService.shared
-
-    @State private var remainingDoses = HomeMockData.patientRemainingDoses
-    @State private var activeMedication = HomeMockData.activeMedication
-    @State private var upcomingDoses = HomeMockData.upcomingDoses
+    @ObservedObject private var medicationService = MedicationService.shared
 
     // UC-2 Sheets State
     @State private var showingCreateInvitationSheet = false
-    @State private var showingReceiveInvitationSheet = false
     @State private var showingSettingsSheet = false
-    @State private var showingAddMedicationAlert = false
+
+    // UC-3 Add/Edit Medication State
+    @State private var showingAddMedicationSheet = false
+    @State private var editingMedication: MedicationItem? = nil
 
     public init(identity: UserIdentity) {
         self.identity = identity
@@ -42,9 +41,10 @@ public struct PatientHomeView: View {
                 .padding(.bottom, 24)
             }
 
-            // Notification Toast (UC-2 S#8)
-            if let toastMessage = relationshipService.notificationToastMessage {
+            // Notification Toast (UC-2 S#8 & UC-3 S#8)
+            if let toastMessage = medicationService.toastMessage ?? relationshipService.notificationToastMessage {
                 NotificationToastView(message: toastMessage) {
+                    medicationService.dismissToast()
                     relationshipService.dismissToast()
                 }
             }
@@ -54,16 +54,14 @@ public struct PatientHomeView: View {
         .sheet(isPresented: $showingCreateInvitationSheet) {
             CreateInvitationSheet(currentUser: identity)
         }
-        .sheet(isPresented: $showingReceiveInvitationSheet) {
-            ReceiveInvitationSheet(currentUser: identity)
-        }
         .sheet(isPresented: $showingSettingsSheet) {
             IdentityDetailsSheet(identity: identity)
         }
-        .alert("إضافة دواء جديد", isPresented: $showingAddMedicationAlert) {
-            Button("حسناً", role: .cancel) {}
-        } message: {
-            Text("سيتم تفعيل هذه الميزة قريباً مع ربط الواجهة الخلفية.")
+        .sheet(isPresented: $showingAddMedicationSheet) {
+            MedicationFormView(mode: .add, currentUser: identity)
+        }
+        .sheet(item: $editingMedication) { med in
+            MedicationFormView(mode: .edit(med), currentUser: identity)
         }
     }
 
@@ -100,7 +98,7 @@ public struct PatientHomeView: View {
     private var heroDoseCounterView: some View {
         HStack {
             Spacer()
-            Text("بقي \(remainingDoses) جرعات لليوم")
+            Text("بقي \(medicationService.remainingDoses) جرعات لليوم")
                 .font(.system(size: 22, weight: .bold, design: .rounded))
                 .foregroundStyle(.white)
             Spacer()
@@ -138,7 +136,7 @@ public struct PatientHomeView: View {
                 Spacer()
 
                 Button {
-                    showingAddMedicationAlert = true
+                    showingAddMedicationSheet = true
                 } label: {
                     Image(systemName: "plus")
                         .font(.system(size: 16, weight: .bold))
@@ -153,93 +151,144 @@ public struct PatientHomeView: View {
                 .accessibilityLabel("إضافة دواء جديد")
             }
 
-            VStack(spacing: 16) {
-                HStack(alignment: .top, spacing: 14) {
-                    // Pill Icon Frame on RIGHT (FIRST in HStack)
-                    ZStack {
-                        RoundedRectangle(cornerRadius: 16, style: .continuous)
-                            .fill(Color.dawaiPrimary.opacity(0.12))
-                            .frame(width: 68, height: 68)
+            if let activeMedication = medicationService.activeMedication {
+                VStack(spacing: 16) {
+                    HStack(alignment: .top, spacing: 14) {
+                        // Pill Icon Frame on RIGHT (FIRST in HStack)
+                        ZStack {
+                            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                                .fill(activeMedication.isTaken ? Color.green.opacity(0.18) : Color.dawaiPrimary.opacity(0.12))
+                                .frame(width: 68, height: 68)
 
-                        Image(systemName: "pill.fill")
-                            .font(.system(size: 32))
-                            .foregroundStyle(Color.dawaiPrimary)
-                            .rotationEffect(.degrees(-45))
-                    }
-
-                    // Details in CENTER
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text(activeMedication.name)
-                            .font(.system(size: 22, weight: .bold))
-                            .foregroundStyle(.primary)
-
-                        Text(activeMedication.dosage)
-                            .font(.system(size: 15, weight: .medium))
-                            .foregroundStyle(.secondary)
-
-                        Text(activeMedication.timeString)
-                            .font(.system(size: 14, weight: .semibold))
-                            .foregroundStyle(Color.dawaiPrimary)
-                    }
-
-                    Spacer()
-
-                    // Edit Button on LEFT
-                    Button {
-                        // Edit action
-                    } label: {
-                        Image(systemName: "pencil")
-                            .font(.system(size: 14, weight: .semibold))
-                            .foregroundStyle(.secondary)
-                            .frame(width: 32, height: 32)
-                            .background(.ultraThinMaterial, in: Circle())
-                            .overlay(
-                                Circle().stroke(Color.black.opacity(0.08), lineWidth: 0.8)
-                            )
-                    }
-                    .buttonStyle(.plain)
-                }
-                .padding(.horizontal, 16)
-                .padding(.top, 16)
-
-                // Dose Confirmation Action Button
-                Button {
-                    withAnimation(.spring(response: 0.35, dampingFraction: 0.7)) {
-                        activeMedication.isTaken.toggle()
-                        if activeMedication.isTaken && remainingDoses > 0 {
-                            remainingDoses -= 1
-                        } else if !activeMedication.isTaken {
-                            remainingDoses += 1
+                            Image(systemName: activeMedication.isTaken ? "checkmark.circle.fill" : "pill.fill")
+                                .font(.system(size: 32))
+                                .foregroundStyle(activeMedication.isTaken ? Color.green : Color.dawaiPrimary)
+                                .rotationEffect(activeMedication.isTaken ? .degrees(0) : .degrees(-45))
                         }
-                    }
-                } label: {
-                    HStack(spacing: 8) {
-                        if activeMedication.isTaken {
-                            Image(systemName: "checkmark.circle.fill")
-                                .font(.system(size: 18, weight: .bold))
-                            Text("تم أخذ الدواء")
-                                .font(.system(size: 18, weight: .bold))
-                        } else {
-                            Text("اخذت الدواء")
-                                .font(.system(size: 18, weight: .bold))
+
+                        // Details in CENTER
+                        VStack(alignment: .leading, spacing: 4) {
+                            HStack(spacing: 8) {
+                                Text(activeMedication.name)
+                                    .font(.system(size: 22, weight: .bold))
+                                    .foregroundStyle(.primary)
+
+                                if activeMedication.isTaken {
+                                    Button {
+                                        withAnimation(.spring(response: 0.35, dampingFraction: 0.7)) {
+                                            medicationService.toggleTaken(id: activeMedication.id)
+                                        }
+                                    } label: {
+                                        HStack(spacing: 4) {
+                                            Image(systemName: "checkmark")
+                                                .font(.system(size: 11, weight: .bold))
+                                            Text("تم أخذ الدواء")
+                                                .font(.system(size: 12, weight: .bold))
+                                        }
+                                        .foregroundStyle(Color.green)
+                                        .padding(.horizontal, 8)
+                                        .padding(.vertical, 3)
+                                        .background(Color.green.opacity(0.14), in: Capsule())
+                                    }
+                                    .buttonStyle(.plain)
+                                    .accessibilityLabel("إلغاء تأكيد أخذ الدواء")
+                                }
+                            }
+
+                            Text(activeMedication.dosage)
+                                .font(.system(size: 15, weight: .medium))
+                                .foregroundStyle(.secondary)
+
+                            Text(activeMedication.timeString)
+                                .font(.system(size: 14, weight: .semibold))
+                                .foregroundStyle(activeMedication.isTaken ? Color.green : Color.dawaiPrimary)
                         }
+
+                        Spacer()
+
+                        // Edit Button on LEFT (UC-3 S#1 Mockup Yellow Note: Pencil opens Edit Medication)
+                        Button {
+                            editingMedication = activeMedication
+                        } label: {
+                            Image(systemName: "pencil")
+                                .font(.system(size: 14, weight: .semibold))
+                                .foregroundStyle(.secondary)
+                                .frame(width: 32, height: 32)
+                                .background(.ultraThinMaterial, in: Circle())
+                                .overlay(
+                                    Circle().stroke(Color.black.opacity(0.08), lineWidth: 0.8)
+                                )
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("تعديل الدواء")
                     }
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 14)
-                    .background(activeMedication.isTaken ? Color.green : Color.dawaiPrimary)
-                    .foregroundStyle(.white)
-                    .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                    .padding(.horizontal, 16)
+                    .padding(.top, 16)
+                    .padding(.bottom, activeMedication.isTaken ? 16 : 0)
+
+                    // Dose Confirmation Action Button (Shown only when NOT taken)
+                    if !activeMedication.isTaken {
+                        Button {
+                            withAnimation(.spring(response: 0.35, dampingFraction: 0.7)) {
+                                medicationService.toggleTaken(id: activeMedication.id)
+                            }
+                        } label: {
+                            HStack(spacing: 8) {
+                                Image(systemName: "checkmark")
+                                    .font(.system(size: 16, weight: .bold))
+                                Text("اخذت الدواء")
+                                    .font(.system(size: 18, weight: .bold))
+                            }
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 14)
+                            .background(Color.dawaiPrimary)
+                            .foregroundStyle(.white)
+                            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                        }
+                        .buttonStyle(.plain)
+                        .padding(.horizontal, 16)
+                        .padding(.bottom, 16)
+                    }
                 }
-                .buttonStyle(.plain)
-                .padding(.horizontal, 16)
-                .padding(.bottom, 16)
+                .background(
+                    activeMedication.isTaken
+                        ? Color.green.opacity(0.18)
+                        : Color.clear
+                )
+                .background(.ultraThinMaterial)
+                .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 22, style: .continuous)
+                        .stroke(
+                            activeMedication.isTaken ? Color.green.opacity(0.5) : Color.dawaiGlassBorder,
+                            lineWidth: activeMedication.isTaken ? 1.5 : 1
+                        )
+                )
+            } else {
+                // Empty state card
+                VStack(spacing: 12) {
+                    Image(systemName: "pill.fill")
+                        .font(.system(size: 32))
+                        .foregroundStyle(Color.dawaiPrimary)
+
+                    Text("لا توجد أدوية مجدولة")
+                        .font(.system(size: 17, weight: .bold))
+                        .foregroundStyle(.primary)
+
+                    Text("اضغط على (+) في الأعلى لإضافة دواء وتحديد مواعيد الجرعات.")
+                        .font(.system(size: 14))
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                }
+                .frame(maxWidth: .infinity)
+                .padding(24)
+                .background(.ultraThinMaterial)
+                .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 22, style: .continuous)
+                        .stroke(Color.dawaiGlassBorder, lineWidth: 1)
+                )
             }
-            .background(.ultraThinMaterial)
-            .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: 22, style: .continuous)
-                    .stroke(Color.dawaiGlassBorder, lineWidth: 1)
-            )
         }
     }
 
@@ -252,8 +301,8 @@ public struct PatientHomeView: View {
                 .foregroundStyle(.primary)
 
             VStack(spacing: 0) {
-                ForEach(upcomingDoses.indices, id: \.self) { index in
-                    let dose = upcomingDoses[index]
+                ForEach(medicationService.upcomingDoses.indices, id: \.self) { index in
+                    let dose = medicationService.upcomingDoses[index]
                     HStack {
                         HStack(spacing: 8) {
                             Text(dose.name)
@@ -268,7 +317,11 @@ public struct PatientHomeView: View {
                         Spacer()
 
                         Button {
-                            // Edit
+                            if let med = medicationService.medications.first(where: { $0.id == dose.id }) {
+                                editingMedication = med
+                            } else {
+                                editingMedication = MedicationItem(name: dose.name, dosage: dose.dosage, timeString: dose.timeString)
+                            }
                         } label: {
                             Image(systemName: "pencil")
                                 .font(.system(size: 13, weight: .semibold))
@@ -280,11 +333,12 @@ public struct PatientHomeView: View {
                                 )
                         }
                         .buttonStyle(.plain)
+                        .accessibilityLabel("تعديل الجرعة")
                     }
                     .padding(.vertical, 14)
                     .padding(.horizontal, 16)
 
-                    if index < upcomingDoses.count - 1 {
+                    if index < medicationService.upcomingDoses.count - 1 {
                         Divider()
                             .padding(.horizontal, 14)
                     }
@@ -310,37 +364,20 @@ public struct PatientHomeView: View {
 
                 Spacer()
 
-                HStack(spacing: 8) {
-                    Button {
-                        showingReceiveInvitationSheet = true
-                    } label: {
-                        Image(systemName: "envelope.badge")
-                            .font(.system(size: 15, weight: .semibold))
-                            .foregroundStyle(Color.dawaiPrimary)
-                            .frame(width: 36, height: 36)
-                            .background(.ultraThinMaterial, in: Circle())
-                            .overlay(
-                                Circle().stroke(Color.dawaiGlassBorder, lineWidth: 1)
-                            )
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel("قبول دعوة اتصال واردة")
-
-                    Button {
-                        showingCreateInvitationSheet = true
-                    } label: {
-                        Image(systemName: "plus")
-                            .font(.system(size: 16, weight: .bold))
-                            .foregroundStyle(Color.dawaiPrimary)
-                            .frame(width: 36, height: 36)
-                            .background(.ultraThinMaterial, in: Circle())
-                            .overlay(
-                                Circle().stroke(Color.dawaiGlassBorder, lineWidth: 1)
-                            )
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel("إنشاء دعوة مقدم رعاية")
+                Button {
+                    showingCreateInvitationSheet = true
+                } label: {
+                    Image(systemName: "plus")
+                        .font(.system(size: 16, weight: .bold))
+                        .foregroundStyle(Color.dawaiPrimary)
+                        .frame(width: 36, height: 36)
+                        .background(.ultraThinMaterial, in: Circle())
+                        .overlay(
+                            Circle().stroke(Color.dawaiGlassBorder, lineWidth: 1)
+                        )
                 }
+                .buttonStyle(.plain)
+                .accessibilityLabel("إنشاء دعوة مقدم رعاية")
             }
 
             // A. UC-2 S#6: Invitations Accepted by Caregiver (Pending Patient Confirmation)

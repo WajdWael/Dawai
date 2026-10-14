@@ -74,7 +74,7 @@ public struct ConnectionInvitation: Codable, Identifiable, Equatable {
         initiatorRole: UserRole,
         initiatorKeyFingerprint: String,
         createdAt: Date = Date(),
-        expiresAt: Date = Date().addingTimeInterval(48 * 3600), // 48 Hours validity
+        expiresAt: Date = Date().addingTimeInterval(15 * 60), // 15 Minutes validity
         status: InvitationStatus = .pending,
         recipientId: String? = nil,
         recipientDisplayName: String? = nil,
