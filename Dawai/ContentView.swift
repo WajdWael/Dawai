@@ -9,6 +9,7 @@ import SwiftUI
 
 struct ContentView: View {
     @EnvironmentObject private var appState: AppState
+    @ObservedObject private var themeService = ThemeService.shared
 
     var body: some View {
         Group {
@@ -20,8 +21,13 @@ struct ContentView: View {
                     .transition(.opacity)
             }
         }
+        .preferredColorScheme(themeService.colorScheme)
         .environment(\.layoutDirection, .rightToLeft)
+        .environment(\.locale, Locale.dawaiArabic)
         .animation(.easeInOut(duration: 0.35), value: appState.isIdentified)
+        .onAppear {
+            themeService.applyThemeToApp()
+        }
     }
 }
 

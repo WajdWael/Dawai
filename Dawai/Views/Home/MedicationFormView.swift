@@ -42,22 +42,12 @@ public struct MedicationFormView: View {
     public let mode: MedicationFormMode
     public let currentUser: UserIdentity
     public var targetPatient: BeneficiarySummary?
+    public var onDismiss: (() -> Void)? = nil
 
     @Environment(\.dismiss) private var dismiss
     @Environment(\.colorScheme) private var colorScheme
     @ObservedObject private var medicationService = MedicationService.shared
-
-    private var fieldBackground: Color {
-        colorScheme == .dark
-            ? Color(red: 30/255, green: 33/255, blue: 38/255)
-            : Color(red: 238/255, green: 240/255, blue: 244/255)
-    }
-
-    private var cardBackground: Color {
-        colorScheme == .dark
-            ? Color(red: 26/255, green: 28/255, blue: 32/255)
-            : Color.white
-    }
+    @ObservedObject private var themeService = ThemeService.shared
 
     // Navigation Subscreen State
     @State private var currentSubscreen: MedicationSubscreen = .main
@@ -85,23 +75,28 @@ public struct MedicationFormView: View {
     public init(
         mode: MedicationFormMode = .add,
         currentUser: UserIdentity,
-        targetPatient: BeneficiarySummary? = nil
+        targetPatient: BeneficiarySummary? = nil,
+        onDismiss: (() -> Void)? = nil
     ) {
         self.mode = mode
         self.currentUser = currentUser
         self.targetPatient = targetPatient
+        self.onDismiss = onDismiss
+    }
+
+    @MainActor
+    private func closeForm() {
+        dismiss()
+        onDismiss?()
     }
 
     public var body: some View {
         NavigationStack {
             ZStack {
-                (colorScheme == .dark ? Color(red: 16/255, green: 18/255, blue: 22/255) : Color(red: 247/255, green: 248/255, blue: 250/255))
+                Color(uiColor: .systemGroupedBackground)
                     .ignoresSafeArea()
 
                 VStack(spacing: 0) {
-                    // Header Bar (Custom across all 5 screens)
-                    headerBarView
-
                     // Error Banner if validation fails (UC-3 Alternate Course)
                     if let err = errorMessage {
                         HStack(spacing: 8) {
@@ -134,27 +129,85 @@ public struct MedicationFormView: View {
                                 frequencyContent
                             }
                         }
-                        .padding(.horizontal, 20)
+                        .padding(.horizontal, 16)
                         .padding(.top, 16)
                         .padding(.bottom, 36)
                     }
                 }
             }
+            .navigationTitle(currentHeaderTitle)
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button {
+                        handleDismissOrBack()
+                    } label: {
+                        if currentSubscreen == .main {
+                            Text("إلغاء")
+                                .font(.system(size: 17, weight: .regular))
+                        } else {
+                            HStack(spacing: 3) {
+                                Image(systemName: "chevron.backward")
+                                    .font(.system(size: 14, weight: .semibold))
+                                Text(currentSubscreen == .doseTime ? "إلغاء" : "رجوع")
+                                    .font(.system(size: 17, weight: .regular))
+                            }
+                        }
+                    }
+                    .foregroundStyle(Color.dawaiPrimary)
+                }
+
+                ToolbarItem(placement: .confirmationAction) {
+                    Button {
+                        handleConfirmOrSave()
+                    } label: {
+                        Text(currentSubscreen == .main ? "حفظ" : "تم")
+                            .font(.system(size: 17, weight: .semibold))
+                    }
+                    .foregroundStyle(Color.dawaiPrimary)
+                    .disabled(isSaving)
+                }
+            }
+            .toolbarBackground(Color(uiColor: .systemGroupedBackground), for: .navigationBar)
+            .toolbarBackground(.visible, for: .navigationBar)
+            .preferredColorScheme(themeService.colorScheme)
             .environment(\.layoutDirection, .rightToLeft)
+            .environment(\.locale, Locale.dawaiArabic)
             .onAppear(perform: initializeFormValues)
             .fullScreenCover(isPresented: $showingCameraView) {
                 MedicationCameraView(capturedImageData: $imageData)
             }
             .alert("حذف الدواء", isPresented: $showingDeleteAlert) {
-                Button("حذف", role: .destructive) {
+                Button(
+                    currentUser.role == .caregiver || RelationshipService.shared.activeRelationships.isEmpty
+                        ? "حذف"
+                        : "إرسال طلب الحذف",
+                    role: .destructive
+                ) {
                     if case .edit(let existing) = mode {
-                        medicationService.deleteMedication(id: existing.id)
-                        dismiss()
+                        if currentUser.role == .caregiver {
+                            medicationService.deleteMedicationByCaregiver(id: existing.id, patientName: targetPatient?.name)
+                        } else if RelationshipService.shared.activeRelationships.isEmpty {
+                            medicationService.deleteMedicationDirectly(id: existing.id)
+                        } else {
+                            medicationService.requestMedicationDeletionByPatient(
+                                medicationId: existing.id,
+                                patient: currentUser,
+                                caregivers: RelationshipService.shared.activeRelationships
+                            )
+                        }
+                        closeForm()
                     }
                 }
                 Button("إلغاء", role: .cancel) {}
             } message: {
-                Text("هل أنت متأكد من رغبتك في حذف هذا الدواء؟ سيتم إلغاء جميع التذكيرات المرتبطة به.")
+                if currentUser.role == .caregiver {
+                    Text("هل أنت متأكد من رغبتك في حذف هذا الدواء؟ سيتم حذفه نهائياً من جدول المستفيد وإلغاء جميع التذكيرات.")
+                } else if RelationshipService.shared.activeRelationships.isEmpty {
+                    Text("هل أنت متأكد من رغبتك في حذف هذا الدواء؟ سيتم إلغاء جميع التذكيرات المرتبطة به.")
+                } else {
+                    Text("هل أنت متأكد من رغبتك في حذف هذا الدواء؟ سيتم إرسال طلب إلى مقدم الرعاية للموافقة على حذفه نهائياً.")
+                }
             }
         }
     }
@@ -182,55 +235,6 @@ public struct MedicationFormView: View {
         }
     }
 
-    // MARK: - 1. Custom Header Bar
-    private var headerBarView: some View {
-        HStack {
-            // Close / Back Button ('X')
-            Button {
-                handleDismissOrBack()
-            } label: {
-                Image(systemName: "xmark")
-                    .font(.system(size: 15, weight: .bold))
-                    .foregroundStyle(.secondary)
-                    .frame(width: 36, height: 36)
-                    .background(Color.black.opacity(0.06), in: Circle())
-            }
-            .buttonStyle(.plain)
-
-            Spacer()
-
-            // Screen Title
-            Text(currentHeaderTitle)
-                .font(.system(size: 20, weight: .bold))
-                .foregroundStyle(.primary)
-
-            Spacer()
-
-            // Save / Confirm Checkmark Button
-            Button {
-                handleConfirmOrSave()
-            } label: {
-                ZStack {
-                    Circle()
-                        .fill(Color.dawaiPrimary)
-                        .frame(width: 36, height: 36)
-
-                    Image(systemName: "checkmark")
-                        .font(.system(size: 16, weight: .bold))
-                        .foregroundStyle(.white)
-                }
-            }
-            .buttonStyle(.plain)
-            .disabled(isSaving)
-        }
-        .padding(.horizontal, 20)
-        .padding(.vertical, 14)
-        .background(colorScheme == .dark ? Color(red: 24/255, green: 26/255, blue: 30/255) : Color.white)
-        .overlay(
-            Divider(), alignment: .bottom
-        )
-    }
-
     private var currentHeaderTitle: String {
         switch currentSubscreen {
         case .main:
@@ -249,7 +253,7 @@ public struct MedicationFormView: View {
     private func handleDismissOrBack() {
         switch currentSubscreen {
         case .main:
-            dismiss()
+            closeForm()
         case .doseTime:
             currentSubscreen = .main
         case .duration, .days, .frequency:
@@ -269,123 +273,102 @@ public struct MedicationFormView: View {
         }
     }
 
-    // MARK: - 2. Screen 1: Main Form Content
+    // MARK: - 2. Screen 1: Main Form Content (Native iOS Inset Grouped)
     private var mainFormContent: some View {
-        VStack(alignment: .leading, spacing: 20) {
-            // Field 1: اسم الدواء
-            VStack(alignment: .leading, spacing: 8) {
-                Text("اسم الدواء")
-                    .font(.system(size: 16, weight: .bold))
-                    .foregroundStyle(.primary)
+        VStack(spacing: 20) {
+            // Section 1: Medication Name & Dosage
+            VStack(spacing: 0) {
+                HStack {
+                    Text("اسم الدواء")
+                        .font(.system(size: 17, weight: .regular))
+                        .foregroundStyle(.primary)
+                        .frame(width: 90, alignment: .leading)
 
-                TextField("ميتروفين", text: $name)
-                    .font(.system(size: 16))
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 14)
-                    .background(fieldBackground)
-                    .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-            }
-
-            // Field 2: الجرعة
-            VStack(alignment: .leading, spacing: 8) {
-                Text("الجرعة")
-                    .font(.system(size: 16, weight: .bold))
-                    .foregroundStyle(.primary)
-
-                TextField("نص حبه - حبتين، 10 مل", text: $dosage)
-                    .font(.system(size: 16))
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 14)
-                    .background(fieldBackground)
-                    .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-            }
-
-            // Field 3: مواعيد تناول الدواء
-            VStack(alignment: .leading, spacing: 8) {
-                Text("مواعيد تناول الدواء")
-                    .font(.system(size: 16, weight: .bold))
-                    .foregroundStyle(.primary)
-
-                if hasConfiguredTime {
-                    // Configured schedule summary chip
-                    HStack {
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text(timeFormatter.string(from: selectedTime))
-                                .font(.system(size: 17, weight: .bold))
-                                .foregroundStyle(Color.dawaiPrimary)
-
-                            Text("\(selectedFrequencySummary) • \(selectedDays.joined(separator: "، ")) • \(selectedDurationSummary)")
-                                .font(.system(size: 13, weight: .medium))
-                                .foregroundStyle(.secondary)
-                        }
-
-                        Spacer()
-
-                        Button {
-                            withAnimation(.easeInOut(duration: 0.2)) {
-                                currentSubscreen = .doseTime
-                            }
-                        } label: {
-                            Text("تعديل")
-                                .font(.system(size: 14, weight: .bold))
-                                .foregroundStyle(Color.dawaiPrimary)
-                                .padding(.horizontal, 12)
-                                .padding(.vertical, 6)
-                                .background(Color.dawaiPrimary.opacity(0.12), in: Capsule())
-                        }
-                        .buttonStyle(.plain)
-                    }
-                    .padding(14)
-                    .background(cardBackground)
-                    .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 12, style: .continuous)
-                            .stroke(Color.dawaiPrimary.opacity(0.3), lineWidth: 1)
-                    )
+                    TextField("مثال: ميتروفين", text: $name)
+                        .font(.system(size: 17))
                 }
+                .padding(.horizontal, 16)
+                .frame(minHeight: 48)
 
-                // Add Time Button (+ اضف وقت)
+                Divider().padding(.leading, 16)
+
+                HStack {
+                    Text("الجرعة")
+                        .font(.system(size: 17, weight: .regular))
+                        .foregroundStyle(.primary)
+                        .frame(width: 90, alignment: .leading)
+
+                    TextField("نصف حبة - حبتين، 10 مل", text: $dosage)
+                        .font(.system(size: 17))
+                }
+                .padding(.horizontal, 16)
+                .frame(minHeight: 48)
+            }
+            .background(Color(uiColor: .secondarySystemGroupedBackground))
+            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+
+            // Section 2: Dose Schedule (opens Dose Time subscreen)
+            VStack(spacing: 0) {
                 Button {
                     withAnimation(.easeInOut(duration: 0.2)) {
                         currentSubscreen = .doseTime
                     }
                 } label: {
                     HStack {
-                        Spacer()
-                        Text("+ اضف وقت")
-                            .font(.system(size: 16, weight: .bold))
+                        Text("وقت الجرعة")
+                            .font(.system(size: 17, weight: .regular))
                             .foregroundStyle(.primary)
+
                         Spacer()
+
+                        if hasConfiguredTime {
+                            VStack(alignment: .trailing, spacing: 2) {
+                                Text(timeFormatter.string(from: selectedTime))
+                                    .font(.system(size: 17, weight: .semibold))
+                                    .foregroundStyle(Color.dawaiPrimary)
+
+                                Text("\(selectedFrequencySummary) • \(selectedDays.joined(separator: "، "))")
+                                    .font(.system(size: 12))
+                                    .foregroundStyle(.secondary)
+                            }
+                        } else {
+                            Text("اضف وقت الجرعة")
+                                .font(.system(size: 17, weight: .regular))
+                                .foregroundStyle(.secondary)
+                        }
+
+                        Image(systemName: "chevron.forward")
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundStyle(Color(uiColor: .tertiaryLabel))
                     }
-                    .padding(.vertical, 14)
-                    .background(fieldBackground)
-                    .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                    .padding(.horizontal, 16)
+                    .frame(minHeight: 48)
                 }
                 .buttonStyle(.plain)
             }
+            .background(Color(uiColor: .secondarySystemGroupedBackground))
+            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
 
-            // Field 4: تعليمات إضافية
-            VStack(alignment: .leading, spacing: 8) {
-                Text("تعليمات إضافية")
-                    .font(.system(size: 16, weight: .bold))
-                    .foregroundStyle(.primary)
+            // Section 3: Additional Instructions
+            VStack(spacing: 0) {
+                HStack {
+                    Text("تعليمات")
+                        .font(.system(size: 17, weight: .regular))
+                        .foregroundStyle(.primary)
+                        .frame(width: 90, alignment: .leading)
 
-                TextField("مثال: بعد الإفطار", text: $instructions)
-                    .font(.system(size: 16))
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 14)
-                    .background(fieldBackground)
-                    .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                    TextField("مثال: بعد الإفطار", text: $instructions)
+                        .font(.system(size: 17))
+                }
+                .padding(.horizontal, 16)
+                .frame(minHeight: 48)
             }
+            .background(Color(uiColor: .secondarySystemGroupedBackground))
+            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
 
-            // Field 5: صورة الدواء
-            VStack(alignment: .leading, spacing: 8) {
-                Text("صورة الدواء")
-                    .font(.system(size: 16, weight: .bold))
-                    .foregroundStyle(.primary)
-
+            // Section 4: Medication Image
+            VStack(spacing: 0) {
                 if let data = imageData, let uiImage = UIImage(data: data) {
-                    // Preview of attached image
                     ZStack(alignment: .topTrailing) {
                         Image(uiImage: uiImage)
                             .resizable()
@@ -393,174 +376,162 @@ public struct MedicationFormView: View {
                             .frame(maxWidth: .infinity)
                             .frame(height: 140)
                             .clipped()
-                            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
 
-                        // Remove image button
                         Button {
-                            withAnimation {
-                                self.imageData = nil
-                            }
+                            withAnimation { self.imageData = nil }
                         } label: {
                             Image(systemName: "xmark.circle.fill")
-                                .font(.system(size: 24))
+                                .font(.system(size: 22))
                                 .foregroundStyle(.white, Color.black.opacity(0.6))
                                 .padding(8)
                         }
                         .buttonStyle(.plain)
                     }
                 } else {
-                    // Empty Camera Box
                     Button {
                         showingCameraView = true
                     } label: {
                         HStack {
-                            Spacer()
-                            Image(systemName: "camera.fill")
-                                .font(.system(size: 24))
-                                .foregroundStyle(Color.black.opacity(0.6))
+                            Image(systemName: "camera")
+                                .font(.system(size: 18))
+                                .foregroundStyle(Color.dawaiPrimary)
+                            Text("إضافة صورة الدواء")
+                                .font(.system(size: 17, weight: .regular))
+                                .foregroundStyle(Color.dawaiPrimary)
                             Spacer()
                         }
-                        .frame(height: 72)
-                        .background(fieldBackground)
-                        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                        .padding(.horizontal, 16)
+                        .frame(minHeight: 48)
                     }
                     .buttonStyle(.plain)
                 }
             }
+            .background(Color(uiColor: .secondarySystemGroupedBackground))
+            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
 
-            // Field 6: حذف الدواء (When editing)
+            // Section 5: Delete Medication (in Edit Mode, like Delete Alarm in Apple Clock)
             if mode.isEditing {
                 Button {
                     showingDeleteAlert = true
                 } label: {
-                    HStack(spacing: 8) {
+                    HStack {
                         Spacer()
-                        Image(systemName: "trash.fill")
-                            .font(.system(size: 15, weight: .bold))
                         Text("حذف الدواء")
-                            .font(.system(size: 16, weight: .bold))
+                            .font(.system(size: 17, weight: .regular))
+                            .foregroundStyle(Color.red)
                         Spacer()
                     }
-                    .foregroundStyle(.white)
-                    .padding(.vertical, 15)
-                    .background(Color.red)
-                    .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-                    .shadow(color: Color.red.opacity(0.3), radius: 8, x: 0, y: 4)
+                    .frame(minHeight: 48)
                 }
                 .buttonStyle(.plain)
-                .padding(.top, 16)
+                .background(Color(uiColor: .secondarySystemGroupedBackground))
+                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
             }
         }
     }
 
-    // MARK: - 3. Screen 2: Dose Time Content ("اضف وقت الجرعة")
+    // MARK: - 3. Screen 2: Dose Time Content ("اضف وقت الجرعة" - Pure Apple Clock Alarm Style)
     private var doseTimeContent: some View {
-        VStack(spacing: 20) {
-            // iOS Glass Mode Wheel Time Picker Card
-            ZStack {
-                // Subtle ambient glow behind the glass to create refraction depth in both Light & Dark modes
-                RoundedRectangle(cornerRadius: 22, style: .continuous)
-                    .fill(
-                        LinearGradient(
-                            colors: [
-                                Color.dawaiPrimary.opacity(colorScheme == .dark ? 0.22 : 0.12),
-                                Color.dawaiPrimary.opacity(colorScheme == .dark ? 0.06 : 0.03),
-                                Color.clear
-                            ],
-                            startPoint: .topLeading,
-                            endPoint: .bottomTrailing
-                        )
-                    )
-                    .blur(radius: 8)
+        VStack(spacing: 24) {
+            // Apple Clock Bare Wheel Time Picker (Completely native, no card, no glass, no shadow)
+            DatePicker("", selection: $selectedTime, displayedComponents: .hourAndMinute)
+                .datePickerStyle(.wheel)
+                .labelsHidden()
+                .frame(height: 216)
+                .frame(maxWidth: .infinity)
 
-                // Frosted glass wheel container
-                VStack {
-                    DatePicker("", selection: $selectedTime, displayedComponents: .hourAndMinute)
-                        .datePickerStyle(.wheel)
-                        .labelsHidden()
-                        .frame(height: 180)
-                        .frame(maxWidth: .infinity)
-                }
-                .padding(.vertical, 8)
-                .padding(.horizontal, 8)
-                .background(.ultraThinMaterial)
-                .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
-                .overlay(
-                    // Specular glass shine & rim lighting
-                    RoundedRectangle(cornerRadius: 22, style: .continuous)
-                        .strokeBorder(
-                            LinearGradient(
-                                colors: [
-                                    Color.white.opacity(colorScheme == .dark ? 0.45 : 0.9),
-                                    Color.white.opacity(colorScheme == .dark ? 0.12 : 0.3)
-                                ],
-                                startPoint: .topLeading,
-                                endPoint: .bottomTrailing
-                            ),
-                            lineWidth: 1.2
-                        )
-                )
-                .shadow(
-                    color: colorScheme == .dark ? Color.black.opacity(0.35) : Color.dawaiPrimary.opacity(0.08),
-                    radius: 14,
-                    x: 0,
-                    y: 6
-                )
-            }
-
-            // 3 Navigation Rows
-            VStack(spacing: 12) {
+            // Apple Clock Inset Grouped Section (Rows underneath)
+            VStack(spacing: 0) {
                 // Row 1: الايام
-                scheduleNavigationRow(
-                    title: "الايام",
-                    value: selectedDays.joined(separator: "، ")
-                ) {
-                    currentSubscreen = .days
+                Button {
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        currentSubscreen = .days
+                    }
+                } label: {
+                    HStack {
+                        Text("الايام")
+                            .font(.system(size: 17, weight: .regular))
+                            .foregroundStyle(.primary)
+
+                        Spacer()
+
+                        Text(selectedDays.joined(separator: "، "))
+                            .font(.system(size: 17, weight: .regular))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+
+                        Image(systemName: "chevron.forward")
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundStyle(Color(uiColor: .tertiaryLabel))
+                    }
+                    .padding(.horizontal, 16)
+                    .frame(minHeight: 48)
                 }
+                .buttonStyle(.plain)
+
+                Divider()
+                    .padding(.leading, 16)
 
                 // Row 2: التكرار خلال اليوم
-                scheduleNavigationRow(
-                    title: "التكرار خلال اليوم",
-                    value: selectedFrequencySummary
-                ) {
-                    currentSubscreen = .frequency
+                Button {
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        currentSubscreen = .frequency
+                    }
+                } label: {
+                    HStack {
+                        Text("التكرار خلال اليوم")
+                            .font(.system(size: 17, weight: .regular))
+                            .foregroundStyle(.primary)
+
+                        Spacer()
+
+                        Text(selectedFrequencySummary)
+                            .font(.system(size: 17, weight: .regular))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+
+                        Image(systemName: "chevron.forward")
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundStyle(Color(uiColor: .tertiaryLabel))
+                    }
+                    .padding(.horizontal, 16)
+                    .frame(minHeight: 48)
                 }
+                .buttonStyle(.plain)
+
+                Divider()
+                    .padding(.leading, 16)
 
                 // Row 3: المدة
-                scheduleNavigationRow(
-                    title: "المدة",
-                    value: selectedDurationSummary
-                ) {
-                    currentSubscreen = .duration
+                Button {
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        currentSubscreen = .duration
+                    }
+                } label: {
+                    HStack {
+                        Text("المدة")
+                            .font(.system(size: 17, weight: .regular))
+                            .foregroundStyle(.primary)
+
+                        Spacer()
+
+                        Text(selectedDurationSummary)
+                            .font(.system(size: 17, weight: .regular))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+
+                        Image(systemName: "chevron.forward")
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundStyle(Color(uiColor: .tertiaryLabel))
+                    }
+                    .padding(.horizontal, 16)
+                    .frame(minHeight: 48)
                 }
+                .buttonStyle(.plain)
             }
+            .background(Color(uiColor: .secondarySystemGroupedBackground))
+            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
         }
-    }
-
-    private func scheduleNavigationRow(title: String, value: String, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            HStack {
-                Text(title)
-                    .font(.system(size: 16, weight: .bold))
-                    .foregroundStyle(.primary)
-
-                Spacer()
-
-                Text(value)
-                    .font(.system(size: 15, weight: .medium))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-
-                Image(systemName: "chevron.left")
-                    .font(.system(size: 14, weight: .semibold))
-                    .foregroundStyle(Color.black.opacity(0.3))
-            }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 16)
-            .background(fieldBackground)
-            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-        }
-        .buttonStyle(.plain)
     }
 
     // MARK: - 4. Screen 3: Duration Content ("المدة")
@@ -573,69 +544,61 @@ public struct MedicationFormView: View {
     ]
 
     private var durationContent: some View {
-        VStack(spacing: 10) {
-            ForEach(durationOptions, id: \.self) { option in
-                selectionOptionRow(
-                    title: option,
-                    isSelected: selectedDuration == option
-                ) {
-                    selectedDuration = option
+        VStack(spacing: 16) {
+            VStack(spacing: 0) {
+                ForEach(durationOptions.indices, id: \.self) { index in
+                    let option = durationOptions[index]
+                    selectionOptionRow(
+                        title: option,
+                        isSelected: selectedDuration == option
+                    ) {
+                        selectedDuration = option
+                    }
+
+                    if index < durationOptions.count - 1 {
+                        Divider().padding(.leading, 16)
+                    }
                 }
             }
+            .background(Color(uiColor: .secondarySystemGroupedBackground))
+            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
 
-            // Custom "اخرى (ارقام فقط)"
-            VStack(alignment: .leading, spacing: 8) {
-                HStack {
-                    Text("اخرى (ارقام فقط)")
-                        .font(.system(size: 16, weight: .bold))
-                        .foregroundStyle(.primary)
-
-                    Spacer()
-
-                    if selectedDuration == "اخرى" {
-                        Image(systemName: "checkmark")
-                            .font(.system(size: 16, weight: .bold))
-                            .foregroundStyle(Color.dawaiPrimary)
-                    }
+            // Custom "أخرى (مدة مخصصة)"
+            VStack(spacing: 0) {
+                selectionOptionRow(
+                    title: "أخرى (مدة مخصصة)",
+                    isSelected: selectedDuration == "اخرى"
+                ) {
+                    selectedDuration = "اخرى"
                 }
 
                 if selectedDuration == "اخرى" {
+                    Divider().padding(.leading, 16)
+
                     HStack(spacing: 12) {
+                        Text("المدة")
+                            .font(.system(size: 17, weight: .regular))
+                            .foregroundStyle(.secondary)
+
                         TextField("مثال: 10", text: $customDurationValue)
                             .keyboardType(.numberPad)
-                            .font(.system(size: 15))
-                            .padding(.horizontal, 12)
-                            .padding(.vertical, 10)
-                            .background(cardBackground)
-                            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                            .font(.system(size: 17))
 
-                        Menu {
-                            Button("يوم") { customDurationUnit = "يوم" }
-                            Button("اسبوع") { customDurationUnit = "اسبوع" }
-                            Button("شهر") { customDurationUnit = "شهر" }
-                        } label: {
-                            HStack {
-                                Text(customDurationUnit)
-                                    .font(.system(size: 15, weight: .bold))
-                                Image(systemName: "chevron.down")
-                                    .font(.system(size: 12))
-                            }
-                            .foregroundStyle(Color.dawaiPrimary)
-                            .padding(.horizontal, 14)
-                            .padding(.vertical, 10)
-                            .background(cardBackground)
-                            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                        Spacer()
+
+                        Picker("الوحدة", selection: $customDurationUnit) {
+                            Text("يوم").tag("يوم")
+                            Text("أسبوع").tag("اسبوع")
+                            Text("شهر").tag("شهر")
                         }
+                        .pickerStyle(.menu)
                     }
+                    .padding(.horizontal, 16)
+                    .frame(minHeight: 48)
                 }
             }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 14)
-            .background(fieldBackground)
-            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-            .onTapGesture {
-                selectedDuration = "اخرى"
-            }
+            .background(Color(uiColor: .secondarySystemGroupedBackground))
+            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
         }
     }
 
@@ -660,16 +623,23 @@ public struct MedicationFormView: View {
     ]
 
     private var daysContent: some View {
-        VStack(spacing: 10) {
-            ForEach(dayOptions, id: \.self) { day in
+        VStack(spacing: 0) {
+            ForEach(dayOptions.indices, id: \.self) { index in
+                let day = dayOptions[index]
                 selectionOptionRow(
                     title: day,
                     isSelected: selectedDays.contains(day)
                 ) {
                     toggleDay(day)
                 }
+
+                if index < dayOptions.count - 1 {
+                    Divider().padding(.leading, 16)
+                }
             }
         }
+        .background(Color(uiColor: .secondarySystemGroupedBackground))
+        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
     }
 
     private func toggleDay(_ day: String) {
@@ -702,21 +672,30 @@ public struct MedicationFormView: View {
     }
 
     private var frequencyContent: some View {
-        VStack(spacing: 12) {
-            ForEach(standardFrequencyOptions, id: \.self) { freq in
-                selectionOptionRow(
-                    title: freq,
-                    isSelected: selectedFrequency == freq
-                ) {
-                    selectedFrequency = freq
+        VStack(spacing: 16) {
+            VStack(spacing: 0) {
+                ForEach(standardFrequencyOptions.indices, id: \.self) { index in
+                    let freq = standardFrequencyOptions[index]
+                    selectionOptionRow(
+                        title: freq,
+                        isSelected: selectedFrequency == freq
+                    ) {
+                        selectedFrequency = freq
+                    }
+
+                    if index < standardFrequencyOptions.count - 1 {
+                        Divider().padding(.leading, 16)
+                    }
                 }
             }
+            .background(Color(uiColor: .secondarySystemGroupedBackground))
+            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
 
-            // The last option: iOS Dropdown Menu for "حسب أيام محددة\أوقات محددة"
-            VStack(alignment: .leading, spacing: 12) {
+            // The last option: iOS Dropdown Menu for custom frequency
+            VStack(spacing: 0) {
                 HStack {
                     Text("حسب أيام محددة\\أوقات محددة")
-                        .font(.system(size: 16, weight: isCustomFrequencySelected ? .bold : .medium))
+                        .font(.system(size: 17, weight: .regular))
                         .foregroundStyle(.primary)
 
                     Spacer()
@@ -724,156 +703,65 @@ public struct MedicationFormView: View {
                     // Native iOS Dropdown Menu
                     Menu {
                         Section("التكرار اليومي") {
-                            Button {
-                                selectCustomFrequencyPreset("مرتان يومياً")
-                            } label: {
-                                HStack {
-                                    Text("مرتان يومياً")
-                                    if customFrequencyText == "مرتان يومياً" {
-                                        Image(systemName: "checkmark")
-                                    }
-                                }
+                            Button { selectCustomFrequencyPreset("مرتان يومياً") } label: {
+                                HStack { Text("مرتان يومياً"); if customFrequencyText == "مرتان يومياً" { Image(systemName: "checkmark") } }
                             }
-
-                            Button {
-                                selectCustomFrequencyPreset("3 مرات يومياً")
-                            } label: {
-                                HStack {
-                                    Text("3 مرات يومياً")
-                                    if customFrequencyText == "3 مرات يومياً" {
-                                        Image(systemName: "checkmark")
-                                    }
-                                }
+                            Button { selectCustomFrequencyPreset("3 مرات يومياً") } label: {
+                                HStack { Text("3 مرات يومياً"); if customFrequencyText == "3 مرات يومياً" { Image(systemName: "checkmark") } }
                             }
-
-                            Button {
-                                selectCustomFrequencyPreset("4 مرات يومياً")
-                            } label: {
-                                HStack {
-                                    Text("4 مرات يومياً")
-                                    if customFrequencyText == "4 مرات يومياً" {
-                                        Image(systemName: "checkmark")
-                                    }
-                                }
+                            Button { selectCustomFrequencyPreset("4 مرات يومياً") } label: {
+                                HStack { Text("4 مرات يومياً"); if customFrequencyText == "4 مرات يومياً" { Image(systemName: "checkmark") } }
                             }
                         }
 
                         Section("أيام محددة وفترات") {
-                            Button {
-                                selectCustomFrequencyPreset("كل يومين")
-                            } label: {
-                                HStack {
-                                    Text("كل يومين")
-                                    if customFrequencyText == "كل يومين" {
-                                        Image(systemName: "checkmark")
-                                    }
-                                }
+                            Button { selectCustomFrequencyPreset("كل يومين") } label: {
+                                HStack { Text("كل يومين"); if customFrequencyText == "كل يومين" { Image(systemName: "checkmark") } }
                             }
-
-                            Button {
-                                selectCustomFrequencyPreset("كل 3 أيام")
-                            } label: {
-                                HStack {
-                                    Text("كل 3 أيام")
-                                    if customFrequencyText == "كل 3 أيام" {
-                                        Image(systemName: "checkmark")
-                                    }
-                                }
+                            Button { selectCustomFrequencyPreset("كل 3 أيام") } label: {
+                                HStack { Text("كل 3 أيام"); if customFrequencyText == "كل 3 أيام" { Image(systemName: "checkmark") } }
                             }
-
-                            Button {
-                                selectCustomFrequencyPreset("أسبوعياً")
-                            } label: {
-                                HStack {
-                                    Text("أسبوعياً")
-                                    if customFrequencyText == "أسبوعياً" {
-                                        Image(systemName: "checkmark")
-                                    }
-                                }
+                            Button { selectCustomFrequencyPreset("أسبوعياً") } label: {
+                                HStack { Text("أسبوعياً"); if customFrequencyText == "أسبوعياً" { Image(systemName: "checkmark") } }
                             }
-
-                            Button {
-                                selectCustomFrequencyPreset("شهرياً")
-                            } label: {
-                                HStack {
-                                    Text("شهرياً")
-                                    if customFrequencyText == "شهرياً" {
-                                        Image(systemName: "checkmark")
-                                    }
-                                }
+                            Button { selectCustomFrequencyPreset("شهرياً") } label: {
+                                HStack { Text("شهرياً"); if customFrequencyText == "شهرياً" { Image(systemName: "checkmark") } }
                             }
                         }
 
                         Section("حسب الحاجة والمواعيد") {
-                            Button {
-                                selectCustomFrequencyPreset("عند اللزوم / الحاجة")
-                            } label: {
-                                HStack {
-                                    Text("عند اللزوم / الحاجة")
-                                    if customFrequencyText == "عند اللزوم / الحاجة" {
-                                        Image(systemName: "checkmark")
-                                    }
-                                }
+                            Button { selectCustomFrequencyPreset("عند اللزوم / الحاجة") } label: {
+                                HStack { Text("عند اللزوم / الحاجة"); if customFrequencyText == "عند اللزوم / الحاجة" { Image(systemName: "checkmark") } }
                             }
-
-                            Button {
-                                selectCustomFrequencyPreset("قبل النوم")
-                            } label: {
-                                HStack {
-                                    Text("قبل النوم")
-                                    if customFrequencyText == "قبل النوم" {
-                                        Image(systemName: "checkmark")
-                                    }
-                                }
+                            Button { selectCustomFrequencyPreset("قبل النوم") } label: {
+                                HStack { Text("قبل النوم"); if customFrequencyText == "قبل النوم" { Image(systemName: "checkmark") } }
                             }
-
-                            Button {
-                                selectCustomFrequencyPreset("مع الوجبات")
-                            } label: {
-                                HStack {
-                                    Text("مع الوجبات")
-                                    if customFrequencyText == "مع الوجبات" {
-                                        Image(systemName: "checkmark")
-                                    }
-                                }
+                            Button { selectCustomFrequencyPreset("مع الوجبات") } label: {
+                                HStack { Text("مع الوجبات"); if customFrequencyText == "مع الوجبات" { Image(systemName: "checkmark") } }
                             }
-
-                            Button {
-                                selectCustomFrequencyPreset("على الريق")
-                            } label: {
-                                HStack {
-                                    Text("على الريق")
-                                    if customFrequencyText == "على الريق" {
-                                        Image(systemName: "checkmark")
-                                    }
-                                }
-                            }
-                        }
-
-                        Section("إدخال مخصص") {
-                            Button {
-                                withAnimation(.easeInOut(duration: 0.2)) {
-                                    selectedFrequency = "حسب أيام محددة\\أوقات محددة"
-                                }
-                            } label: {
-                                Label("كتابة تكرار يدوي...", systemImage: "square.and.pencil")
+                            Button { selectCustomFrequencyPreset("على الريق") } label: {
+                                HStack { Text("على الريق"); if customFrequencyText == "على الريق" { Image(systemName: "checkmark") } }
                             }
                         }
                     } label: {
-                        HStack(spacing: 6) {
+                        HStack(spacing: 4) {
                             Text(customFrequencyMenuTitle)
-                                .font(.system(size: 14, weight: .semibold))
-                                .lineLimit(1)
-
+                                .font(.system(size: 16))
+                                .foregroundStyle(.secondary)
                             Image(systemName: "chevron.up.chevron.down")
-                                .font(.system(size: 12, weight: .medium))
+                                .font(.system(size: 12))
+                                .foregroundStyle(Color(uiColor: .tertiaryLabel))
                         }
-                        .foregroundStyle(Color.dawaiPrimary)
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 8)
-                        .background(Color.dawaiPrimary.opacity(0.12), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    }
+
+                    if isCustomFrequencySelected {
+                        Image(systemName: "checkmark")
+                            .font(.system(size: 15, weight: .semibold))
+                            .foregroundStyle(Color.dawaiPrimary)
                     }
                 }
+                .padding(.horizontal, 16)
+                .frame(minHeight: 48)
                 .contentShape(Rectangle())
                 .onTapGesture {
                     withAnimation(.easeInOut(duration: 0.2)) {
@@ -883,43 +771,29 @@ public struct MedicationFormView: View {
 
                 // Custom Data Entry Field (when selected)
                 if isCustomFrequencySelected {
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("أو أدخل التكرار يدوياً:")
-                            .font(.system(size: 13, weight: .semibold))
-                            .foregroundStyle(.secondary)
+                    Divider().padding(.leading, 16)
 
-                        HStack {
-                            TextField("مثال: 3 مرات يومياً، كل يومين، بعد الأكل", text: $customFrequencyText)
-                                .font(.system(size: 15))
+                    HStack {
+                        TextField("مثال: 3 مرات يومياً، بعد الأكل", text: $customFrequencyText)
+                            .font(.system(size: 17))
 
-                            if !customFrequencyText.isEmpty {
-                                Button {
-                                    customFrequencyText = ""
-                                } label: {
-                                    Image(systemName: "xmark.circle.fill")
-                                        .font(.system(size: 16))
-                                        .foregroundStyle(.secondary)
-                                }
-                                .buttonStyle(.plain)
+                        if !customFrequencyText.isEmpty {
+                            Button {
+                                customFrequencyText = ""
+                            } label: {
+                                Image(systemName: "xmark.circle.fill")
+                                    .font(.system(size: 16))
+                                    .foregroundStyle(Color(uiColor: .tertiaryLabel))
                             }
+                            .buttonStyle(.plain)
                         }
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 10)
-                        .background(cardBackground)
-                        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                                .stroke(Color.dawaiPrimary.opacity(0.35), lineWidth: 1)
-                        )
                     }
-                    .padding(.top, 2)
-                    .transition(.opacity.combined(with: .move(edge: .top)))
+                    .padding(.horizontal, 16)
+                    .frame(minHeight: 48)
                 }
             }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 14)
-            .background(fieldBackground)
-            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .background(Color(uiColor: .secondarySystemGroupedBackground))
+            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
         }
     }
 
@@ -950,21 +824,19 @@ public struct MedicationFormView: View {
         Button(action: action) {
             HStack {
                 Text(title)
-                    .font(.system(size: 16, weight: isSelected ? .bold : .medium))
+                    .font(.system(size: 17, weight: .regular))
                     .foregroundStyle(.primary)
 
                 Spacer()
 
                 if isSelected {
                     Image(systemName: "checkmark")
-                        .font(.system(size: 16, weight: .bold))
+                        .font(.system(size: 15, weight: .semibold))
                         .foregroundStyle(Color.dawaiPrimary)
                 }
             }
             .padding(.horizontal, 16)
-            .padding(.vertical, 16)
-            .background(fieldBackground)
-            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .frame(minHeight: 48)
         }
         .buttonStyle(.plain)
     }
@@ -974,7 +846,7 @@ public struct MedicationFormView: View {
         errorMessage = nil
         isSaving = true
 
-        Task {
+        Task { @MainActor in
             do {
                 let timeStr = timeFormatter.string(from: selectedTime)
                 let durationFinal = selectedDurationSummary
@@ -1021,7 +893,7 @@ public struct MedicationFormView: View {
                 }
 
                 isSaving = false
-                dismiss()
+                closeForm()
             } catch let error as MedicationError {
                 isSaving = false
                 withAnimation {
@@ -1038,7 +910,7 @@ public struct MedicationFormView: View {
 
     private var timeFormatter: DateFormatter {
         let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "ar_SA")
+        formatter.locale = Locale.dawaiArabic
         formatter.dateFormat = "hh:mm a"
         return formatter
     }

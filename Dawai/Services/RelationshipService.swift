@@ -31,14 +31,20 @@ public final class RelationshipService: ObservableObject {
 
     // MARK: - S#2: Create a Secure Invitation
     public func createInvitation(initiator: UserIdentity) -> ConnectionInvitation {
+        // Remove previous pending or expired invitations from this user before creating a new one
+        outgoingInvitations.removeAll {
+            $0.initiatorId == initiator.id && ($0.status == .pending || $0.isExpired)
+        }
+
         let invitation = ConnectionInvitation(
             initiatorId: initiator.id,
             initiatorDisplayName: initiator.displayName,
             initiatorRole: initiator.role,
             initiatorKeyFingerprint: initiator.keyFingerprint
         )
-        
+
         outgoingInvitations.append(invitation)
+        outgoingInvitations = deduplicate(outgoingInvitations)
         persistState()
         return invitation
     }
@@ -121,6 +127,35 @@ public final class RelationshipService: ObservableObject {
         persistState()
     }
 
+    // MARK: - Cancel / Reject Invitations (User Control)
+    public func rejectAcceptedInvitation(invitationId: UUID) {
+        let matchingTokens = Set(
+            outgoingInvitations.filter { $0.id == invitationId }.map { $0.token.lowercased() } +
+            incomingInvitations.filter { $0.id == invitationId }.map { $0.token.lowercased() }
+        )
+        outgoingInvitations.removeAll { $0.id == invitationId || matchingTokens.contains($0.token.lowercased()) }
+        incomingInvitations.removeAll { $0.id == invitationId || matchingTokens.contains($0.token.lowercased()) }
+        showToast("تم رفض الارتباط وإلغاء الدعوة.")
+        persistState()
+    }
+
+    public func cancelOutgoingInvitation(invitationId: UUID) {
+        let matchingTokens = Set(
+            outgoingInvitations.filter { $0.id == invitationId }.map { $0.token.lowercased() } +
+            incomingInvitations.filter { $0.id == invitationId }.map { $0.token.lowercased() }
+        )
+        outgoingInvitations.removeAll { $0.id == invitationId || matchingTokens.contains($0.token.lowercased()) }
+        incomingInvitations.removeAll { $0.id == invitationId || matchingTokens.contains($0.token.lowercased()) }
+        showToast("تم إلغاء الدعوة المرسلة بنجاح.")
+        persistState()
+    }
+
+    public func disconnect(relationshipId: UUID) {
+        activeRelationships.removeAll { $0.id == relationshipId }
+        showToast("تم إنهاء الارتباط بنجاح.")
+        persistState()
+    }
+
     // MARK: - S#6 & S#7: Initiator Confirms Connection (Mutual Handshake Complete)
     @discardableResult
     public func confirmConnection(invitationId: UUID, initiator: UserIdentity) throws -> ActiveRelationship {
@@ -171,6 +206,12 @@ public final class RelationshipService: ObservableObject {
             isActive: true
         )
 
+        // Remove confirmed invitation and any duplicate tokens
+        let tokenKey = invitation.token.lowercased()
+        outgoingInvitations.removeAll { $0.id == invitationId || $0.token.lowercased() == tokenKey }
+        incomingInvitations.removeAll { $0.id == invitationId || $0.token.lowercased() == tokenKey }
+
+        activeRelationships.removeAll { $0.patientId == patientId && $0.caregiverId == caregiverId }
         activeRelationships.append(relationship)
 
         // S#8: Notify both users
@@ -215,6 +256,12 @@ public final class RelationshipService: ObservableObject {
         notificationToastMessage = nil
     }
 
+    // MARK: - UC-6 S#6: Dose Confirmation Notification to Caregivers
+    public func notifyCaregiversDoseTaken(medicationName: String, patientName: String) {
+        guard !activeRelationships.isEmpty else { return }
+        showToast("قام \(patientName) بتأكيد أخذ جرعة دواء \"\(medicationName)\" في الموعد.")
+    }
+
     // MARK: - Internal Helpers & Persistence
     private func findInvitation(by token: String) -> ConnectionInvitation? {
         let cleaned = token.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -230,18 +277,36 @@ public final class RelationshipService: ObservableObject {
         }
         if let idx = incomingInvitations.firstIndex(where: { $0.id == invitation.id }) {
             incomingInvitations[idx] = invitation
-        } else {
-            incomingInvitations.append(invitation)
         }
+        // Note: do NOT append here — incoming invitations are added only via simulateIncomingInvitation
     }
 
-    private func showToast(_ message: String) {
+    public func showToast(_ message: String) {
         notificationToastMessage = message
     }
 
+    private func deduplicate(_ invitations: [ConnectionInvitation]) -> [ConnectionInvitation] {
+        var seenIds = Set<UUID>()
+        var seenTokens = Set<String>()
+        var result: [ConnectionInvitation] = []
+        for inv in invitations {
+            let tokenKey = inv.token.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            if !seenIds.contains(inv.id) && !seenTokens.contains(tokenKey) {
+                seenIds.insert(inv.id)
+                seenTokens.insert(tokenKey)
+                result.append(inv)
+            }
+        }
+        return result
+    }
+
     private func persistState() {
+        self.outgoingInvitations = deduplicate(outgoingInvitations)
+        self.incomingInvitations = deduplicate(incomingInvitations)
+
         do {
-            let invData = try JSONEncoder().encode(outgoingInvitations + incomingInvitations)
+            let combined = deduplicate(outgoingInvitations + incomingInvitations)
+            let invData = try JSONEncoder().encode(combined)
             UserDefaults.standard.set(invData, forKey: storageKeyInvitations)
 
             let relData = try JSONEncoder().encode(activeRelationships)
@@ -254,8 +319,13 @@ public final class RelationshipService: ObservableObject {
     private func loadPersistedState() {
         if let invData = UserDefaults.standard.data(forKey: storageKeyInvitations),
            let allInvs = try? JSONDecoder().decode([ConnectionInvitation].self, from: invData) {
-            self.outgoingInvitations = allInvs.filter { $0.recipientId == nil || $0.status == .accepted || $0.status == .confirmed }
-            self.incomingInvitations = allInvs.filter { $0.recipientId != nil }
+            let uniqueInvs = deduplicate(allInvs)
+            // Outgoing = invitations this user initiated (no recipientId = pending, or accepted/confirmed)
+            self.outgoingInvitations = deduplicate(uniqueInvs.filter { $0.recipientId == nil || $0.status == .accepted || $0.status == .confirmed })
+            // Incoming = invitations received by someone else (has a recipient, but NOT confirmed as outgoing)
+            let outgoingIds = Set(self.outgoingInvitations.map { $0.id })
+            let outgoingTokens = Set(self.outgoingInvitations.map { $0.token.lowercased() })
+            self.incomingInvitations = deduplicate(uniqueInvs.filter { !outgoingIds.contains($0.id) && !outgoingTokens.contains($0.token.lowercased()) && $0.recipientId != nil })
         }
 
         if let relData = UserDefaults.standard.data(forKey: storageKeyRelationships),
@@ -270,5 +340,12 @@ public final class RelationshipService: ObservableObject {
         activeRelationships.removeAll()
         UserDefaults.standard.removeObject(forKey: storageKeyInvitations)
         UserDefaults.standard.removeObject(forKey: storageKeyRelationships)
+    }
+
+    /// Removes stale pending invitations for a given user — call on sheet open to clear accumulated state.
+    public func clearStalePendingInvitations(for userId: String) {
+        outgoingInvitations.removeAll { $0.initiatorId == userId && ($0.status == .pending || $0.isExpired) }
+        outgoingInvitations = deduplicate(outgoingInvitations)
+        persistState()
     }
 }

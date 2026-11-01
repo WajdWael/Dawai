@@ -55,7 +55,7 @@ public struct NotificationToastView: View {
         .clipShape(Capsule())
         .overlay(
             Capsule()
-                .stroke(Color.white.opacity(0.8), lineWidth: 1)
+                .stroke(Color.dawaiGlassBorder, lineWidth: 1)
         )
         .padding(.horizontal, 20)
         .padding(.top, 8)

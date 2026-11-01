@@ -18,8 +18,8 @@ public struct RoleSelectionView: View {
 
     public var body: some View {
         ZStack {
-            // Screen Background: soft clean slate
-            Color(red: 243.0 / 255.0, green: 245.0 / 255.0, blue: 249.0 / 255.0)
+            // Screen Background: adaptive slate gray in light mode, deep dark in dark mode
+            Color.dawaiBackground
                 .ignoresSafeArea()
 
             VStack(alignment: .leading, spacing: 20) {
@@ -79,6 +79,7 @@ public struct RoleSelectionView: View {
             }
         }
         .environment(\.layoutDirection, .rightToLeft)
+        .environment(\.locale, Locale.dawaiArabic)
         .navigationBarTitleDisplayMode(.inline)
         .toolbar(.hidden, for: .navigationBar)
     }
@@ -122,8 +123,12 @@ private struct ArabicRoleCard: View {
             .padding(.vertical, 22)
             .padding(.horizontal, 24)
             .frame(maxWidth: .infinity)
-            .background(Color.white)
+            .background(Color(uiColor: .secondarySystemGroupedBackground))
             .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 24, style: .continuous)
+                    .stroke(Color.dawaiGlassBorder, lineWidth: 1)
+            )
             .shadow(color: Color.black.opacity(0.03), radius: 8, x: 0, y: 3)
             .scaleEffect(isPressed ? 0.98 : 1.0)
             .animation(.spring(response: 0.25, dampingFraction: 0.7), value: isPressed)

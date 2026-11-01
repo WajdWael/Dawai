@@ -19,6 +19,26 @@ public final class AppState: ObservableObject {
 
     /// Pending invitation token received via deep link (UC-2 S#4)
     @Published public var pendingInviteToken: String? = nil
+
+    /// Pending medication ID for dose confirmation via notification tap (UC-4 S#4)
+    @Published public var pendingDoseConfirmationMedicationId: UUID? = nil
+
+    /// Pending beneficiary to navigate to upon tapping missed-dose notification (UC-5 S#5)
+    @Published public var pendingCaregiverBeneficiaryToOpen: BeneficiarySummary? = nil
+
+    /// Triggers the dose confirmation screen for a specific medication (UC-4 S#4 & S#5)
+    public func openDoseConfirmation(for medicationId: UUID) {
+        withAnimation(.easeInOut(duration: 0.3)) {
+            self.pendingDoseConfirmationMedicationId = medicationId
+        }
+    }
+
+    /// Triggers navigation to patient detail screen for missed-dose review (UC-5 S#5)
+    public func openCaregiverPatientDetail(for beneficiary: BeneficiarySummary) {
+        withAnimation(.easeInOut(duration: 0.3)) {
+            self.pendingCaregiverBeneficiaryToOpen = beneficiary
+        }
+    }
     
     private let identityService: IdentityService
 

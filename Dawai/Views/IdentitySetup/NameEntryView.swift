@@ -128,6 +128,7 @@ public struct NameEntryView: View {
             }
         }
         .environment(\.layoutDirection, .rightToLeft)
+        .environment(\.locale, Locale.dawaiArabic)
         .safeAreaInset(edge: .bottom) {
             VStack(spacing: 0) {
                 Divider()

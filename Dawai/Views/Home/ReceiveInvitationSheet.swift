@@ -12,6 +12,7 @@ import SwiftUI
 public struct ReceiveInvitationSheet: View {
     let currentUser: UserIdentity
     @ObservedObject private var relationshipService = RelationshipService.shared
+    @ObservedObject private var themeService = ThemeService.shared
     @Environment(\.dismiss) private var dismiss
 
     @State private var tokenInput: String = ""
@@ -126,7 +127,7 @@ public struct ReceiveInvitationSheet: View {
                         .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
                         .overlay(
                             RoundedRectangle(cornerRadius: 20, style: .continuous)
-                                .stroke(Color.white.opacity(0.8), lineWidth: 1)
+                                .stroke(Color.dawaiGlassBorder, lineWidth: 1)
                         )
                     }
 
@@ -142,7 +143,7 @@ public struct ReceiveInvitationSheet: View {
 
                                 Label("صالح تشفيرياً", systemImage: "checkmark.seal.fill")
                                     .font(.system(size: 13, weight: .bold))
-                                    .foregroundStyle(.green)
+                                    .foregroundStyle(Color.dawaiTaken)
                             }
 
                             Divider()
@@ -221,7 +222,7 @@ public struct ReceiveInvitationSheet: View {
                         .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
                         .overlay(
                             RoundedRectangle(cornerRadius: 22, style: .continuous)
-                                .stroke(Color.white.opacity(0.8), lineWidth: 1)
+                                .stroke(Color.dawaiGlassBorder, lineWidth: 1)
                         )
                     }
 
@@ -255,8 +256,10 @@ public struct ReceiveInvitationSheet: View {
                 .padding(.horizontal, 20)
                 .padding(.bottom, 24)
             }
-            .background(Color(red: 243.0 / 255.0, green: 245.0 / 255.0, blue: 249.0 / 255.0).ignoresSafeArea())
+            .background(Color.dawaiBackground.ignoresSafeArea())
+            .preferredColorScheme(themeService.colorScheme)
             .environment(\.layoutDirection, .rightToLeft)
+            .environment(\.locale, Locale.dawaiArabic)
             .navigationTitle("قبول دعوة")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {

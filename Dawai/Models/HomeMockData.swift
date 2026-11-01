@@ -21,7 +21,13 @@ public struct MedicationItem: Identifiable, Codable, Equatable {
     public var instructions: String?
     public var imageData: Data?
     public var isTaken: Bool
+    public var takenAt: Date?
     public var createdAt: Date
+    public var isPendingDeletion: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case id, name, dosage, timeString, scheduledDate, days, frequency, duration, instructions, imageData, isTaken, takenAt, createdAt, isPendingDeletion
+    }
 
     public init(
         id: UUID = UUID(),
@@ -35,7 +41,9 @@ public struct MedicationItem: Identifiable, Codable, Equatable {
         instructions: String? = nil,
         imageData: Data? = nil,
         isTaken: Bool = false,
-        createdAt: Date = Date()
+        takenAt: Date? = nil,
+        createdAt: Date = Date(),
+        isPendingDeletion: Bool = false
     ) {
         self.id = id
         self.name = name
@@ -48,7 +56,71 @@ public struct MedicationItem: Identifiable, Codable, Equatable {
         self.instructions = instructions
         self.imageData = imageData
         self.isTaken = isTaken
+        self.takenAt = takenAt
         self.createdAt = createdAt
+        self.isPendingDeletion = isPendingDeletion
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        name = try container.decode(String.self, forKey: .name)
+        dosage = try container.decode(String.self, forKey: .dosage)
+        timeString = try container.decode(String.self, forKey: .timeString)
+        scheduledDate = try container.decodeIfPresent(Date.self, forKey: .scheduledDate)
+        days = try container.decodeIfPresent([String].self, forKey: .days) ?? ["كل يوم"]
+        frequency = try container.decodeIfPresent(String.self, forKey: .frequency) ?? "مرة يوميًا"
+        duration = try container.decodeIfPresent(String.self, forKey: .duration) ?? "دائم"
+        instructions = try container.decodeIfPresent(String.self, forKey: .instructions)
+        imageData = try container.decodeIfPresent(Data.self, forKey: .imageData)
+        isTaken = try container.decodeIfPresent(Bool.self, forKey: .isTaken) ?? false
+        takenAt = try container.decodeIfPresent(Date.self, forKey: .takenAt)
+        createdAt = try container.decodeIfPresent(Date.self, forKey: .createdAt) ?? Date()
+        isPendingDeletion = try container.decodeIfPresent(Bool.self, forKey: .isPendingDeletion) ?? false
+    }
+}
+
+// MARK: - Use-Case 11 (UC-11): Medication Deletion Request Model
+public struct MedicationDeletionRequest: Identifiable, Codable, Equatable {
+    public let id: UUID
+    public let medicationId: UUID
+    public let medicationName: String
+    public let dosage: String
+    public let timeString: String
+    public let patientId: String
+    public let patientDisplayName: String
+    public let caregiverId: String?
+    public let requestedAt: Date
+    public var status: RequestStatus
+
+    public enum RequestStatus: String, Codable {
+        case pending
+        case approved
+        case rejected
+    }
+
+    public init(
+        id: UUID = UUID(),
+        medicationId: UUID,
+        medicationName: String,
+        dosage: String,
+        timeString: String,
+        patientId: String,
+        patientDisplayName: String,
+        caregiverId: String? = nil,
+        requestedAt: Date = Date(),
+        status: RequestStatus = .pending
+    ) {
+        self.id = id
+        self.medicationId = medicationId
+        self.medicationName = medicationName
+        self.dosage = dosage
+        self.timeString = timeString
+        self.patientId = patientId
+        self.patientDisplayName = patientDisplayName
+        self.caregiverId = caregiverId
+        self.requestedAt = requestedAt
+        self.status = status
     }
 }
 
@@ -96,13 +168,16 @@ public struct CaregiverLink: Identifiable {
 }
 
 // MARK: - Beneficiary Summary Model (For Caregiver View)
-public struct BeneficiarySummary: Identifiable {
+public struct BeneficiarySummary: Identifiable, Equatable {
     public let id: UUID
     public var name: String
     public var hasDelayAlert: Bool
     public var delayNotice: String?
     public var scheduledTime: String?
     public var isInvitation: Bool
+    public var delayedMedicationName: String?
+    public var delayedDosage: String?
+    public var phoneNumber: String?
 
     public init(
         id: UUID = UUID(),
@@ -110,7 +185,10 @@ public struct BeneficiarySummary: Identifiable {
         hasDelayAlert: Bool = false,
         delayNotice: String? = nil,
         scheduledTime: String? = nil,
-        isInvitation: Bool = false
+        isInvitation: Bool = false,
+        delayedMedicationName: String? = nil,
+        delayedDosage: String? = nil,
+        phoneNumber: String? = "0501234567"
     ) {
         self.id = id
         self.name = name
@@ -118,6 +196,9 @@ public struct BeneficiarySummary: Identifiable {
         self.delayNotice = delayNotice
         self.scheduledTime = scheduledTime
         self.isInvitation = isInvitation
+        self.delayedMedicationName = delayedMedicationName
+        self.delayedDosage = delayedDosage
+        self.phoneNumber = phoneNumber
     }
 }
 
@@ -134,8 +215,8 @@ public enum HomeMockData {
     )
 
     public static let upcomingDoses: [UpcomingDose] = [
-        UpcomingDose(name: "ميترفين", timeString: "12:00 ص"),
-        UpcomingDose(name: "اسبرين", timeString: "12:00 ص")
+        UpcomingDose(name: "ميترفين", timeString: "12:00 ص", dosage: "حبة واحدة بعد الأكل", isTaken: false),
+        UpcomingDose(name: "فيتامين د", timeString: "10:00 ص", dosage: "قطرة واحدة يوميًا", isTaken: false)
     ]
 
     public static let patientCaregivers: [CaregiverLink] = [
@@ -148,8 +229,11 @@ public enum HomeMockData {
             name: "عمر",
             hasDelayAlert: true,
             delayNotice: "30 د تأخير، اسبرين (500 ملغ)",
-            scheduledTime: "11:30 PM",
-            isInvitation: false
+            scheduledTime: "11:30 م",
+            isInvitation: false,
+            delayedMedicationName: "اسبرين",
+            delayedDosage: "500 ملغ",
+            phoneNumber: "0501234567"
         ),
         BeneficiarySummary(
             name: "خلود",

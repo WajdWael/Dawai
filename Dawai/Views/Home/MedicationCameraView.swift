@@ -66,7 +66,7 @@ public struct MedicationCameraView: View {
             }
         }
         .environment(\.layoutDirection, .rightToLeft)
-        .onChange(of: selectedPhotoItem) { _, newItem in
+        .onChange(of: selectedPhotoItem) { newItem in
             Task {
                 if let data = try? await newItem?.loadTransferable(type: Data.self) {
                     processSelectedImageData(data)
