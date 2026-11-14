@@ -22,10 +22,11 @@ public final class RelationshipService: ObservableObject {
     // Notification toast banner trigger
     @Published public var notificationToastMessage: String? = nil
 
-    private let storageKeyInvitations = "dawai_stored_invitations_v1"
-    private let storageKeyRelationships = "dawai_stored_relationships_v1"
+    /// Persistence for invitations and relationships (UserDefaults today, replaceable later).
+    private let store: any InvitationStore
 
-    public init() {
+    public init(store: any InvitationStore = UserDefaultsInvitationStore()) {
+        self.store = store
         loadPersistedState()
     }
 
@@ -304,21 +305,13 @@ public final class RelationshipService: ObservableObject {
         self.outgoingInvitations = deduplicate(outgoingInvitations)
         self.incomingInvitations = deduplicate(incomingInvitations)
 
-        do {
-            let combined = deduplicate(outgoingInvitations + incomingInvitations)
-            let invData = try JSONEncoder().encode(combined)
-            UserDefaults.standard.set(invData, forKey: storageKeyInvitations)
-
-            let relData = try JSONEncoder().encode(activeRelationships)
-            UserDefaults.standard.set(relData, forKey: storageKeyRelationships)
-        } catch {
-            print("Failed to persist relationship state: \(error)")
-        }
+        store.saveInvitations(deduplicate(outgoingInvitations + incomingInvitations))
+        store.saveRelationships(activeRelationships)
     }
 
     private func loadPersistedState() {
-        if let invData = UserDefaults.standard.data(forKey: storageKeyInvitations),
-           let allInvs = try? JSONDecoder().decode([ConnectionInvitation].self, from: invData) {
+        let allInvs = store.loadInvitations()
+        if !allInvs.isEmpty {
             let uniqueInvs = deduplicate(allInvs)
             // Outgoing = invitations this user initiated (no recipientId = pending, or accepted/confirmed)
             self.outgoingInvitations = deduplicate(uniqueInvs.filter { $0.recipientId == nil || $0.status == .accepted || $0.status == .confirmed })
@@ -328,10 +321,7 @@ public final class RelationshipService: ObservableObject {
             self.incomingInvitations = deduplicate(uniqueInvs.filter { !outgoingIds.contains($0.id) && !outgoingTokens.contains($0.token.lowercased()) && $0.recipientId != nil })
         }
 
-        if let relData = UserDefaults.standard.data(forKey: storageKeyRelationships),
-           let rels = try? JSONDecoder().decode([ActiveRelationship].self, from: relData) {
-            self.activeRelationships = rels
-        }
+        self.activeRelationships = store.loadRelationships()
     }
 
     public func resetAllData() {
@@ -339,8 +329,7 @@ public final class RelationshipService: ObservableObject {
         incomingInvitations.removeAll()
         activeRelationships.removeAll()
         notificationToastMessage = nil
-        UserDefaults.standard.removeObject(forKey: storageKeyInvitations)
-        UserDefaults.standard.removeObject(forKey: storageKeyRelationships)
+        store.removeAll()
     }
 
     /// Removes stale pending invitations for a given user — call on sheet open to clear accumulated state.

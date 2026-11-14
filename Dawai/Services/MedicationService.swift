@@ -35,19 +35,20 @@ public final class MedicationService: ObservableObject {
 
     // MARK: - Use-Case 11 (UC-11): Collaborative Medication Deletion State
     @Published public private(set) var pendingDeletionRequests: [MedicationDeletionRequest] = []
-    private let storageKeyDeletionRequests = "dawai_stored_deletion_requests_v1"
 
     // Feedback & Toast notifications
     @Published public var toastMessage: String? = nil
     @Published public var notificationWarning: String? = nil
 
-    private let storageKey = "dawai_stored_medications_v2"
+    /// Persistence for medications and deletion requests (UserDefaults today, replaceable later).
+    private let store: any MedicationStore
     private let maxImageSizeBytes = 5 * 1024 * 1024 // 5 MB (UC-3 S#4)
 
     public static let doseReminderCategoryIdentifier = "DAWAI_DOSE_REMINDER_CATEGORY"
     public static let confirmDoseActionIdentifier = "DAWAI_CONFIRM_DOSE_ACTION"
 
-    public init() {
+    public init(store: any MedicationStore = UserDefaultsMedicationStore()) {
+        self.store = store
         registerNotificationCategories()
         loadPersistedMedications()
         loadPersistedDeletionRequests()
@@ -81,23 +82,16 @@ public final class MedicationService: ObservableObject {
     // MARK: - Persistence & Initial State
     public func loadPersistedMedications() {
         let identity = KeychainService.shared.loadUserIdentity()
-        let decoder = JSONDecoder()
         // Items saved before `patientId` existed are assigned to the identity using this device.
-        decoder.userInfo[MedicationItem.legacyPatientIdUserInfoKey] = identity?.id ?? MedicationItem.fallbackPatientId
-
-        if let data = UserDefaults.standard.data(forKey: storageKey),
-           let decoded = try? decoder.decode([MedicationItem].self, from: data) {
-            self.allMedications = decoded.map { item in
-                var m = item
-                m.timeString = m.timeString.westernNumerals
-                m.dosage = m.dosage.westernNumerals
-                return m
-            }
-            reassignLegacyCaregiverMedications(identity: identity)
-        } else {
-            // A new user starts with no medications.
-            self.allMedications = []
+        // A new user starts with no medications.
+        let stored = store.loadMedications(legacyPatientId: identity?.id ?? MedicationItem.fallbackPatientId)
+        self.allMedications = stored.map { item in
+            var m = item
+            m.timeString = m.timeString.westernNumerals
+            m.dosage = m.dosage.westernNumerals
+            return m
         }
+        reassignLegacyCaregiverMedications(identity: identity)
         refreshDerivedState()
     }
 
@@ -138,8 +132,7 @@ public final class MedicationService: ObservableObject {
         toastMessage = nil
         notificationWarning = nil
 
-        UserDefaults.standard.removeObject(forKey: storageKey)
-        UserDefaults.standard.removeObject(forKey: storageKeyDeletionRequests)
+        store.removeAll()
         refreshDerivedState()
     }
 
@@ -162,23 +155,16 @@ public final class MedicationService: ObservableObject {
     #endif
 
     private func persistMedications() {
-        if let encoded = try? JSONEncoder().encode(allMedications) {
-            UserDefaults.standard.set(encoded, forKey: storageKey)
-        }
+        store.saveMedications(allMedications)
     }
 
     // MARK: - UC-11 Deletion Requests Persistence
     public func loadPersistedDeletionRequests() {
-        if let data = UserDefaults.standard.data(forKey: storageKeyDeletionRequests),
-           let decoded = try? JSONDecoder().decode([MedicationDeletionRequest].self, from: data) {
-            self.pendingDeletionRequests = decoded
-        }
+        self.pendingDeletionRequests = store.loadDeletionRequests()
     }
 
     private func persistDeletionRequests() {
-        if let encoded = try? JSONEncoder().encode(pendingDeletionRequests) {
-            UserDefaults.standard.set(encoded, forKey: storageKeyDeletionRequests)
-        }
+        store.saveDeletionRequests(pendingDeletionRequests)
     }
 
     // MARK: - Dose Time Window Rules (Backed by DoseWindowConfig)

@@ -16,10 +16,12 @@ public final class AdherenceService: ObservableObject {
 
     @Published public private(set) var doseRecords: [DoseRecord] = []
 
-    private let storageKey = "dawai_stored_dose_records_v2"
+    /// Persistence for the dose log (UserDefaults today, replaceable later).
+    private let store: any DoseRecordStore
     private let calendar: Calendar
 
-    public init() {
+    public init(store: any DoseRecordStore = UserDefaultsDoseRecordStore()) {
+        self.store = store
         var cal = Calendar(identifier: .gregorian)
         cal.locale = Locale.dawaiArabic
         cal.firstWeekday = 1 // Sunday as the start of the week in Arab region
@@ -30,19 +32,14 @@ public final class AdherenceService: ObservableObject {
 
     // MARK: - Persistence
     public func loadRecords() {
-        if let data = UserDefaults.standard.data(forKey: storageKey),
-           let decoded = try? JSONDecoder().decode([DoseRecord].self, from: data) {
-            self.doseRecords = decoded
-        } else {
-            // A new user starts with no dose history.
-            self.doseRecords = []
-        }
+        // A new user starts with no dose history.
+        self.doseRecords = store.loadDoseRecords()
     }
 
     // MARK: - Reset (wipes all dose history on this device)
     public func resetAllData() {
         doseRecords = []
-        UserDefaults.standard.removeObject(forKey: storageKey)
+        store.removeAll()
     }
 
     #if DEBUG
@@ -60,9 +57,7 @@ public final class AdherenceService: ObservableObject {
     }
 
     private func persistRecords() {
-        if let encoded = try? JSONEncoder().encode(doseRecords) {
-            UserDefaults.standard.set(encoded, forKey: storageKey)
-        }
+        store.saveDoseRecords(doseRecords)
     }
 
     // MARK: - UC-7 S#2: Permission & Authorization Verification

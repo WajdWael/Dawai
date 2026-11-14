@@ -18,11 +18,11 @@ public enum LocalDataStore {
     /// Every UserDefaults key that holds user data. Used both to wipe data and to
     /// recognise installs that existed before the schema version was introduced.
     private static let userDataKeys = [
-        "dawai_stored_medications_v2",
-        "dawai_stored_deletion_requests_v1",
-        "dawai_stored_dose_records_v2",
-        "dawai_stored_invitations_v1",
-        "dawai_stored_relationships_v1"
+        UserDefaultsMedicationStore.medicationsKey,
+        UserDefaultsMedicationStore.deletionRequestsKey,
+        UserDefaultsDoseRecordStore.doseRecordsKey,
+        UserDefaultsInvitationStore.invitationsKey,
+        UserDefaultsInvitationStore.relationshipsKey
     ]
 
     /// Call once, as early as possible at launch (before any service is first used).
