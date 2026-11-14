@@ -38,10 +38,29 @@ public final class MedicationService: ObservableObject {
     private let storageKey = "dawai_stored_medications_v2"
     private let maxImageSizeBytes = 5 * 1024 * 1024 // 5 MB (UC-3 S#4)
 
+    public static let doseReminderCategoryIdentifier = "DAWAI_DOSE_REMINDER_CATEGORY"
+    public static let confirmDoseActionIdentifier = "DAWAI_CONFIRM_DOSE_ACTION"
+
     public init() {
+        registerNotificationCategories()
         loadPersistedMedications()
         loadPersistedDeletionRequests()
         setupTimeProgressionTimer()
+    }
+
+    private func registerNotificationCategories() {
+        let confirmAction = UNNotificationAction(
+            identifier: Self.confirmDoseActionIdentifier,
+            title: "أخذت الدواء",
+            options: [.authenticationRequired]
+        )
+        let category = UNNotificationCategory(
+            identifier: Self.doseReminderCategoryIdentifier,
+            actions: [confirmAction],
+            intentIdentifiers: [],
+            options: []
+        )
+        UNUserNotificationCenter.current().setNotificationCategories([category])
     }
 
     // MARK: - UC-12 S#3: Time Progresses (Auto-updates schedule as time passes)
@@ -119,40 +138,217 @@ public final class MedicationService: ObservableObject {
         }
     }
 
+    // MARK: - Dose Time Window Rules (Backed by DoseWindowConfig)
+    public static var preDoseWindowMinutes: Int { DoseWindowConfig.preWindowMinutes }
+    public static var lateThresholdMinutes: Int { DoseWindowConfig.lateThresholdMinutes }
+    public static var missedCutoffMinutes: Int { DoseWindowConfig.missedCutoffMinutes }
+
+    public enum DoseInteractionState: Equatable {
+        case taken
+        case upcomingBeforeWindow
+        case dueOnTime
+        case overdueLate
+        case missed
+    }
+
+    /// Computes the exact scheduled `Date` for `item` on the calendar day of `dayDate`.
+    public func scheduledDateTime(for item: MedicationItem, on dayDate: Date) -> Date {
+        let calendar = Calendar.current
+        let mins = scheduledMinutes(for: item)
+        return calendar.date(bySettingHour: mins / 60, minute: mins % 60, second: 0, of: dayDate) ?? dayDate
+    }
+
+    /// Returns true when yesterday's scheduled dose was not yet recorded and its confirmation window extends past midnight into `date`.
+    private func hasActiveCarryoverFromYesterday(_ item: MedicationItem, at date: Date) -> Bool {
+        let calendar = Calendar.current
+        guard let yesterday = calendar.date(byAdding: .day, value: -1, to: date),
+              isScheduledForToday(item, on: yesterday) else {
+            return false
+        }
+        let yesterdaySched = scheduledDateTime(for: item, on: yesterday)
+        let createdMinuteStart = calendar.date(bySetting: .second, value: 0, of: item.createdAt) ?? item.createdAt
+        if calendar.isDate(yesterday, inSameDayAs: item.createdAt) && yesterdaySched < createdMinuteStart {
+            return false
+        }
+        guard !AdherenceService.shared.hasRecord(for: item.id, on: yesterday) else {
+            return false
+        }
+        let diffYesterdayMin = Int(floor(date.timeIntervalSince(yesterdaySched) / 60.0))
+        return diffYesterdayMin >= -DoseWindowConfig.preWindowMinutes && diffYesterdayMin < DoseWindowConfig.missedCutoffMinutes
+    }
+
+    /// Returns the active occurrence `Date` (yesterday carryover if still open past midnight, otherwise today's scheduled `Date`).
+    private func activeOccurrenceDate(for item: MedicationItem, at date: Date) -> Date {
+        if hasActiveCarryoverFromYesterday(item, at: date),
+           let yesterday = Calendar.current.date(byAdding: .day, value: -1, to: date) {
+            return scheduledDateTime(for: item, on: yesterday)
+        }
+        return scheduledDateTime(for: item, on: date)
+    }
+
+    /// Evaluates the current interaction state of a scheduled medication for today (including midnight carryover from yesterday)
+    public func doseInteractionState(for item: MedicationItem, at date: Date? = nil) -> DoseInteractionState {
+        let effectiveDate = date ?? AppClock.shared.now
+        let calendar = Calendar.current
+
+        if item.isTaken {
+            if let takenAt = item.takenAt {
+                if calendar.isDate(takenAt, inSameDayAs: effectiveDate) {
+                    return .taken
+                }
+            } else {
+                return .taken
+            }
+        }
+
+        // Check if yesterday's dose crossed midnight and is still within the active confirmation window
+        if hasActiveCarryoverFromYesterday(item, at: effectiveDate),
+           let yesterday = calendar.date(byAdding: .day, value: -1, to: effectiveDate) {
+            let yesterdaySched = scheduledDateTime(for: item, on: yesterday)
+            let diffYesterdayMin = Int(floor(effectiveDate.timeIntervalSince(yesterdaySched) / 60.0))
+            return diffYesterdayMin <= DoseWindowConfig.lateThresholdMinutes ? .dueOnTime : .overdueLate
+        }
+
+        guard isScheduledForToday(item, on: effectiveDate) else {
+            return .upcomingBeforeWindow
+        }
+
+        let todaySched = scheduledDateTime(for: item, on: effectiveDate)
+        let diffMin = Int(floor(effectiveDate.timeIntervalSince(todaySched) / 60.0))
+
+        if diffMin < -DoseWindowConfig.preWindowMinutes {
+            return .upcomingBeforeWindow
+        } else if diffMin <= DoseWindowConfig.lateThresholdMinutes {
+            return .dueOnTime
+        } else if diffMin < DoseWindowConfig.missedCutoffMinutes {
+            return .overdueLate
+        } else {
+            return .missed
+        }
+    }
+
+    /// Reconciles taken flags from previous days, handles doses crossing midnight without losing their state,
+    /// and retroactively marks any past unrecorded scheduled doses whose cutoff window has elapsed as `.missed`.
+    private func reconcilePastAndMidnightDoses(at now: Date, patientId: String) {
+        let calendar = Calendar.current
+        let todayStart = calendar.startOfDay(for: now)
+
+        // 1. Preserve previous-day `isTaken` state in AdherenceService BEFORE resetting `isTaken` for the new day
+        var didResetStaleDay = false
+        for idx in medications.indices {
+            if medications[idx].isTaken,
+               let takenAt = medications[idx].takenAt,
+               !calendar.isDate(takenAt, inSameDayAs: now) {
+                AdherenceService.shared.recordDoseTaken(
+                    medication: medications[idx],
+                    patientId: patientId,
+                    takenAt: takenAt,
+                    scheduledDay: takenAt
+                )
+                medications[idx].isTaken = false
+                medications[idx].takenAt = nil
+                didResetStaleDay = true
+            }
+        }
+        if didResetStaleDay {
+            persistMedications()
+        }
+
+        // 2. Retroactive backfill for past days (only when the confirmation window has fully expired)
+        for med in medications {
+            let createdDay = calendar.startOfDay(for: med.createdAt)
+            let earliestLookback = calendar.date(byAdding: .day, value: -DoseWindowConfig.retroactiveLookbackDays, to: todayStart) ?? createdDay
+            var day = max(createdDay, earliestLookback)
+            let createdMinuteStart = calendar.date(bySetting: .second, value: 0, of: med.createdAt) ?? med.createdAt
+
+            while day < todayStart {
+                if isScheduledForToday(med, on: day) {
+                    let schedDate = scheduledDateTime(for: med, on: day)
+                    let isBeforeCreation = calendar.isDate(day, inSameDayAs: med.createdAt) && schedDate < createdMinuteStart
+                    if !isBeforeCreation {
+                        let elapsedMinutes = Int(floor(now.timeIntervalSince(schedDate) / 60.0))
+                        // If a midnight-crossing dose (e.g. 23:00 checked at 00:30) is still within 120m, keep it open rather than marking missed
+                        if elapsedMinutes >= DoseWindowConfig.missedCutoffMinutes && !AdherenceService.shared.hasRecord(for: med.id, on: day) {
+                            AdherenceService.shared.recordDoseMissedIfNeeded(
+                                medication: med,
+                                patientId: patientId,
+                                on: day
+                            )
+                        }
+                    }
+                }
+                guard let nextDay = calendar.date(byAdding: .day, value: 1, to: day) else { break }
+                day = nextDay
+            }
+        }
+    }
+
     // MARK: - UC-12 S#1, S#2, S#3: Automatically Sort & Prioritize by Scheduled Time
     public func refreshDerivedState() {
-        let now = Date()
-        let nowComps = Calendar.current.dateComponents([.hour, .minute], from: now)
-        let currentMinutes = (nowComps.hour ?? 0) * 60 + (nowComps.minute ?? 0)
+        let now = AppClock.shared.now
+        let calendar = Calendar.current
+        let currentPatientId = KeychainService.shared.loadUserIdentity()?.id ?? "default_patient"
 
-        // 1. UC-12 S#1: Retrieve registered medications scheduled for the current day
-        let todaysList = medications.filter { isScheduledForToday($0, on: now) }
+        // Reconcile day rollover, midnight carryover, and past unrecorded missed doses before evaluating today
+        reconcilePastAndMidnightDoses(at: now, patientId: currentPatientId)
 
-        // 2. UC-12 S#2: Automatically sort daily medications according to their scheduled times
+        // 1. UC-12 S#1: Retrieve registered medications scheduled for today OR still active from yesterday past midnight
+        let todaysList = medications.filter {
+            isScheduledForToday($0, on: now) || hasActiveCarryoverFromYesterday($0, at: now)
+        }
+
+        // 2. UC-12 S#2: Automatically sort daily medications chronologically by active occurrence date
         let sortedTodaysList = todaysList.sorted { a, b in
-            scheduledMinutes(for: a) < scheduledMinutes(for: b)
+            activeOccurrenceDate(for: a, at: now) < activeOccurrenceDate(for: b, at: now)
         }
         self.todayMedications = sortedTodaysList
 
-        // 3. UC-12 S#2: Prioritize the medication whose scheduled time is due or closest to the current time
-        let untaken = sortedTodaysList.filter { !$0.isTaken }
+        // Automatically record any dose today that crossed the missed cutoff as `.missed` ("فائتة") in AdherenceService
+        let createdTodayCutoffCheck = { (item: MedicationItem) -> Bool in
+            let createdMinuteStart = calendar.date(bySetting: .second, value: 0, of: item.createdAt) ?? item.createdAt
+            let schedToday = self.scheduledDateTime(for: item, on: now)
+            return schedToday >= createdMinuteStart || !calendar.isDate(item.createdAt, inSameDayAs: now)
+        }
+        for item in sortedTodaysList where doseInteractionState(for: item, at: now) == .missed {
+            if createdTodayCutoffCheck(item) {
+                AdherenceService.shared.recordDoseMissedIfNeeded(
+                    medication: item,
+                    patientId: currentPatientId,
+                    on: now
+                )
+            }
+        }
 
-        if !untaken.isEmpty {
-            // If any untaken doses are due/overdue (scheduled time <= current time):
-            // Prioritize the due medication closest to current time
-            let dueDoses = untaken.filter { scheduledMinutes(for: $0) <= currentMinutes }
-            let upcomingDosesList = untaken.filter { scheduledMinutes(for: $0) > currentMinutes }
+        // 3. UC-12 S#2: Prioritize confirmable or upcoming medications (excluding taken and missed doses)
+        let actionableUntaken = sortedTodaysList.filter { item in
+            let state = doseInteractionState(for: item, at: now)
+            return state == .dueOnTime || state == .overdueLate || state == .upcomingBeforeWindow
+        }
 
-            if !dueDoses.isEmpty {
-                // The dose due that is closest to now (or most recent due)
-                self.activeMedication = dueDoses.max(by: { scheduledMinutes(for: $0) < scheduledMinutes(for: $1) }) ?? dueDoses.first
+        if !actionableUntaken.isEmpty {
+            let confirmableNow = actionableUntaken.filter { item in
+                let state = doseInteractionState(for: item, at: now)
+                return state == .dueOnTime || state == .overdueLate
+            }
+            let futureToday = actionableUntaken.filter { item in
+                doseInteractionState(for: item, at: now) == .upcomingBeforeWindow
+            }
+
+            if !confirmableNow.isEmpty {
+                // Prioritize the confirmable dose (within -15m ..< +120m window) closest to `now`
+                self.activeMedication = confirmableNow.min(by: {
+                    abs(now.timeIntervalSince(activeOccurrenceDate(for: $0, at: now))) <
+                    abs(now.timeIntervalSince(activeOccurrenceDate(for: $1, at: now)))
+                }) ?? confirmableNow.first
             } else {
-                // All untaken doses are upcoming in the future today; pick the one closest to current time
-                self.activeMedication = upcomingDosesList.min(by: { scheduledMinutes(for: $0) < scheduledMinutes(for: $1) }) ?? untaken.first
+                // All remaining actionable doses are in the future today; pick the earliest upcoming one
+                self.activeMedication = futureToday.min(by: {
+                    activeOccurrenceDate(for: $0, at: now) < activeOccurrenceDate(for: $1, at: now)
+                }) ?? actionableUntaken.first
             }
         } else {
-            // All doses for today are taken: select first in schedule
-            self.activeMedication = sortedTodaysList.first
+            // All doses for today are either taken or missed: show the most recent or first in schedule
+            self.activeMedication = sortedTodaysList.last ?? sortedTodaysList.first
         }
 
         // 4. Generate schedule doses for other medications (excluding the active highlighted card)
@@ -167,24 +363,21 @@ public final class MedicationService: ObservableObject {
             )
         }
 
-        // 5. Count untaken doses for today
-        self.remainingDoses = untaken.count
+        // 5. Count remaining actionable untaken doses for today (excludes taken and missed doses)
+        self.remainingDoses = actionableUntaken.count
     }
 
     // MARK: - Use-Case 5 (UC-5): Missed Dose Calculations (30-Minute Grace Period)
-    /// UC-5 S#1: Determines if a scheduled dose has remained unconfirmed for 30 minutes after its scheduled time
-    public func isDoseMissed(_ item: MedicationItem, at date: Date = Date()) -> Bool {
-        guard isScheduledForToday(item, on: date) && !item.isTaken else { return false }
-        let comps = Calendar.current.dateComponents([.hour, .minute], from: date)
-        let currentMinutes = (comps.hour ?? 0) * 60 + (comps.minute ?? 0)
-        let medMinutes = scheduledMinutes(for: item)
-        // 30-minute grace period
-        return currentMinutes >= (medMinutes + 30)
+    /// UC-5 S#1: Determines if a scheduled dose has remained unconfirmed past `DoseWindowConfig.lateThresholdMinutes`
+    public func isDoseMissed(_ item: MedicationItem, at date: Date? = nil) -> Bool {
+        let effectiveDate = date ?? AppClock.shared.now
+        let state = doseInteractionState(for: item, at: effectiveDate)
+        return state == .overdueLate || state == .missed
     }
 
-    /// List of medications scheduled for today whose 30-minute grace period has passed without confirmation
+    /// List of medications scheduled for today whose late threshold has passed without confirmation
     public var missedMedicationsToday: [MedicationItem] {
-        let now = Date()
+        let now = AppClock.shared.now
         return todayMedications.filter { isDoseMissed($0, at: now) }
     }
 
@@ -474,51 +667,105 @@ public final class MedicationService: ObservableObject {
         showToast("تم رفض حذف دواء \"\(request.medicationName)\" والاحتفاظ به في جدول المستفيد.")
     }
 
-    // MARK: - Toggle Taken Status & UC-6 Confirm Dose
-    public func toggleTaken(id: UUID) {
-        guard let index = medications.firstIndex(where: { $0.id == id }) else { return }
-        medications[index].isTaken.toggle()
-        if medications[index].isTaken {
-            medications[index].takenAt = Date()
-            cancelMissedDoseAlert(id: id)
+    // MARK: - UC-6 Confirm Dose Taken
+    /// UC-6: Confirms dose taken, records timestamp, updates status and notifies caregivers.
+    /// Single unified entry point for all dose confirmations; ignores duplicate, early, or expired confirmations.
+    @discardableResult
+    public func confirmDoseTaken(id: UUID, patient: UserIdentity) -> Bool {
+        guard let index = medications.firstIndex(where: { $0.id == id }) else { return false }
+        let now = AppClock.shared.now
+
+        // Guard against double-tap / already confirmed dose or out-of-window dose
+        let currentState = doseInteractionState(for: medications[index], at: now)
+        guard !medications[index].isTaken, (currentState == .dueOnTime || currentState == .overdueLate) else {
+            if currentState == .missed {
+                AdherenceService.shared.recordDoseMissedIfNeeded(
+                    medication: medications[index],
+                    patientId: patient.id,
+                    on: now
+                )
+                showToast("انتهى وقت تأكيد جرعة «\(medications[index].name)» وتم تسجيلها كجرعة فائتة.")
+            }
+            return false
+        }
+
+        let medName = medications[index].name
+        let isCarryover = hasActiveCarryoverFromYesterday(medications[index], at: now)
+        let yesterday = Calendar.current.date(byAdding: .day, value: -1, to: now)
+
+        if isCarryover, let yesterday {
+            // Confirm yesterday's midnight-crossing occurrence without marking today's future dose as taken
             AdherenceService.shared.recordDoseTaken(
                 medication: medications[index],
-                patientId: "default_patient",
-                takenAt: Date()
+                patientId: patient.id,
+                takenAt: now,
+                scheduledDay: yesterday
             )
         } else {
-            medications[index].takenAt = nil
+            medications[index].isTaken = true
+            medications[index].takenAt = now
+            persistMedications()
+
+            // UC-7: Record in dose log for weekly adherence report
+            AdherenceService.shared.recordDoseTaken(
+                medication: medications[index],
+                patientId: patient.id,
+                takenAt: now,
+                scheduledDay: now
+            )
         }
-        persistMedications()
-        refreshDerivedState()
-    }
 
-    /// UC-6: Confirms dose taken, records timestamp, updates status and notifies caregivers
-    public func confirmDoseTaken(id: UUID, patient: UserIdentity) {
-        guard let index = medications.firstIndex(where: { $0.id == id }) else { return }
-        let now = Date()
-        medications[index].isTaken = true
-        medications[index].takenAt = now
-        persistMedications()
+        // Refresh derived schedule and remainingDoses count
         refreshDerivedState()
-
-        // UC-7: Record in dose log for weekly adherence report
-        AdherenceService.shared.recordDoseTaken(
-            medication: medications[index],
-            patientId: patient.id,
-            takenAt: now
-        )
 
         // UC-5: Dose confirmed -> cancel caregiver missed dose alert
         cancelMissedDoseAlert(id: id)
 
         // UC-6 S#6: Notify connected caregivers
         RelationshipService.shared.notifyCaregiversDoseTaken(
-            medicationName: medications[index].name,
+            medicationName: medName,
             patientName: patient.displayName
         )
 
-        showToast("تم تأكيد أخذ جرعة \"\(medications[index].name)\" بنجاح.")
+        if self.remainingDoses > 0 {
+            showToast("تم تأكيد جرعة «\(medName)». باقي \(self.remainingDoses) جرعات اليوم")
+        } else {
+            showToast("أكملت جميع جرعات اليوم")
+        }
+        return true
+    }
+
+    // MARK: - Notification Action Handling (Quick Actions & Notification Taps)
+    public func handleNotificationAction(medicationId: UUID, actionIdentifier: String, appState: AppState?) {
+        refreshDerivedState()
+        guard let med = medications.first(where: { $0.id == medicationId }) else { return }
+
+        let now = AppClock.shared.now
+        let state = doseInteractionState(for: med, at: now)
+
+        if actionIdentifier == Self.confirmDoseActionIdentifier {
+            switch state {
+            case .dueOnTime, .overdueLate:
+                if let patient = appState?.currentIdentity ?? KeychainService.shared.loadUserIdentity() {
+                    _ = confirmDoseTaken(id: medicationId, patient: patient)
+                }
+            case .missed:
+                let patientId = appState?.currentIdentity?.id ?? KeychainService.shared.loadUserIdentity()?.id ?? "default_patient"
+                reconcilePastAndMidnightDoses(at: now, patientId: patientId)
+                showToast("انتهى وقت تأكيد جرعة «\(med.name)» وتم تسجيلها كجرعة فائتة.")
+            case .upcomingBeforeWindow:
+                showToast("لم يحن موعد جرعة «\(med.name)» بعد (الموعد الساعة \(med.timeString.westernNumerals)).")
+            case .taken:
+                showToast("تم تأكيد جرعة «\(med.name)» مسبقاً.")
+            }
+        } else {
+            if state == .missed {
+                let patientId = appState?.currentIdentity?.id ?? KeychainService.shared.loadUserIdentity()?.id ?? "default_patient"
+                reconcilePastAndMidnightDoses(at: now, patientId: patientId)
+                showToast("انتهى وقت تأكيد جرعة «\(med.name)» وتم تسجيلها كجرعة فائتة.")
+            }
+            appState?.openDoseConfirmation(for: medicationId)
+        }
     }
 
     // MARK: - Validation Helpers (UC-3)
@@ -594,6 +841,7 @@ public final class MedicationService: ObservableObject {
                 content.body += "\nتعليمات: \(instructions)"
             }
             content.sound = .default
+            content.categoryIdentifier = Self.doseReminderCategoryIdentifier
             content.userInfo = [
                 "medicationId": item.id.uuidString,
                 "type": "dose_reminder"
@@ -631,7 +879,7 @@ public final class MedicationService: ObservableObject {
 
             var missedComps = DateComponents()
             let schedMinutes = scheduledMinutes(for: item)
-            let alertMinutes = (schedMinutes + 30) % 1440
+            let alertMinutes = (schedMinutes + DoseWindowConfig.lateThresholdMinutes) % 1440
             missedComps.hour = alertMinutes / 60
             missedComps.minute = alertMinutes % 60
 
@@ -702,6 +950,7 @@ public final class MedicationService: ObservableObject {
             content.body += "\nتعليمات: \(instructions)"
         }
         content.sound = .default
+        content.categoryIdentifier = Self.doseReminderCategoryIdentifier
         content.userInfo = [
             "medicationId": item.id.uuidString,
             "type": "dose_reminder"
@@ -729,7 +978,7 @@ public final class MedicationService: ObservableObject {
         let center = UNUserNotificationCenter.current()
         let content = UNMutableNotificationContent()
         content.title = "تنبيه تأخر جرعة: \(item.name)"
-        content.body = "لم يتم تأكيد أخذ جرعة \(item.name) (\(item.dosage)) بعد مرور 30 دقيقة من موعدها."
+        content.body = "لم يتم تأكيد أخذ جرعة \(item.name) (\(item.dosage)) بعد مرور \(DoseWindowConfig.lateThresholdMinutes) دقيقة من موعدها."
         content.sound = .default
         content.userInfo = [
             "medicationId": item.id.uuidString,
@@ -881,9 +1130,16 @@ public final class NotificationDelegate: NSObject, UNUserNotificationCenterDeleg
             }
         } else if let medIdString = userInfo["medicationId"] as? String,
                   let medId = UUID(uuidString: medIdString) {
+            let actionId = response.actionIdentifier
             Task { @MainActor in
-                self.appState?.openDoseConfirmation(for: medId)
+                MedicationService.shared.handleNotificationAction(
+                    medicationId: medId,
+                    actionIdentifier: actionId,
+                    appState: self.appState
+                )
+                completionHandler()
             }
+            return
         }
         completionHandler()
     }

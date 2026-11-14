@@ -518,29 +518,24 @@ public struct CaregiverPatientDetailView: View {
             .padding(.top, 16)
             .padding(.bottom, activeMedication.isTaken ? 16 : 0)
 
-            // Dose Confirmation Action Button (Shown only when NOT taken)
-            if !activeMedication.isTaken {
-                Button {
-                    withAnimation(.spring(response: 0.35, dampingFraction: 0.7)) {
-                        medicationService.toggleTaken(id: activeMedication.id)
-                    }
-                } label: {
-                    HStack(spacing: 8) {
-                        Image(systemName: "checkmark")
-                            .font(.system(size: 16, weight: .bold))
-                        Text("اخذت الدواء")
-                            .font(.system(size: 18, weight: .bold))
-                    }
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 14)
-                    .background(Color.dawaiPrimary)
-                    .foregroundStyle(.white)
-                    .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-                }
-                .buttonStyle(.plain)
-                .padding(.horizontal, 16)
-                .padding(.bottom, 16)
+            // Dose Status Banner for Caregiver (Read-only status: "تم أخذها" or "بانتظار أخذ الجرعة")
+            HStack(spacing: 8) {
+                Image(systemName: activeMedication.isTaken ? "checkmark.circle.fill" : "clock.fill")
+                    .font(.system(size: 16, weight: .bold))
+                Text(activeMedication.isTaken ? "تم أخذها" : "بانتظار أخذ الجرعة")
+                    .font(.system(size: 16, weight: .bold))
             }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 12)
+            .background(
+                activeMedication.isTaken
+                    ? Color.dawaiTakenBadgeBackground
+                    : Color.dawaiPrimary.opacity(0.10)
+            )
+            .foregroundStyle(activeMedication.isTaken ? Color.dawaiTaken : Color.dawaiPrimary)
+            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .padding(.horizontal, 16)
+            .padding(.bottom, 16)
         }
         .background(
             activeMedication.isTaken

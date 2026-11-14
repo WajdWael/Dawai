@@ -27,6 +27,7 @@ public struct PatientHomeView: View {
 
     // UC-4 & UC-6 Dose Confirmation State
     @State private var confirmingDoseMedication: MedicationItem? = nil
+    @State private var processingMedicationId: UUID? = nil
 
     // UC-11 Delete Medication Confirmation State
     @State private var medicationToDelete: MedicationItem? = nil
@@ -501,6 +502,9 @@ public struct PatientHomeView: View {
     // MARK: - Active Medication Single Card (When Doses Remain)
     @ViewBuilder
     private func activeMedicationCard(_ activeMedication: MedicationItem) -> some View {
+        let interactionState = medicationService.doseInteractionState(for: activeMedication)
+        let isConfirmingThisMed = (processingMedicationId == activeMedication.id)
+
         VStack(spacing: 16) {
             HStack(alignment: .top, spacing: 14) {
                 // Pill Icon Frame on RIGHT (FIRST in HStack)
@@ -526,7 +530,7 @@ public struct PatientHomeView: View {
                         .foregroundStyle(.secondary)
 
                     HStack(spacing: 6) {
-                        Text(activeMedication.timeString)
+                        Text(activeMedication.timeString.westernNumerals)
                             .font(.system(size: 14, weight: .semibold))
                             .foregroundStyle(activeMedication.isTaken ? Color.dawaiTaken : Color.dawaiPrimary)
 
@@ -534,6 +538,14 @@ public struct PatientHomeView: View {
                             Text("• تم أخذها")
                                 .font(.system(size: 13, weight: .bold))
                                 .foregroundStyle(Color.dawaiTaken)
+                        } else if interactionState == .overdueLate {
+                            Text("• جرعة متأخرة")
+                                .font(.system(size: 13, weight: .bold))
+                                .foregroundStyle(Color.dawaiWarning)
+                        } else if interactionState == .missed {
+                            Text("• جرعة فائتة")
+                                .font(.system(size: 13, weight: .bold))
+                                .foregroundStyle(Color.red)
                         }
                     }
                 }
@@ -560,11 +572,38 @@ public struct PatientHomeView: View {
             .padding(.top, 16)
             .padding(.bottom, activeMedication.isTaken ? 16 : 0)
 
-            // Dose Confirmation Action Button (Shown only when NOT taken - UC-4 & UC-6)
-            if !activeMedication.isTaken {
+            // Dose Confirmation or Window Status Banner (UC-4 & UC-6)
+            switch interactionState {
+            case .taken:
+                EmptyView()
+
+            case .upcomingBeforeWindow:
+                HStack(spacing: 8) {
+                    Image(systemName: "clock")
+                        .font(.system(size: 16, weight: .semibold))
+                    Text("الجرعة القادمة الساعة \(activeMedication.timeString.westernNumerals)")
+                        .font(.system(size: 16, weight: .bold))
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 13)
+                .background(Color.dawaiPrimary.opacity(0.10))
+                .foregroundStyle(Color.dawaiPrimary)
+                .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                .padding(.horizontal, 16)
+                .padding(.bottom, 16)
+
+            case .dueOnTime, .overdueLate:
                 Button {
+                    guard !isConfirmingThisMed, !activeMedication.isTaken else { return }
+                    processingMedicationId = activeMedication.id
+                    UIImpactFeedbackGenerator(style: .rigid).impactOccurred()
                     withAnimation(.spring(response: 0.35, dampingFraction: 0.7)) {
-                        medicationService.confirmDoseTaken(id: activeMedication.id, patient: identity)
+                        _ = medicationService.confirmDoseTaken(id: activeMedication.id, patient: identity)
+                    }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+                        if processingMedicationId == activeMedication.id {
+                            processingMedicationId = nil
+                        }
                     }
                 } label: {
                     HStack(spacing: 8) {
@@ -575,11 +614,27 @@ public struct PatientHomeView: View {
                     }
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 14)
-                    .background(Color.dawaiPrimary)
+                    .background(interactionState == .overdueLate ? Color.dawaiWarning : Color.dawaiPrimary)
                     .foregroundStyle(.white)
                     .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
                 }
                 .buttonStyle(.plain)
+                .disabled(isConfirmingThisMed || activeMedication.isTaken)
+                .padding(.horizontal, 16)
+                .padding(.bottom, 16)
+
+            case .missed:
+                HStack(spacing: 8) {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 16, weight: .semibold))
+                    Text("جرعة فائتة • انتهى وقت التأكيد")
+                        .font(.system(size: 15, weight: .bold))
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 13)
+                .background(Color.red.opacity(0.10))
+                .foregroundStyle(Color.red)
+                .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
                 .padding(.horizontal, 16)
                 .padding(.bottom, 16)
             }
@@ -1182,6 +1237,18 @@ public struct DoseConfirmationSheet: View {
     @State private var hasConfirmed: Bool = false
     @State private var isProcessing: Bool = false
 
+    private var liveMedication: MedicationItem {
+        medicationService.medications.first(where: { $0.id == medication.id }) ?? medication
+    }
+
+    private var isAlreadyTaken: Bool {
+        hasConfirmed || liveMedication.isTaken
+    }
+
+    private var isDoseMissedInReport: Bool {
+        medicationService.doseInteractionState(for: liveMedication) == .missed
+    }
+
     public init(
         medication: MedicationItem,
         currentUser: UserIdentity,
@@ -1204,13 +1271,20 @@ public struct DoseConfirmationSheet: View {
 
                     // MARK: - 2. Title & Status Badge
                     VStack(spacing: 8) {
-                        if hasConfirmed || medication.isTaken {
+                        if isAlreadyTaken {
                             Label("تم تأكيد الجرعة بنجاح", systemImage: "checkmark.circle.fill")
                                 .font(.system(size: 14, weight: .bold))
                                 .foregroundStyle(Color.dawaiTaken)
                                 .padding(.horizontal, 14)
                                 .padding(.vertical, 6)
                                 .background(Color.dawaiTakenBadgeBackground, in: Capsule())
+                        } else if isDoseMissedInReport {
+                            Label("جرعة فائتة • انتهى وقت التأكيد", systemImage: "xmark.circle.fill")
+                                .font(.system(size: 14, weight: .bold))
+                                .foregroundStyle(Color.red)
+                                .padding(.horizontal, 14)
+                                .padding(.vertical, 6)
+                                .background(Color.red.opacity(0.12), in: Capsule())
                         } else {
                             Label("حان موعد الجرعة الآن", systemImage: "bell.badge.fill")
                                 .font(.system(size: 14, weight: .bold))
@@ -1285,7 +1359,7 @@ public struct DoseConfirmationSheet: View {
     // MARK: - 1. Hero Image / Icon View
     @ViewBuilder
     private var heroImageView: some View {
-        if let imageData = medication.imageData, let uiImage = UIImage(data: imageData) {
+        if let imageData = liveMedication.imageData, let uiImage = UIImage(data: imageData) {
             Image(uiImage: uiImage)
                 .resizable()
                 .scaledToFill()
@@ -1299,12 +1373,12 @@ public struct DoseConfirmationSheet: View {
         } else {
             ZStack {
                 Circle()
-                    .fill(hasConfirmed || medication.isTaken ? Color.dawaiTakenBadgeBackground : Color.dawaiPrimary.opacity(0.12))
+                    .fill(isAlreadyTaken ? Color.dawaiTakenBadgeBackground : Color.dawaiPrimary.opacity(0.12))
                     .frame(width: 110, height: 110)
 
-                Image(systemName: hasConfirmed || medication.isTaken ? "checkmark.circle.fill" : "pills.circle.fill")
+                Image(systemName: isAlreadyTaken ? "checkmark.circle.fill" : "pills.circle.fill")
                     .font(.system(size: 58))
-                    .foregroundStyle(hasConfirmed || medication.isTaken ? Color.dawaiTaken : Color.dawaiPrimary)
+                    .foregroundStyle(isAlreadyTaken ? Color.dawaiTaken : Color.dawaiPrimary)
             }
             .padding(.vertical, 8)
         }
@@ -1372,7 +1446,7 @@ public struct DoseConfirmationSheet: View {
     @ViewBuilder
     private var actionButtonsSection: some View {
         VStack(spacing: 12) {
-            if hasConfirmed || medication.isTaken {
+            if isAlreadyTaken {
                 // Already confirmed state
                 HStack(spacing: 10) {
                     Image(systemName: "checkmark.seal.fill")
@@ -1386,6 +1460,18 @@ public struct DoseConfirmationSheet: View {
                 .background(Color.dawaiTaken)
                 .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
                 .shadow(color: Color.dawaiTaken.opacity(0.25), radius: 8, x: 0, y: 4)
+            } else if isDoseMissedInReport {
+                HStack(spacing: 10) {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 22))
+                    Text("جرعة فائتة • انتهى وقت التأكيد")
+                        .font(.system(size: 18, weight: .bold))
+                }
+                .foregroundStyle(.white)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 16)
+                .background(Color.red)
+                .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
             } else {
                 // Prominent "I Took It" Button (UC-4 S#5 & S#6)
                 Button {
@@ -1410,7 +1496,7 @@ public struct DoseConfirmationSheet: View {
                     .shadow(color: Color.dawaiPrimary.opacity(0.3), radius: 10, x: 0, y: 5)
                 }
                 .buttonStyle(.plain)
-                .disabled(isProcessing)
+                .disabled(isProcessing || isAlreadyTaken)
 
                 // Secondary "Remind me later" Button
                 Button {
@@ -1429,12 +1515,13 @@ public struct DoseConfirmationSheet: View {
 
     // MARK: - Action: Confirm Dose Taken (UC-6)
     private func confirmDose() {
+        guard !isProcessing, !isAlreadyTaken, !isDoseMissedInReport else { return }
         isProcessing = true
         UIImpactFeedbackGenerator(style: .rigid).impactOccurred()
 
         withAnimation(.spring(response: 0.35, dampingFraction: 0.7)) {
-            medicationService.confirmDoseTaken(id: medication.id, patient: currentUser)
-            hasConfirmed = true
+            let didConfirm = medicationService.confirmDoseTaken(id: medication.id, patient: currentUser)
+            hasConfirmed = didConfirm || liveMedication.isTaken
             isProcessing = false
         }
 

@@ -15,6 +15,83 @@
 import Foundation
 import Combine
 
+/// Single source of truth for dose confirmation windows and retroactive missed-dose evaluation.
+public enum DoseWindowConfig {
+    /// Minutes before the scheduled time when the "اخذت الدواء" button activates.
+    public static let preWindowMinutes: Int = 15
+    /// Minutes after the scheduled time before a dose is considered late (triggers UC-5 alert).
+    public static let lateThresholdMinutes: Int = 30
+    /// Minutes after the scheduled time when an unconfirmed dose transitions from late to missed ("فائتة").
+    public static let missedCutoffMinutes: Int = 120
+    /// Maximum number of past days scanned retroactively when recording missed doses on launch.
+    public static let retroactiveLookbackDays: Int = 28
+}
+
+/// Provides the current clock time, supporting simulated dates/offsets in DEBUG builds without modifying the device clock.
+public final class AppClock: ObservableObject {
+    public static let shared = AppClock()
+
+    @Published public private(set) var overrideDate: Date? = nil
+    @Published public private(set) var offsetMinutes: Int = 0
+
+    private init() {}
+
+    public var isUsingSimulatedTime: Bool {
+        #if DEBUG
+        return overrideDate != nil || offsetMinutes != 0
+        #else
+        return false
+        #endif
+    }
+
+    public var now: Date {
+        #if DEBUG
+        if let overrideDate {
+            return overrideDate
+        }
+        if offsetMinutes != 0 {
+            return Date().addingTimeInterval(TimeInterval(offsetMinutes * 60))
+        }
+        return Date()
+        #else
+        return Date()
+        #endif
+    }
+
+    #if DEBUG
+    @MainActor
+    public func setSimulatedDate(_ date: Date?) {
+        overrideDate = date
+        offsetMinutes = 0
+        MedicationService.shared.refreshDerivedState()
+    }
+
+    @MainActor
+    public func setOffset(minutes: Int) {
+        offsetMinutes = minutes
+        overrideDate = nil
+        MedicationService.shared.refreshDerivedState()
+    }
+
+    /// Positions the simulated clock relative to `med`'s scheduled time today (`+deltaMinutesFromSchedule`).
+    @MainActor
+    public func setStageForMedication(_ med: MedicationItem, deltaMinutesFromSchedule: Int) {
+        let baseToday = Calendar.current.startOfDay(for: Date())
+        let sched = MedicationService.shared.scheduledDateTime(for: med, on: baseToday)
+        overrideDate = sched.addingTimeInterval(TimeInterval(deltaMinutesFromSchedule * 60))
+        offsetMinutes = 0
+        MedicationService.shared.refreshDerivedState()
+    }
+
+    @MainActor
+    public func reset() {
+        overrideDate = nil
+        offsetMinutes = 0
+        MedicationService.shared.refreshDerivedState()
+    }
+    #endif
+}
+
 public enum AppEnvironment {
 
     /// True only for builds compiled with the DEBUG flag (Run from Xcode).

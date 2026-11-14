@@ -95,30 +95,44 @@ public final class AdherenceService: ObservableObject {
     }
 
     // MARK: - Dose Logging (Triggered by UC-6 Confirm Dose)
+    public func hasRecord(for medicationId: UUID, on dayDate: Date) -> Bool {
+        doseRecords.contains { rec in
+            rec.medicationId == medicationId &&
+            calendar.isDate(rec.scheduledDate, inSameDayAs: dayDate)
+        }
+    }
+
     public func recordDoseTaken(
         medication: MedicationItem,
         patientId: String,
-        takenAt: Date = Date()
+        takenAt: Date? = nil,
+        scheduledDay: Date? = nil
     ) {
-        let today = calendar.startOfDay(for: takenAt)
-        
-        // Find existing record for this medication today, or create new one
+        let effectiveTakenAt = takenAt ?? AppClock.shared.now
+        let targetDay = calendar.startOfDay(for: scheduledDay ?? effectiveTakenAt)
+
+        // Find existing record for this medication on targetDay, or create new one
         if let idx = doseRecords.firstIndex(where: {
             $0.medicationId == medication.id &&
-            calendar.isDate($0.scheduledDate, inSameDayAs: today)
+            calendar.isDate($0.scheduledDate, inSameDayAs: targetDay)
         }) {
-            let sched = doseRecords[idx].scheduledDate
-            let delayMinutes = max(0, Int(takenAt.timeIntervalSince(sched) / 60))
-            let isLate = delayMinutes > 30
+            // Prevent duplicate confirmation if already marked as taken on targetDay
+            if doseRecords[idx].status == .takenOnTime || doseRecords[idx].status == .takenLate {
+                return
+            }
 
-            doseRecords[idx].takenDate = takenAt
+            let sched = doseRecords[idx].scheduledDate
+            let delayMinutes = max(0, Int(effectiveTakenAt.timeIntervalSince(sched) / 60))
+            let isLate = delayMinutes > DoseWindowConfig.lateThresholdMinutes
+
+            doseRecords[idx].takenDate = effectiveTakenAt
             doseRecords[idx].status = isLate ? .takenLate : .takenOnTime
             doseRecords[idx].delayMinutes = delayMinutes
         } else {
             // Create record
-            let sched = scheduledDateTime(for: medication, on: today)
-            let delayMinutes = max(0, Int(takenAt.timeIntervalSince(sched) / 60))
-            let isLate = delayMinutes > 30
+            let sched = scheduledDateTime(for: medication, on: targetDay)
+            let delayMinutes = max(0, Int(effectiveTakenAt.timeIntervalSince(sched) / 60))
+            let isLate = delayMinutes > DoseWindowConfig.lateThresholdMinutes
 
             let record = DoseRecord(
                 patientId: patientId,
@@ -126,7 +140,7 @@ public final class AdherenceService: ObservableObject {
                 medicationName: medication.name,
                 dosage: medication.dosage,
                 scheduledDate: sched,
-                takenDate: takenAt,
+                takenDate: effectiveTakenAt,
                 status: isLate ? .takenLate : .takenOnTime,
                 delayMinutes: delayMinutes
             )
@@ -136,12 +150,47 @@ public final class AdherenceService: ObservableObject {
         persistRecords()
     }
 
+    /// Marks a scheduled dose as `.missed` ("فائتة") in the adherence log once its late confirmation window has expired without being taken.
+    public func recordDoseMissedIfNeeded(
+        medication: MedicationItem,
+        patientId: String,
+        on date: Date? = nil
+    ) {
+        let dayStart = calendar.startOfDay(for: date ?? AppClock.shared.now)
+        if let idx = doseRecords.firstIndex(where: {
+            $0.medicationId == medication.id &&
+            calendar.isDate($0.scheduledDate, inSameDayAs: dayStart)
+        }) {
+            if doseRecords[idx].status == .upcoming {
+                doseRecords[idx].status = .missed
+                doseRecords[idx].takenDate = nil
+                doseRecords[idx].delayMinutes = 0
+                persistRecords()
+            }
+            return
+        }
+
+        let sched = scheduledDateTime(for: medication, on: dayStart)
+        let record = DoseRecord(
+            patientId: patientId,
+            medicationId: medication.id,
+            medicationName: medication.name,
+            dosage: medication.dosage,
+            scheduledDate: sched,
+            takenDate: nil,
+            status: .missed,
+            delayMinutes: 0
+        )
+        doseRecords.append(record)
+        persistRecords()
+    }
+
     // MARK: - UC-7 S#3: Available Week Periods
-    public func availableWeekPeriods(count: Int = 4, referenceDate: Date = Date()) -> [WeekPeriod] {
+    public func availableWeekPeriods(count: Int = 4, referenceDate: Date? = nil) -> [WeekPeriod] {
         var periods: [WeekPeriod] = []
 
         // Compute start of current week (Sunday 00:00:00)
-        let currentWeekStart = startOfWeek(for: referenceDate)
+        let currentWeekStart = startOfWeek(for: referenceDate ?? AppClock.shared.now)
 
         for offset in 0..<count {
             guard let weekStart = calendar.date(byAdding: .day, value: -(offset * 7), to: currentWeekStart),
@@ -222,7 +271,7 @@ public final class AdherenceService: ObservableObject {
 
         // 4. Generate 7 Daily Summaries (Sunday through Saturday)
         var dailySummaries: [DailyAdherenceSummary] = []
-        let today = calendar.startOfDay(for: Date())
+        let today = calendar.startOfDay(for: AppClock.shared.now)
 
         for dayOffset in 0..<7 {
             guard let dayDate = calendar.date(byAdding: .day, value: dayOffset, to: period.startDate) else {
@@ -372,7 +421,13 @@ public final class AdherenceService: ObservableObject {
     }
 
     private func scheduledDateTime(for med: MedicationItem, on dayDate: Date) -> Date {
-        let minutes = parseTimeToMinutes(med.timeString)
+        let minutes: Int
+        if let date = med.scheduledDate {
+            let comps = calendar.dateComponents([.hour, .minute], from: date)
+            minutes = (comps.hour ?? 0) * 60 + (comps.minute ?? 0)
+        } else {
+            minutes = parseTimeToMinutes(med.timeString)
+        }
         let hour = minutes / 60
         let minute = minutes % 60
         return calendar.date(bySettingHour: hour, minute: minute, second: 0, of: dayDate) ?? dayDate

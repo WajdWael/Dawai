@@ -18,6 +18,8 @@ public struct IdentityDetailsSheet: View {
 
     @ObservedObject private var themeService = ThemeService.shared
     @ObservedObject private var demoMode = DemoModeService.shared
+    @ObservedObject private var appClock = AppClock.shared
+    @ObservedObject private var medicationService = MedicationService.shared
     @State private var notificationsEnabled: Bool = UserDefaults.standard.object(forKey: "dawai_notifications_enabled") as? Bool ?? true
     @State private var showingResetConfirmation = false
     @State private var showingPermissionDeniedAlert = false
@@ -205,6 +207,100 @@ public struct IdentityDetailsSheet: View {
                                     .foregroundStyle(.primary)
                             }
                         }
+
+                        VStack(alignment: .leading, spacing: 6) {
+                            HStack {
+                                Label("الساعة الحالية للاختبار (DEBUG)", systemImage: "clock.badge.checkmark")
+                                    .font(.system(size: 14, weight: .semibold))
+                                    .foregroundStyle(.primary)
+                                Spacer()
+                                Text(appClock.isUsingSimulatedTime ? "محاكى" : "ساعة الجهاز")
+                                    .font(.system(size: 11, weight: .bold))
+                                    .padding(.horizontal, 8)
+                                    .padding(.vertical, 3)
+                                    .background(
+                                        (appClock.isUsingSimulatedTime ? Color.dawaiWarning : Color.secondary)
+                                            .opacity(0.15)
+                                    )
+                                    .foregroundStyle(appClock.isUsingSimulatedTime ? Color.dawaiWarning : Color.secondary)
+                                    .clipShape(Capsule())
+                            }
+                            Text(formattedSimulatedClock)
+                                .font(.system(size: 13, weight: .medium, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                        }
+                        .padding(.vertical, 2)
+
+                        if let targetMed = medicationService.activeMedication ?? medicationService.medications.first {
+                            Text("الدواء المستهدف: \(targetMed.name) (\(targetMed.timeString.westernNumerals))")
+                                .font(.system(size: 12, weight: .medium))
+                                .foregroundStyle(.secondary)
+
+                            debugStageButton(
+                                title: "المرحلة 1: قبل النافذة (-30 د)",
+                                subtitle: "يعرض «الجرعة القادمة الساعة \(targetMed.timeString.westernNumerals)»",
+                                icon: "clock",
+                                tint: .secondary,
+                                deltaMinutes: -30,
+                                medication: targetMed
+                            )
+                            debugStageButton(
+                                title: "المرحلة 2: داخل النافذة (-10 د)",
+                                subtitle: "يفعّل زر «اخذت الدواء» (قبل \(DoseWindowConfig.preWindowMinutes) د من الموعد)",
+                                icon: "checkmark.circle",
+                                tint: Color.dawaiPrimary,
+                                deltaMinutes: -10,
+                                medication: targetMed
+                            )
+                            debugStageButton(
+                                title: "المرحلة 3: جرعة متأخرة (+45 د)",
+                                subtitle: "يعرض «• جرعة متأخرة» ويبقي زر التأكيد ظاهراً",
+                                icon: "exclamationmark.circle.fill",
+                                tint: Color.dawaiWarning,
+                                deltaMinutes: 45,
+                                medication: targetMed
+                            )
+                            debugStageButton(
+                                title: "المرحلة 4: جرعة فائتة (+130 د)",
+                                subtitle: "بعد \(DoseWindowConfig.missedCutoffMinutes) د — تسجّل «فائتة» ويختفي الزر",
+                                icon: "xmark.octagon.fill",
+                                tint: .red,
+                                deltaMinutes: 130,
+                                medication: targetMed
+                            )
+
+                            HStack(spacing: 8) {
+                                Button("+15 د") {
+                                    appClock.setSimulatedDate(appClock.now.addingTimeInterval(15 * 60))
+                                }
+                                .buttonStyle(.bordered)
+                                Button("+60 د") {
+                                    appClock.setSimulatedDate(appClock.now.addingTimeInterval(60 * 60))
+                                }
+                                .buttonStyle(.bordered)
+                                Button("+24 ساعة") {
+                                    appClock.setSimulatedDate(appClock.now.addingTimeInterval(24 * 60 * 60))
+                                }
+                                .buttonStyle(.bordered)
+                            }
+                            .font(.system(size: 12, weight: .semibold))
+                        } else {
+                            Text("أضف دواءً واحداً على الأقل لتجربة محاكاة المراحل الأربع للنافذة الزمنية.")
+                                .font(.system(size: 12))
+                                .foregroundStyle(.secondary)
+                        }
+
+                        if appClock.isUsingSimulatedTime {
+                            Button(role: .destructive) {
+                                appClock.reset()
+                            } label: {
+                                HStack(spacing: 8) {
+                                    Image(systemName: "arrow.uturn.backward.circle.fill")
+                                    Text("إعادة ضبط الوقت إلى ساعة الجهاز الحقيقية")
+                                        .font(.system(size: 14, weight: .semibold))
+                                }
+                            }
+                        }
                         #endif
                     } header: {
                         Text("وضع تجريبي")
@@ -283,6 +379,43 @@ public struct IdentityDetailsSheet: View {
         }
         .preferredColorScheme(themeService.colorScheme)
     }
+
+    #if DEBUG
+    private var formattedSimulatedClock: String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale.dawaiArabic
+        formatter.dateFormat = "d MMM • hh:mm a"
+        return formatter.string(from: appClock.now).westernNumerals
+    }
+
+    @ViewBuilder
+    private func debugStageButton(
+        title: String,
+        subtitle: String,
+        icon: String,
+        tint: Color,
+        deltaMinutes: Int,
+        medication: MedicationItem
+    ) -> some View {
+        Button {
+            appClock.setStageForMedication(medication, deltaMinutesFromSchedule: deltaMinutes)
+        } label: {
+            HStack(spacing: 10) {
+                Image(systemName: icon)
+                    .font(.system(size: 16))
+                    .foregroundStyle(tint)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(title)
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(.primary)
+                    Text(subtitle)
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+    }
+    #endif
 }
 
 struct IdentityDetailsSheet_Previews: PreviewProvider {
