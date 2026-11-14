@@ -17,6 +17,7 @@ public struct IdentityDetailsSheet: View {
     @Environment(\.dismiss) private var dismiss
 
     @ObservedObject private var themeService = ThemeService.shared
+    @ObservedObject private var demoMode = DemoModeService.shared
     @State private var notificationsEnabled: Bool = UserDefaults.standard.object(forKey: "dawai_notifications_enabled") as? Bool ?? true
     @State private var showingResetConfirmation = false
     @State private var showingPermissionDeniedAlert = false
@@ -158,29 +159,62 @@ public struct IdentityDetailsSheet: View {
                          : "لن تتلقى أي إشعارات أو تذكيرات عند حلول مواعيد الأدوية.")
                 }
 
-                // MARK: - 4. Reset & Data Management
-                Section {
-                    Button {
-                        Task {
-                            let med = MedicationService.shared.medications.first ?? HomeMockData.activeMedication
-                            await MedicationService.shared.simulateInstantMissedDoseAlert(for: med, delaySeconds: 3)
-                        }
-                    } label: {
-                        HStack(spacing: 10) {
-                            Image(systemName: "exclamationmark.triangle.fill")
-                                .font(.system(size: 18))
-                                .foregroundStyle(Color.dawaiWarning)
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text("محاكاة تنبيه تأخر الجرعة 30 د (UC-5)")
-                                    .font(.system(size: 15, weight: .semibold))
-                                    .foregroundStyle(.primary)
-                                Text("إرسال إشعار بعد 3 ثوانٍ لمقدم الرعاية بتأخر الجرعة وتجربة الاتصال")
-                                    .font(.system(size: 12))
-                                    .foregroundStyle(.secondary)
+                // MARK: - 4. Simulator Tools (Debug & TestFlight only)
+                if AppEnvironment.showsSimulatorTools {
+                    Section {
+                        Button {
+                            Task {
+                                let fallbackMed = MedicationItem(
+                                    name: "دواء تجريبي",
+                                    dosage: "حبة واحدة",
+                                    timeString: "12:00 م"
+                                )
+                                let med = MedicationService.shared.medications.first ?? fallbackMed
+                                await MedicationService.shared.simulateInstantMissedDoseAlert(for: med, delaySeconds: 3)
+                            }
+                        } label: {
+                            HStack(spacing: 10) {
+                                Image(systemName: "exclamationmark.triangle.fill")
+                                    .font(.system(size: 18))
+                                    .foregroundStyle(Color.dawaiWarning)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text("محاكاة تنبيه تأخر الجرعة 30 د (UC-5)")
+                                        .font(.system(size: 15, weight: .semibold))
+                                        .foregroundStyle(.primary)
+                                    Text("إرسال إشعار بعد 3 ثوانٍ لمقدم الرعاية بتأخر الجرعة وتجربة الاتصال")
+                                        .font(.system(size: 12))
+                                        .foregroundStyle(.secondary)
+                                }
                             }
                         }
-                    }
 
+                        #if DEBUG
+                        Button {
+                            if demoMode.isActive {
+                                demoMode.disable()
+                            } else {
+                                demoMode.enable()
+                            }
+                        } label: {
+                            HStack(spacing: 10) {
+                                Image(systemName: demoMode.isActive ? "trash.slash.fill" : "tray.and.arrow.down.fill")
+                                    .font(.system(size: 17))
+                                    .foregroundStyle(Color.dawaiPrimary)
+                                Text(demoMode.isActive ? "إيقاف ومسح البيانات التجريبية (DEBUG)" : "تحميل البيانات التجريبية (DEBUG)")
+                                    .font(.system(size: 15, weight: .semibold))
+                                    .foregroundStyle(.primary)
+                            }
+                        }
+                        #endif
+                    } header: {
+                        Text("وضع تجريبي")
+                    } footer: {
+                        Text("تظهر أدوات المحاكاة في نسخ التطوير و TestFlight فقط لتسهيل الاختبار، وتختفي في نسخة App Store.")
+                    }
+                }
+
+                // MARK: - 5. Reset & Data Management
+                Section {
                     Button(role: .destructive) {
                         showingResetConfirmation = true
                     } label: {
@@ -190,9 +224,9 @@ public struct IdentityDetailsSheet: View {
                         }
                     }
                 } header: {
-                    Text("إدارة البيانات واختبار النظام")
+                    Text("إدارة البيانات")
                 } footer: {
-                    Text("يمكنك محاكاة تنبيهات تأخر الجرعات لمقدم الرعاية أو إعادة ضبط الهوية للبدء من جديد.")
+                    Text("إعادة ضبط الهوية تمسح جميع البيانات المحلية المحفوظة على هذا الجهاز للبدء من جديد.")
                 }
             }
             .preferredColorScheme(themeService.colorScheme)
@@ -234,18 +268,17 @@ public struct IdentityDetailsSheet: View {
                     .preferredColorScheme(themeService.colorScheme)
             }
             .confirmationDialog(
-                "إعادة ضبط هوية التطبيق؟",
+                "إعادة ضبط الهوية ومسح جميع البيانات؟",
                 isPresented: $showingResetConfirmation,
                 titleVisibility: .visible
             ) {
-                Button("إعادة الضبط والبدء من جديد", role: .destructive) {
+                Button("مسح جميع البيانات وإعادة الضبط", role: .destructive) {
                     dismiss()
-                    RelationshipService.shared.resetForTesting()
-                    appState.resetIdentityForTesting()
+                    appState.resetIdentityAndAllData()
                 }
                 Button("إلغاء", role: .cancel) {}
             } message: {
-                Text("سيؤدي هذا إلى مسح الهوية الحالية وإعادتك لشاشة اختيار الدور.")
+                Text("سيؤدي هذا إلى مسح الهوية الحالية وجميع الأدوية وسجل الالتزام والارتباطات المحفوظة على هذا الجهاز نهائياً، وإعادتك لشاشة البداية.")
             }
         }
         .preferredColorScheme(themeService.colorScheme)

@@ -172,3 +172,16 @@ extension String {
     }
 }
 
+extension View {
+    /// Removes the extra top margin that `.insetGrouped` List adds above a custom header section.
+    @ViewBuilder
+    public func compactListTopMargin() -> some View {
+        if #available(iOS 17.0, *) {
+            self.contentMargins(.top, 8, for: .scrollContent)
+        } else {
+            self
+        }
+    }
+}
+
+

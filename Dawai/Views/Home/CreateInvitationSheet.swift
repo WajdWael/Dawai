@@ -150,25 +150,25 @@ public struct CreateInvitationSheet: View {
                         }
                     }
 
-                    // MARK: – Simulator Testing (DEBUG only)
-                    #if DEBUG
-                    Section {
-                        Button {
-                            relationshipService.simulateRecipientAcceptance(
-                                for: invite.id,
-                                simulatedRecipientName: currentUser.role == .patient ? "سارة (مقدم رعاية)" : "عمر (مستفيد)"
-                            )
-                            dismiss()
-                        } label: {
-                            Label("محاكاة قبول الطرف الآخر", systemImage: "play.circle")
-                                .foregroundStyle(.secondary)
+                    // MARK: – Simulator Testing (Debug & TestFlight only)
+                    if AppEnvironment.showsSimulatorTools {
+                        Section {
+                            Button {
+                                relationshipService.simulateRecipientAcceptance(
+                                    for: invite.id,
+                                    simulatedRecipientName: currentUser.role == .patient ? "سارة (مقدم رعاية)" : "عمر (مستفيد)"
+                                )
+                                dismiss()
+                            } label: {
+                                Label("محاكاة قبول الطرف الآخر", systemImage: "play.circle")
+                                    .foregroundStyle(.secondary)
+                            }
+                        } header: {
+                            Text("وضع تجريبي")
+                        } footer: {
+                            Text("يظهر هذا الخيار في نسخ التطوير و TestFlight فقط لتجربة الربط، ويختفي في نسخة App Store.")
                         }
-                    } header: {
-                        Text("أدوات المحاكي")
-                    } footer: {
-                        Text("يظهر هذا الخيار في وضع التطوير فقط ولن يظهر في TestFlight أو الإنتاج.")
                     }
-                    #endif
 
                 } else {
 

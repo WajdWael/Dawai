@@ -334,10 +334,11 @@ public final class RelationshipService: ObservableObject {
         }
     }
 
-    public func resetForTesting() {
+    public func resetAllData() {
         outgoingInvitations.removeAll()
         incomingInvitations.removeAll()
         activeRelationships.removeAll()
+        notificationToastMessage = nil
         UserDefaults.standard.removeObject(forKey: storageKeyInvitations)
         UserDefaults.standard.removeObject(forKey: storageKeyRelationships)
     }

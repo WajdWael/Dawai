@@ -19,6 +19,7 @@ public struct AdherenceReportView: View {
     @ObservedObject private var adherenceService = AdherenceService.shared
     @ObservedObject private var relationshipService = RelationshipService.shared
     @ObservedObject private var themeService = ThemeService.shared
+    @ObservedObject private var demoMode = DemoModeService.shared
 
     // Selected state
     @State private var selectedPeriodIndex: Int = 0
@@ -82,8 +83,11 @@ public struct AdherenceReportView: View {
                             caregiverPatientSelector
                         }
 
-                        // 2. Permission check warning (if unauthorized)
-                        if !accessVerification.isAuthorized {
+                        // 2. Empty state when caregiver has no linked patients yet
+                        if currentUser.role == .caregiver && selectedPatientId.isEmpty {
+                            noLinkedBeneficiariesCard
+                        } else if !accessVerification.isAuthorized {
+                            // Permission check warning (if unauthorized)
                             unauthorizedAccessCard
                         } else {
                             // 3. Week Period Selector (UC-7 S#3)
@@ -173,12 +177,12 @@ public struct AdherenceReportView: View {
             } else if let firstActive = relationshipService.activeRelationships.first(where: { $0.caregiverId == currentUser.id }) {
                 selectedPatientId = firstActive.patientId
                 selectedPatientName = firstActive.patientDisplayName
-            } else if let demoFirst = HomeMockData.beneficiaries.first(where: { !$0.isInvitation }) {
+            } else if let demoFirst = demoMode.beneficiaries.first {
                 selectedPatientId = demoFirst.id.uuidString
                 selectedPatientName = demoFirst.name
             } else {
-                selectedPatientId = "default_patient"
-                selectedPatientName = "المستفيد"
+                selectedPatientId = ""
+                selectedPatientName = ""
             }
         }
     }
@@ -186,6 +190,9 @@ public struct AdherenceReportView: View {
     // MARK: - 1. Caregiver Patient Selector (UC-7 S#2)
     @ViewBuilder
     private var caregiverPatientSelector: some View {
+        let activeRels = relationshipService.activeRelationships.filter { $0.caregiverId == currentUser.id }
+        let demoBeneficiaries = demoMode.beneficiaries
+
         VStack(alignment: .leading, spacing: 8) {
             HStack {
                 Label("المستفيد المحدد", systemImage: "person.circle.fill")
@@ -199,21 +206,28 @@ public struct AdherenceReportView: View {
                 }
             }
 
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 8) {
-                    // Connected active relationships
-                    ForEach(relationshipService.activeRelationships.filter { $0.caregiverId == currentUser.id }) { rel in
-                        patientChip(id: rel.patientId, name: rel.patientDisplayName, isConnected: true)
-                    }
+            if activeRels.isEmpty && demoBeneficiaries.isEmpty {
+                Text("لا يوجد مستفيدون مرتبطون لعرض تقاريرهم حالياً.")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(.secondary)
+                    .padding(.vertical, 4)
+            } else {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        // Connected active relationships
+                        ForEach(activeRels) { rel in
+                            patientChip(id: rel.patientId, name: rel.patientDisplayName, isConnected: true)
+                        }
 
-                    // Demo beneficiaries if no active relationship is available
-                    if relationshipService.activeRelationships.isEmpty {
-                        ForEach(HomeMockData.beneficiaries.filter { !$0.isInvitation }) { ben in
-                            patientChip(id: ben.id.uuidString, name: ben.name, isConnected: true)
+                        // Demo beneficiaries if enabled in DEBUG and no active relationship is available
+                        if activeRels.isEmpty {
+                            ForEach(demoBeneficiaries) { ben in
+                                patientChip(id: ben.id.uuidString, name: ben.name, isConnected: true)
+                            }
                         }
                     }
+                    .padding(.vertical, 2)
                 }
-                .padding(.vertical, 2)
             }
         }
         .padding(14)
@@ -256,7 +270,37 @@ public struct AdherenceReportView: View {
         .buttonStyle(.plain)
     }
 
-    // MARK: - 2. Unauthorized Access Card
+    // MARK: - 2. Empty & Unauthorized Cards
+    @ViewBuilder
+    private var noLinkedBeneficiariesCard: some View {
+        VStack(spacing: 14) {
+            Image(systemName: "person.2.slash")
+                .font(.system(size: 42))
+                .foregroundStyle(Color.secondary.opacity(0.75))
+
+            Text("لا يوجد مستفيدون مرتبطون")
+                .font(.system(size: 18, weight: .bold))
+                .foregroundStyle(.primary)
+
+            Text("يرجى إرسال دعوة ربط لمستفيد وقبولها أولاً لتتمكن من متابعة تقارير الالتزام الدوائي الخاصة به.")
+                .font(.system(size: 14))
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 16)
+        }
+        .padding(.vertical, 36)
+        .padding(.horizontal, 20)
+        .frame(maxWidth: .infinity)
+        .background(
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .fill(.ultraThinMaterial)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 18, style: .continuous)
+                        .stroke(Color.dawaiGlassBorder, lineWidth: 1)
+                )
+        )
+    }
+
     @ViewBuilder
     private var unauthorizedAccessCard: some View {
         VStack(spacing: 12) {

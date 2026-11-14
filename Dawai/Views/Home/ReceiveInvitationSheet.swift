@@ -226,32 +226,34 @@ public struct ReceiveInvitationSheet: View {
                         )
                     }
 
-                    // Simulator Test Shortcuts (To easily test different roles)
-                    VStack(alignment: .leading, spacing: 10) {
-                        Text("اختصارات تجربة المحاكي")
-                            .font(.system(size: 14, weight: .bold))
-                            .foregroundStyle(.secondary)
+                    // Simulator Test Shortcuts (Debug & TestFlight only)
+                    if AppEnvironment.showsSimulatorTools {
+                        VStack(alignment: .leading, spacing: 10) {
+                            Text("وضع تجريبي")
+                                .font(.system(size: 14, weight: .bold))
+                                .foregroundStyle(.secondary)
 
-                        Button {
-                            let simulatedRole: UserRole = currentUser.role == .patient ? .caregiver : .patient
-                            let simulatedName = currentUser.role == .patient ? "سارة (مقدم رعاية)" : "عمر (مستفيد)"
-                            let simInvite = relationshipService.simulateIncomingInvitation(
-                                fromName: simulatedName,
-                                fromRole: simulatedRole,
-                                currentRecipient: currentUser
-                            )
-                            tokenInput = simInvite.token
-                            validateToken()
-                        } label: {
-                            HStack {
-                                Image(systemName: "wand.and.stars")
-                                Text("توليد دعوة واردة متوافقة لتجربة القبول")
-                                    .font(.system(size: 14, weight: .semibold))
+                            Button {
+                                let simulatedRole: UserRole = currentUser.role == .patient ? .caregiver : .patient
+                                let simulatedName = currentUser.role == .patient ? "سارة (مقدم رعاية)" : "عمر (مستفيد)"
+                                let simInvite = relationshipService.simulateIncomingInvitation(
+                                    fromName: simulatedName,
+                                    fromRole: simulatedRole,
+                                    currentRecipient: currentUser
+                                )
+                                tokenInput = simInvite.token
+                                validateToken()
+                            } label: {
+                                HStack {
+                                    Image(systemName: "wand.and.stars")
+                                    Text("توليد دعوة واردة متوافقة لتجربة القبول")
+                                        .font(.system(size: 14, weight: .semibold))
+                                }
+                                .foregroundStyle(Color.dawaiPrimary)
                             }
-                            .foregroundStyle(Color.dawaiPrimary)
                         }
+                        .padding(.horizontal, 4)
                     }
-                    .padding(.horizontal, 4)
                 }
                 .padding(.horizontal, 20)
                 .padding(.bottom, 24)

@@ -202,11 +202,11 @@ public struct BeneficiarySummary: Identifiable, Equatable {
     }
 }
 
-// MARK: - Centralized Dummy Data Store
+// MARK: - Centralized Dummy Data Store (Debug builds only)
+// This data is compiled out of TestFlight and App Store builds. In Debug it is loaded
+// only when demo mode is switched on from Settings (see DemoModeService).
+#if DEBUG
 public enum HomeMockData {
-    // Patient Data
-    public static let patientRemainingDoses: Int = 3
-
     public static let activeMedication = MedicationItem(
         name: "اسبرين",
         dosage: "حبتان قبل الاكل",
@@ -258,3 +258,4 @@ public enum HomeMockData {
         )
     ]
 }
+#endif

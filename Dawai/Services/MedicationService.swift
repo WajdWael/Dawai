@@ -20,7 +20,8 @@ public final class MedicationService: ObservableObject {
     @Published public private(set) var medications: [MedicationItem] = []
     @Published public var activeMedication: MedicationItem?
     @Published public var upcomingDoses: [UpcomingDose] = []
-    @Published public var remainingDoses: Int = 3
+    /// Untaken doses scheduled for today. Always derived from the real schedule in `refreshDerivedState()`.
+    @Published public var remainingDoses: Int = 0
 
     // MARK: - Use-Case 12 (UC-12): Today's Medications & Auto-Sorting State
     @Published public private(set) var todayMedications: [MedicationItem] = []
@@ -55,8 +56,7 @@ public final class MedicationService: ObservableObject {
     // MARK: - Persistence & Initial State
     public func loadPersistedMedications() {
         if let data = UserDefaults.standard.data(forKey: storageKey),
-           let decoded = try? JSONDecoder().decode([MedicationItem].self, from: data),
-           !decoded.isEmpty {
+           let decoded = try? JSONDecoder().decode([MedicationItem].self, from: data) {
             self.medications = decoded.map { item in
                 var m = item
                 m.timeString = m.timeString.westernNumerals
@@ -64,17 +64,40 @@ public final class MedicationService: ObservableObject {
                 return m
             }
         } else {
-            // Seed with initial HomeMockData
-            let initial = [
-                HomeMockData.activeMedication,
-                MedicationItem(name: "ميترفين", dosage: "حبة واحدة بعد الأكل", timeString: "12:00 ص", scheduledDate: nil, days: ["كل يوم"], frequency: "مرة يوميًا"),
-                MedicationItem(name: "فيتامين د", dosage: "قطرة واحدة يوميًا", timeString: "10:00 ص", scheduledDate: nil, days: ["كل يوم"], frequency: "مرة يوميًا")
-            ]
-            self.medications = initial
-            persistMedications()
+            // A new user starts with no medications.
+            self.medications = []
         }
         refreshDerivedState()
     }
+
+    // MARK: - Reset (wipes all medication data on this device)
+    public func resetAllData() {
+        let center = UNUserNotificationCenter.current()
+        center.removeAllPendingNotificationRequests()
+        center.removeAllDeliveredNotifications()
+
+        medications = []
+        pendingDeletionRequests = []
+        toastMessage = nil
+        notificationWarning = nil
+
+        UserDefaults.standard.removeObject(forKey: storageKey)
+        UserDefaults.standard.removeObject(forKey: storageKeyDeletionRequests)
+        refreshDerivedState()
+    }
+
+    #if DEBUG
+    // MARK: - Demo data (Debug builds only, loaded on request from Settings)
+    public func loadDemoData() {
+        medications = [
+            HomeMockData.activeMedication,
+            MedicationItem(name: "ميترفين", dosage: "حبة واحدة بعد الأكل", timeString: "12:00 ص", scheduledDate: nil, days: ["كل يوم"], frequency: "مرة يوميًا"),
+            MedicationItem(name: "فيتامين د", dosage: "قطرة واحدة يوميًا", timeString: "10:00 ص", scheduledDate: nil, days: ["كل يوم"], frequency: "مرة يوميًا")
+        ]
+        persistMedications()
+        refreshDerivedState()
+    }
+    #endif
 
     private func persistMedications() {
         if let encoded = try? JSONEncoder().encode(medications) {

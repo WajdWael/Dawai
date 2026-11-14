@@ -71,8 +71,9 @@ public final class AppState: ObservableObject {
         }
     }
 
-    /// Resets the application identity to test first launch UC-1 experience again.
-    public func resetIdentityForTesting() {
+    /// Clears the identity and every piece of locally stored user data, returning the app to a first-launch state.
+    public func resetIdentityAndAllData() {
+        LocalDataStore.resetAllUserData()
         identityService.resetIdentity()
         withAnimation(.easeInOut(duration: 0.35)) {
             self.currentIdentity = nil

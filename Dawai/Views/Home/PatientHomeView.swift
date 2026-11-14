@@ -77,6 +77,7 @@ public struct PatientHomeView: View {
                     caregiversSection
                 }
                 .listStyle(.insetGrouped)
+                .compactListTopMargin()
                 .scrollContentBackground(.hidden)
                 .background(Color.dawaiBackground.ignoresSafeArea())
 
@@ -88,6 +89,7 @@ public struct PatientHomeView: View {
                     }
                 }
             }
+            .toolbar(.hidden, for: .navigationBar)
             .environment(\.layoutDirection, .rightToLeft)
             .environment(\.locale, Locale.dawaiArabic)
             .sheet(isPresented: $showingCreateInvitationSheet) {

@@ -13,6 +13,8 @@ struct DawaiApp: App {
     @ObservedObject private var themeService = ThemeService.shared
 
     init() {
+        // Must run before any service reads its stored data.
+        LocalDataStore.prepareOnLaunch()
         UNUserNotificationCenter.current().delegate = NotificationDelegate.shared
     }
 

@@ -15,8 +15,7 @@ public struct CaregiverHomeView: View {
     @ObservedObject private var relationshipService = RelationshipService.shared
     @ObservedObject private var medicationService = MedicationService.shared
     @ObservedObject private var themeService = ThemeService.shared
-
-    // UC-2 Sheets State
+    @ObservedObject private var demoMode = DemoModeService.shared
     @State private var showingCreateInvitationSheet = false
     @State private var showingSettingsSheet = false
     @State private var showingReportSheet = false
@@ -50,6 +49,7 @@ public struct CaregiverHomeView: View {
                     beneficiariesSection
                 }
                 .listStyle(.insetGrouped)
+                .compactListTopMargin()
                 .scrollContentBackground(.hidden)
                 .background(Color.dawaiBackground.ignoresSafeArea())
 
@@ -61,6 +61,7 @@ public struct CaregiverHomeView: View {
                     }
                 }
             }
+            .toolbar(.hidden, for: .navigationBar)
             .environment(\.layoutDirection, .rightToLeft)
             .environment(\.locale, Locale.dawaiArabic)
             .sheet(isPresented: $showingCreateInvitationSheet) {
@@ -240,7 +241,7 @@ public struct CaregiverHomeView: View {
     @ViewBuilder
     private var beneficiariesSection: some View {
         let activeRels = relationshipService.activeRelationships.filter { $0.caregiverId == identity.id }
-        let demoItems = HomeMockData.beneficiaries.filter { !$0.isInvitation }
+        let demoItems = demoMode.beneficiaries
 
         Section {
             if !activeRels.isEmpty {
@@ -248,12 +249,11 @@ public struct CaregiverHomeView: View {
                     activePatientRow(rel: rel)
                         .listRowBackground(rowBackground(hasDelayAlert: medicationService.hasMissedDosesToday))
                 }
-            } else if relationshipService.outgoingInvitations.isEmpty && relationshipService.incomingInvitations.isEmpty {
-                // All beneficiaries together in the same system list
+            } else if !demoItems.isEmpty {
                 ForEach(demoItems, id: \.id) { item in
                     demoItemRow(item: item)
                 }
-            } else {
+            } else if !relationshipService.outgoingInvitations.isEmpty || !relationshipService.incomingInvitations.isEmpty {
                 HStack {
                     Spacer()
                     VStack(spacing: 8) {
@@ -267,6 +267,43 @@ public struct CaregiverHomeView: View {
                     .padding(.vertical, 16)
                     Spacer()
                 }
+                .listRowBackground(glassRowBackground)
+            } else {
+                VStack(spacing: 12) {
+                    Image(systemName: "person.2.slash")
+                        .font(.system(size: 32, weight: .regular))
+                        .foregroundStyle(Color.dawaiPrimary.opacity(0.75))
+
+                    Text("لا يوجد مستفيدون مرتبطون حالياً")
+                        .font(.system(size: 16, weight: .bold))
+                        .foregroundStyle(.primary)
+
+                    Text("اضغط على زر (+) أعلى القائمة لإرسال دعوة ربط لمستفيد ومتابعة جدول أدويته.")
+                        .font(.system(size: 13))
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal, 12)
+
+                    Button {
+                        showingCreateInvitationSheet = true
+                    } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: "link.badge.plus")
+                                .font(.system(size: 14, weight: .bold))
+                            Text("إرسال دعوة ربط")
+                                .font(.system(size: 14, weight: .bold))
+                        }
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 9)
+                        .background(Color.dawaiPrimary)
+                        .foregroundStyle(.white)
+                        .clipShape(Capsule())
+                    }
+                    .buttonStyle(.plain)
+                    .padding(.top, 2)
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 20)
                 .listRowBackground(glassRowBackground)
             }
         } header: {

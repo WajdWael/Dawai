@@ -31,13 +31,32 @@ public final class AdherenceService: ObservableObject {
     // MARK: - Persistence
     public func loadRecords() {
         if let data = UserDefaults.standard.data(forKey: storageKey),
-           let decoded = try? JSONDecoder().decode([DoseRecord].self, from: data),
-           !decoded.isEmpty {
+           let decoded = try? JSONDecoder().decode([DoseRecord].self, from: data) {
             self.doseRecords = decoded
         } else {
-            // Seed realistic historical dose logs for demonstration and testing
-            seedRealisticDoseHistory()
+            // A new user starts with no dose history.
+            self.doseRecords = []
         }
+    }
+
+    // MARK: - Reset (wipes all dose history on this device)
+    public func resetAllData() {
+        doseRecords = []
+        UserDefaults.standard.removeObject(forKey: storageKey)
+    }
+
+    #if DEBUG
+    // MARK: - Demo data (Debug builds only, loaded on request from Settings)
+    public func loadDemoHistory() {
+        seedRealisticDoseHistory()
+    }
+    #endif
+
+    /// A record belongs to a patient only when the ids match.
+    /// Demo history (Debug builds with demo mode on) is stored under "default_patient" and shown to everyone.
+    private func record(_ record: DoseRecord, belongsTo patientId: String) -> Bool {
+        if record.patientId == patientId { return true }
+        return DemoModeService.shared.isActive && record.patientId == "default_patient"
     }
 
     private func persistRecords() {
@@ -67,9 +86,8 @@ public final class AdherenceService: ObservableObject {
             return (true, nil)
         }
 
-        // Allow demo beneficiaries if demo environment is active
-        let isDemoBeneficiary = HomeMockData.beneficiaries.contains { $0.id.uuidString == targetPatientId || $0.name == targetPatientId }
-        if isDemoBeneficiary {
+        // Allow demo beneficiaries only while demo mode is on (Debug builds)
+        if DemoModeService.shared.isDemoPatient(targetPatientId) {
             return (true, nil)
         }
 
@@ -167,10 +185,10 @@ public final class AdherenceService: ObservableObject {
         period: WeekPeriod
     ) -> WeeklyAdherenceReport {
         // 1. Gather all records for target patient in this week period
-        let patientRecords = doseRecords.filter { record in
-            (record.patientId == patientId || patientId.isEmpty || record.patientId == "default_patient") &&
-            record.scheduledDate >= period.startDate &&
-            record.scheduledDate <= period.endDate
+        let patientRecords = doseRecords.filter { rec in
+            record(rec, belongsTo: patientId) &&
+            rec.scheduledDate >= period.startDate &&
+            rec.scheduledDate <= period.endDate
         }
 
         // Check if sufficient data is available (Post-condition requirement)
@@ -275,10 +293,10 @@ public final class AdherenceService: ObservableObject {
         var trendVsPrev: Double? = nil
         if let prevStart = calendar.date(byAdding: .day, value: -7, to: period.startDate),
            let prevEnd = calendar.date(byAdding: .second, value: -1, to: period.startDate) {
-            let prevRecords = doseRecords.filter { record in
-                (record.patientId == patientId || patientId.isEmpty || record.patientId == "default_patient") &&
-                record.scheduledDate >= prevStart &&
-                record.scheduledDate <= prevEnd
+            let prevRecords = doseRecords.filter { rec in
+                record(rec, belongsTo: patientId) &&
+                rec.scheduledDate >= prevStart &&
+                rec.scheduledDate <= prevEnd
             }
             if !prevRecords.isEmpty {
                 let prevTaken = prevRecords.filter { $0.status == .takenOnTime || $0.status == .takenLate }.count
@@ -379,7 +397,8 @@ public final class AdherenceService: ObservableObject {
         return hour * 60 + m
     }
 
-    // MARK: - Realistic Dose History Seeding (Past 4 Weeks)
+    #if DEBUG
+    // MARK: - Realistic Dose History Seeding (Past 4 Weeks, Debug demo data only)
     private func seedRealisticDoseHistory() {
         var seeded: [DoseRecord] = []
         let today = calendar.startOfDay(for: Date())
@@ -396,7 +415,6 @@ public final class AdherenceService: ObservableObject {
             // Seed across 28 days (4 weeks: current week + 3 previous weeks)
             for dayOffset in -21...6 {
                 guard let day = calendar.date(byAdding: .day, value: dayOffset, to: weekStart) else { continue }
-                let isPastDay = day < today
                 let isTodayDay = calendar.isDate(day, inSameDayAs: today)
                 let isFutureDay = day > today
 
@@ -463,4 +481,5 @@ public final class AdherenceService: ObservableObject {
         self.doseRecords = seeded
         persistRecords()
     }
+    #endif
 }
