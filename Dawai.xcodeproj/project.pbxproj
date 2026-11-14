@@ -10,9 +10,22 @@
 		8B6682B9307C113400E6CE41 /* Dawai.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Dawai.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
+/* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
+		8B6682C7307C113500E6CE41 /* Exceptions for "Dawai" folder in "Dawai" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				Info.plist,
+			);
+			target = 8B6682B8307C113400E6CE41 /* Dawai */;
+		};
+/* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
+
 /* Begin PBXFileSystemSynchronizedRootGroup section */
 		8B6682BB307C113400E6CE41 /* Dawai */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+				8B6682C7307C113500E6CE41 /* Exceptions for "Dawai" folder in "Dawai" target */,
+			);
 			path = Dawai;
 			sourceTree = "<group>";
 		};
@@ -256,6 +269,7 @@
 				DEVELOPMENT_TEAM = F3FXMY5BHX;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = Dawai/Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = "دواي | Dawai";
 				INFOPLIST_KEY_ITSAppUsesNonExemptEncryption = NO;
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
@@ -290,6 +304,7 @@
 				DEVELOPMENT_TEAM = F3FXMY5BHX;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = Dawai/Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = "دواي | Dawai";
 				INFOPLIST_KEY_ITSAppUsesNonExemptEncryption = NO;
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
