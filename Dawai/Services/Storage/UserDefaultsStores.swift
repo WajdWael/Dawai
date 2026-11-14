@@ -114,7 +114,8 @@ private extension UserDefaults {
 
     func setEncoded<T: Encodable>(_ value: T, forKey key: String) {
         do {
-            set(try JSONEncoder().encode(value), forKey: key)
+            let data = try JSONEncoder().encode(value)
+            set(data, forKey: key)
         } catch {
             print("Failed to persist data for \(key): \(error)")
         }

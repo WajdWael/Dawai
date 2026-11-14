@@ -286,8 +286,9 @@ public final class MedicationService: ObservableObject {
             persistMedications()
             // Confirming yesterday's dose removed the repeating missed-dose alert (`cancelMissedDoseAlert`).
             // The dose is open again today, so the alert must be scheduled again.
+            let toReschedule = resetMedications
             Task {
-                for med in resetMedications {
+                for med in toReschedule {
                     await self.scheduleMissedDoseAlert(for: med)
                 }
             }
