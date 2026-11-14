@@ -113,9 +113,18 @@ public final class RelationshipService: ObservableObject {
     }
 
     // MARK: - Recipient Rejects Invitation
+    /// Only a pending invitation that has not expired can be rejected.
     public func rejectInvitation(token: String, recipient: UserIdentity) throws {
         guard var invitation = findInvitation(by: token) else {
             throw InvitationError.tokenNotFound
+        }
+
+        guard invitation.status == .pending else {
+            throw InvitationError.invitationAlreadyProcessed
+        }
+
+        if invitation.isExpired {
+            throw InvitationError.tokenExpired
         }
 
         invitation.status = .rejected
@@ -152,9 +161,15 @@ public final class RelationshipService: ObservableObject {
     }
 
     public func disconnect(relationshipId: UUID) {
+        let ended = activeRelationships.filter { $0.id == relationshipId }
         activeRelationships.removeAll { $0.id == relationshipId }
         showToast("تم إنهاء الارتباط بنجاح.")
         persistState()
+
+        // The former caregiver can no longer act on this patient's pending deletion requests
+        for rel in ended {
+            MedicationService.shared.relationshipEnded(patientId: rel.patientId, caregiverId: rel.caregiverId)
+        }
     }
 
     // MARK: - S#6 & S#7: Initiator Confirms Connection (Mutual Handshake Complete)
@@ -168,6 +183,10 @@ public final class RelationshipService: ObservableObject {
 
         guard invitation.initiatorId == initiator.id else {
             throw InvitationError.tokenNotFound
+        }
+
+        if invitation.isExpired {
+            throw InvitationError.tokenExpired
         }
 
         guard invitation.status == .accepted else {

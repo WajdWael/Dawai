@@ -110,7 +110,8 @@ public struct MedicationDeletionRequest: Identifiable, Codable, Equatable {
     public let timeString: String
     public let patientId: String
     public let patientDisplayName: String
-    public let caregiverId: String?
+    /// Every caregiver linked to the patient when the request was made. Any one of them may approve or reject it.
+    public var caregiverIds: [String]
     public let requestedAt: Date
     public var status: RequestStatus
 
@@ -118,6 +119,12 @@ public struct MedicationDeletionRequest: Identifiable, Codable, Equatable {
         case pending
         case approved
         case rejected
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id, medicationId, medicationName, dosage, timeString, patientId, patientDisplayName, caregiverIds, requestedAt, status
+        /// Single-caregiver field written by earlier versions; read only.
+        case legacyCaregiverId = "caregiverId"
     }
 
     public init(
@@ -128,7 +135,7 @@ public struct MedicationDeletionRequest: Identifiable, Codable, Equatable {
         timeString: String,
         patientId: String,
         patientDisplayName: String,
-        caregiverId: String? = nil,
+        caregiverIds: [String] = [],
         requestedAt: Date = Date(),
         status: RequestStatus = .pending
     ) {
@@ -139,9 +146,43 @@ public struct MedicationDeletionRequest: Identifiable, Codable, Equatable {
         self.timeString = timeString
         self.patientId = patientId
         self.patientDisplayName = patientDisplayName
-        self.caregiverId = caregiverId
+        self.caregiverIds = caregiverIds
         self.requestedAt = requestedAt
         self.status = status
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        medicationId = try container.decode(UUID.self, forKey: .medicationId)
+        medicationName = try container.decode(String.self, forKey: .medicationName)
+        dosage = try container.decode(String.self, forKey: .dosage)
+        timeString = try container.decode(String.self, forKey: .timeString)
+        patientId = try container.decode(String.self, forKey: .patientId)
+        patientDisplayName = try container.decode(String.self, forKey: .patientDisplayName)
+        if let ids = try container.decodeIfPresent([String].self, forKey: .caregiverIds) {
+            caregiverIds = ids
+        } else if let legacyId = try container.decodeIfPresent(String.self, forKey: .legacyCaregiverId) {
+            caregiverIds = [legacyId]
+        } else {
+            caregiverIds = []
+        }
+        requestedAt = try container.decode(Date.self, forKey: .requestedAt)
+        status = try container.decode(RequestStatus.self, forKey: .status)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(medicationId, forKey: .medicationId)
+        try container.encode(medicationName, forKey: .medicationName)
+        try container.encode(dosage, forKey: .dosage)
+        try container.encode(timeString, forKey: .timeString)
+        try container.encode(patientId, forKey: .patientId)
+        try container.encode(patientDisplayName, forKey: .patientDisplayName)
+        try container.encode(caregiverIds, forKey: .caregiverIds)
+        try container.encode(requestedAt, forKey: .requestedAt)
+        try container.encode(status, forKey: .status)
     }
 }
 

@@ -1191,7 +1191,8 @@ public struct PatientHomeView: View {
                     initiator: identity
                 )
             } catch {
-                // Toast notification managed by relationshipService
+                // e.g. the invitation expired before it was confirmed
+                relationshipService.showToast(error.localizedDescription)
             }
         }
     }
@@ -1217,7 +1218,8 @@ public struct PatientHomeView: View {
                     recipient: identity
                 )
             } catch {
-                // Toast notification managed by relationshipService
+                // Only a pending, unexpired invitation can be rejected
+                relationshipService.showToast(error.localizedDescription)
             }
         }
     }

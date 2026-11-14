@@ -677,17 +677,24 @@ public final class MedicationService: ObservableObject {
     }
 
     /// UC-11 Collaborative Workflow: Patient requests deletion of a medication
-    /// If connected to caregivers: marks medication as pending deletion and sends a request/notification to caregiver.
+    /// If connected to caregivers: marks medication as pending deletion and sends one request to every caregiver
+    /// linked to this patient. Any one of them can approve or reject it.
     /// If not connected to any caregiver: deletes directly.
+    /// - Parameter caregivers: Relationships to consider; only active links to `patient` are used.
     public func requestMedicationDeletionByPatient(
         medicationId: UUID,
         patient: UserIdentity,
         caregivers: [ActiveRelationship]
     ) {
-        guard let item = allMedications.first(where: { $0.id == medicationId }) else { return }
+        guard let item = allMedications.first(where: { $0.id == medicationId && $0.patientId == patient.id }) else { return }
+
+        var caregiverIds: [String] = []
+        for rel in caregivers where rel.patientId == patient.id && rel.isActive && !caregiverIds.contains(rel.caregiverId) {
+            caregiverIds.append(rel.caregiverId)
+        }
 
         // If no caregiver is connected, delete directly
-        if caregivers.isEmpty {
+        if caregiverIds.isEmpty {
             deleteMedicationDirectly(id: medicationId)
             return
         }
@@ -699,29 +706,95 @@ public final class MedicationService: ObservableObject {
             refreshDerivedState()
         }
 
-        let caregiverId = caregivers.first?.caregiverId
-        let request = MedicationDeletionRequest(
-            medicationId: medicationId,
-            medicationName: item.name,
-            dosage: item.dosage,
-            timeString: item.timeString,
-            patientId: patient.id,
-            patientDisplayName: patient.displayName,
-            caregiverId: caregiverId
+        if let existingIndex = pendingDeletionRequests.firstIndex(where: { $0.medicationId == medicationId }) {
+            // Already requested: make sure every currently linked caregiver can act on it
+            pendingDeletionRequests[existingIndex].caregiverIds = caregiverIds
+        } else {
+            pendingDeletionRequests.append(
+                MedicationDeletionRequest(
+                    medicationId: medicationId,
+                    medicationName: item.name,
+                    dosage: item.dosage,
+                    timeString: item.timeString,
+                    patientId: patient.id,
+                    patientDisplayName: patient.displayName,
+                    caregiverIds: caregiverIds
+                )
+            )
+        }
+        persistDeletionRequests()
+
+        if caregiverIds.count > 1 {
+            showToast("تم إرسال طلب حذف دواء \"\(item.name)\" إلى مقدمي الرعاية المرتبطين بك للموافقة.")
+        } else {
+            showToast("تم إرسال طلب حذف دواء \"\(item.name)\" إلى مقدم الرعاية للموافقة.")
+        }
+    }
+
+    /// True when `caregiverId` may approve or reject `request`: it was sent to them and they are still
+    /// actively linked to the patient. Requests saved without recipients accept any linked caregiver.
+    public func canRespond(to request: MedicationDeletionRequest, caregiverId: String) -> Bool {
+        let isLinked = RelationshipService.shared.activeRelationships.contains {
+            $0.caregiverId == caregiverId && $0.patientId == request.patientId && $0.isActive
+        }
+        guard isLinked else { return false }
+        return request.caregiverIds.isEmpty || request.caregiverIds.contains(caregiverId)
+    }
+
+    /// Pending deletion requests that `caregiverId` can approve or reject.
+    public func deletionRequests(forCaregiver caregiverId: String) -> [MedicationDeletionRequest] {
+        pendingDeletionRequests.filter { canRespond(to: $0, caregiverId: caregiverId) }
+    }
+
+    /// Called after a patient–caregiver link ends. That caregiver is removed from the patient's pending
+    /// deletion requests; a request left with no linked caregiver is withdrawn and its medication stays scheduled.
+    public func relationshipEnded(patientId: String, caregiverId: String) {
+        let stillLinked = Set(
+            RelationshipService.shared.activeRelationships
+                .filter { $0.patientId == patientId && $0.isActive }
+                .map(\.caregiverId)
         )
 
-        if !pendingDeletionRequests.contains(where: { $0.medicationId == medicationId }) {
-            pendingDeletionRequests.append(request)
-            persistDeletionRequests()
+        var withdrawnMedicationIds: [UUID] = []
+        var changed = false
+        for idx in pendingDeletionRequests.indices.reversed() where pendingDeletionRequests[idx].patientId == patientId {
+            let original = pendingDeletionRequests[idx].caregiverIds
+            let remaining = original.filter { $0 != caregiverId }
+            // Requests saved without recipients stay open while any caregiver is still linked.
+            let hasRecipient = original.isEmpty
+                ? !stillLinked.isEmpty
+                : remaining.contains { stillLinked.contains($0) }
+            if hasRecipient {
+                if remaining != pendingDeletionRequests[idx].caregiverIds {
+                    pendingDeletionRequests[idx].caregiverIds = remaining
+                    changed = true
+                }
+            } else {
+                withdrawnMedicationIds.append(pendingDeletionRequests[idx].medicationId)
+                pendingDeletionRequests.remove(at: idx)
+                changed = true
+            }
         }
+        guard changed else { return }
 
-        showToast("تم إرسال طلب حذف دواء \"\(item.name)\" إلى مقدم الرعاية للموافقة.")
+        for idx in allMedications.indices where withdrawnMedicationIds.contains(allMedications[idx].id) {
+            allMedications[idx].isPendingDeletion = false
+        }
+        if !withdrawnMedicationIds.isEmpty {
+            persistMedications()
+            refreshDerivedState()
+        }
+        persistDeletionRequests()
     }
 
     /// UC-11: Caregiver approves deletion request -> permanently deletes medication from patient's schedule
-    public func approveDeletionRequest(requestId: UUID) {
+    public func approveDeletionRequest(requestId: UUID, by caregiver: UserIdentity) {
         guard let reqIndex = pendingDeletionRequests.firstIndex(where: { $0.id == requestId }) else { return }
         let request = pendingDeletionRequests[reqIndex]
+        guard canRespond(to: request, caregiverId: caregiver.id) else {
+            showToast("لا تملك صلاحية الرد على طلب الحذف هذا.")
+            return
+        }
 
         // 1. Cancel future reminders (UC-11 S#5)
         cancelReminder(id: request.medicationId)
@@ -741,9 +814,13 @@ public final class MedicationService: ObservableObject {
     }
 
     /// UC-11: Caregiver rejects deletion request -> keeps medication active in patient's schedule
-    public func rejectDeletionRequest(requestId: UUID) {
+    public func rejectDeletionRequest(requestId: UUID, by caregiver: UserIdentity) {
         guard let reqIndex = pendingDeletionRequests.firstIndex(where: { $0.id == requestId }) else { return }
         let request = pendingDeletionRequests[reqIndex]
+        guard canRespond(to: request, caregiverId: caregiver.id) else {
+            showToast("لا تملك صلاحية الرد على طلب الحذف هذا.")
+            return
+        }
 
         // 1. Restore medication (clear pending flag, keep active in schedule)
         if let medIndex = allMedications.firstIndex(where: { $0.id == request.medicationId }) {

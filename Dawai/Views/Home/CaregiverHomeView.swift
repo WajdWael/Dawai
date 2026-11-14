@@ -41,7 +41,7 @@ public struct CaregiverHomeView: View {
                     invitationsSection
 
                     // Actionable Medication Deletion Requests (UC-11)
-                    if !medicationService.pendingDeletionRequests.isEmpty {
+                    if !medicationService.deletionRequests(forCaregiver: identity.id).isEmpty {
                         pendingDeletionSection
                     }
 
@@ -159,7 +159,7 @@ public struct CaregiverHomeView: View {
     @ViewBuilder
     private var pendingDeletionSection: some View {
         Section {
-            ForEach(medicationService.pendingDeletionRequests) { req in
+            ForEach(medicationService.deletionRequests(forCaregiver: identity.id)) { req in
                 VStack(alignment: .leading, spacing: 10) {
                     HStack {
                         VStack(alignment: .leading, spacing: 2) {
@@ -186,7 +186,7 @@ public struct CaregiverHomeView: View {
                     HStack(spacing: 12) {
                         Button {
                             withAnimation {
-                                medicationService.approveDeletionRequest(requestId: req.id)
+                                medicationService.approveDeletionRequest(requestId: req.id, by: identity)
                             }
                         } label: {
                             HStack(spacing: 4) {
@@ -205,7 +205,7 @@ public struct CaregiverHomeView: View {
 
                         Button {
                             withAnimation {
-                                medicationService.rejectDeletionRequest(requestId: req.id)
+                                medicationService.rejectDeletionRequest(requestId: req.id, by: identity)
                             }
                         } label: {
                             HStack(spacing: 4) {
@@ -706,7 +706,8 @@ public struct CaregiverHomeView: View {
                     initiator: identity
                 )
             } catch {
-                // Toast notification is managed by relationshipService
+                // e.g. the invitation expired before it was confirmed
+                relationshipService.showToast(error.localizedDescription)
             }
         }
     }
@@ -732,7 +733,8 @@ public struct CaregiverHomeView: View {
                     recipient: identity
                 )
             } catch {
-                // Toast notification is managed by relationshipService
+                // Only a pending, unexpired invitation can be rejected
+                relationshipService.showToast(error.localizedDescription)
             }
         }
     }

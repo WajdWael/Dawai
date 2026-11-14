@@ -13,9 +13,11 @@ public struct CaregiverPatientDetailView: View {
     @Environment(\.dismiss) private var dismiss
     @EnvironmentObject private var appState: AppState
     @ObservedObject private var medicationService = MedicationService.shared
+    @ObservedObject private var relationshipService = RelationshipService.shared
     @ObservedObject private var themeService = ThemeService.shared
 
     @State private var showingCallAlert = false
+    @State private var showingUnlinkAlert = false
     @State private var showingReportSheet = false
     @State private var showingAddMedicationSheet = false
     @State private var editingMedication: MedicationItem? = nil
@@ -44,6 +46,14 @@ public struct CaregiverPatientDetailView: View {
         medicationService.medicationList(forPatient: beneficiaryPatientId)
     }
 
+    /// The active link between the signed-in caregiver and this patient. `nil` for demo rows or ended links.
+    private var activeRelationship: ActiveRelationship? {
+        guard let caregiverId = appState.currentIdentity?.id, let patientId = beneficiary.patientId else { return nil }
+        return relationshipService.activeRelationships.first {
+            $0.caregiverId == caregiverId && $0.patientId == patientId && $0.isActive
+        }
+    }
+
     public var body: some View {
         ZStack(alignment: .top) {
             ScrollView {
@@ -60,6 +70,11 @@ public struct CaregiverPatientDetailView: View {
                     callButton
                     medicationsSection
                     upcomingDosesSection
+
+                    // Only for a real, currently linked patient
+                    if activeRelationship != nil {
+                        unlinkButton
+                    }
                 }
                 .padding(.horizontal, 20)
                 .padding(.bottom, 24)
@@ -128,6 +143,44 @@ public struct CaregiverPatientDetailView: View {
         } message: {
             Text("هل أنت متأكد من رغبتك في حذف دواء \"\(medicationToDelete?.name ?? "")\"؟ سيتم حذفه نهائياً من جدول \(beneficiary.name) وإلغاء جميع التذكيرات.")
         }
+        .alert("إنهاء الارتباط", isPresented: $showingUnlinkAlert) {
+            Button("إنهاء الارتباط", role: .destructive) {
+                if let rel = activeRelationship {
+                    relationshipService.disconnect(relationshipId: rel.id)
+                    dismiss()
+                }
+            }
+            Button("إلغاء", role: .cancel) {}
+        } message: {
+            Text("هل أنت متأكد من إنهاء الارتباط مع \(beneficiary.name)؟ لن تتمكن بعد ذلك من متابعة جدول أدويته أو تعديله.")
+        }
+    }
+
+    // MARK: - End Link Button
+    @ViewBuilder
+    private var unlinkButton: some View {
+        Button(role: .destructive) {
+            showingUnlinkAlert = true
+        } label: {
+            HStack(spacing: 10) {
+                Image(systemName: "person.crop.circle.badge.xmark")
+                    .font(.system(size: 17, weight: .semibold))
+                Text("إنهاء الارتباط")
+                    .font(.system(size: 17, weight: .bold))
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 14)
+            .background(Color.red.opacity(0.08))
+            .foregroundStyle(Color.red)
+            .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    .stroke(Color.red.opacity(0.35), lineWidth: 1)
+            )
+        }
+        .buttonStyle(.plain)
+        .padding(.top, 8)
+        .accessibilityLabel("إنهاء الارتباط مع \(beneficiary.name)")
     }
 
     // MARK: - 1. Navigation Bar (Strict RTL: Back button on Leading/Right, Actions on Trailing/Left)
@@ -272,7 +325,9 @@ public struct CaregiverPatientDetailView: View {
                             // Accept: permanently delete from patient
                             Button {
                                 withAnimation {
-                                    medicationService.approveDeletionRequest(requestId: req.id)
+                                    if let caregiver = appState.currentIdentity {
+                                        medicationService.approveDeletionRequest(requestId: req.id, by: caregiver)
+                                    }
                                 }
                             } label: {
                                 HStack(spacing: 6) {
@@ -292,7 +347,9 @@ public struct CaregiverPatientDetailView: View {
                             // Reject: keep in patient's schedule
                             Button {
                                 withAnimation {
-                                    medicationService.rejectDeletionRequest(requestId: req.id)
+                                    if let caregiver = appState.currentIdentity {
+                                        medicationService.rejectDeletionRequest(requestId: req.id, by: caregiver)
+                                    }
                                 }
                             } label: {
                                 HStack(spacing: 6) {
@@ -718,6 +775,7 @@ public struct CaregiverPatientDetailView: View {
             )
         )
     }
+    .environmentObject(AppState())
     .tint(Color.dawaiPrimary)
     .environment(\.layoutDirection, .rightToLeft)
 }

@@ -321,6 +321,8 @@ public struct ReceiveInvitationSheet: View {
         do {
             try relationshipService.rejectInvitation(token: invitation.token, recipient: currentUser)
             dismiss()
+        } catch let error as InvitationError {
+            validationError = error.errorDescription ?? "تعذر رفض الدعوة."
         } catch {
             validationError = "تعذر رفض الدعوة."
         }
