@@ -167,11 +167,15 @@ public struct IdentityDetailsSheet: View {
                         Button {
                             Task {
                                 let fallbackMed = MedicationItem(
+                                    patientId: identity.id,
                                     name: "دواء تجريبي",
                                     dosage: "حبة واحدة",
                                     timeString: "12:00 م"
                                 )
-                                let med = MedicationService.shared.medications.first ?? fallbackMed
+                                // A caregiver owns no medications; fall back to any medication stored on this device.
+                                let med = MedicationService.shared.medications.first
+                                    ?? MedicationService.shared.allMedications.first
+                                    ?? fallbackMed
                                 await MedicationService.shared.simulateInstantMissedDoseAlert(for: med, delaySeconds: 3)
                             }
                         } label: {

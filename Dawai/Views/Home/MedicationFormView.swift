@@ -854,7 +854,10 @@ public struct MedicationFormView: View {
 
                 switch mode {
                 case .add:
+                    // A caregiver adds to the linked patient's schedule; a patient adds to their own.
+                    // MedicationService re-checks and enforces this owner.
                     let newMedication = MedicationItem(
+                        patientId: currentUser.role == .caregiver ? (targetPatient?.patientId ?? "") : currentUser.id,
                         name: name,
                         dosage: dosage,
                         timeString: timeStr,
@@ -870,7 +873,7 @@ public struct MedicationFormView: View {
                     try await medicationService.addMedication(
                         item: newMedication,
                         currentUser: currentUser,
-                        targetPatientId: targetPatient?.id.uuidString
+                        targetPatientId: targetPatient?.patientId
                     )
 
                 case .edit(let existing):
@@ -888,7 +891,7 @@ public struct MedicationFormView: View {
                     try await medicationService.updateMedication(
                         item: updated,
                         currentUser: currentUser,
-                        targetPatientId: targetPatient?.id.uuidString
+                        targetPatientId: targetPatient?.patientId
                     )
                 }
 

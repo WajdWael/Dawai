@@ -247,7 +247,7 @@ public struct CaregiverHomeView: View {
             if !activeRels.isEmpty {
                 ForEach(activeRels, id: \.id) { rel in
                     activePatientRow(rel: rel)
-                        .listRowBackground(rowBackground(hasDelayAlert: medicationService.hasMissedDosesToday))
+                        .listRowBackground(rowBackground(hasDelayAlert: medicationService.daySchedule(forPatient: rel.patientId).hasMissedDoses))
                 }
             } else if !demoItems.isEmpty {
                 ForEach(demoItems, id: \.id) { item in
@@ -401,11 +401,14 @@ public struct CaregiverHomeView: View {
     // MARK: - Active Patient Row (Connected Glass Row)
     @ViewBuilder
     private func activePatientRow(rel: ActiveRelationship) -> some View {
-        let hasDelay = medicationService.hasMissedDosesToday
-        let missedMed = medicationService.missedMedicationsToday.first
+        // Delay alerts come only from this linked patient's own medications.
+        let schedule = medicationService.daySchedule(forPatient: rel.patientId)
+        let hasDelay = schedule.hasMissedDoses
+        let missedMed = schedule.missedMedications.first
         let delayNoticeText = missedMed != nil ? "30 د تأخير، \(missedMed!.name)" : nil
         let summary = BeneficiarySummary(
             id: rel.id,
+            patientId: rel.patientId,
             name: rel.patientDisplayName,
             hasDelayAlert: hasDelay,
             delayNotice: delayNoticeText,

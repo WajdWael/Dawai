@@ -28,6 +28,22 @@ public struct CaregiverPatientDetailView: View {
         self.beneficiary = beneficiary
     }
 
+    // MARK: - Patient Scope
+    /// The real patient identity id. Empty when the row has no patient behind it, which matches no data.
+    private var beneficiaryPatientId: String {
+        beneficiary.patientId ?? ""
+    }
+
+    /// Today's schedule built only from this patient's medications.
+    private var currentSchedule: MedicationService.PatientDaySchedule {
+        medicationService.daySchedule(forPatient: beneficiaryPatientId)
+    }
+
+    /// All medications owned by this patient.
+    private var currentPatientMedications: [MedicationItem] {
+        medicationService.medicationList(forPatient: beneficiaryPatientId)
+    }
+
     public var body: some View {
         ZStack(alignment: .top) {
             ScrollView {
@@ -80,7 +96,7 @@ public struct CaregiverPatientDetailView: View {
             let caregiverUser = appState.currentIdentity ?? UserIdentity(role: .caregiver, displayName: "مقدم الرعاية", keyFingerprint: "cg_default")
             AdherenceReportView(
                 currentUser: caregiverUser,
-                targetPatientId: beneficiary.id.uuidString,
+                targetPatientId: beneficiary.patientId,
                 targetPatientName: beneficiary.name
             )
             .preferredColorScheme(themeService.colorScheme)
@@ -165,9 +181,10 @@ public struct CaregiverPatientDetailView: View {
     // MARK: - 2. Delay Alert Banner (Refined Warm Amber Alert Card)
     @ViewBuilder
     private var delayAlertBanner: some View {
-        let medName = beneficiary.delayedMedicationName ?? medicationService.missedMedicationsToday.first?.name ?? medicationService.activeMedication?.name ?? "الدواء"
-        let dosage = beneficiary.delayedDosage ?? medicationService.missedMedicationsToday.first?.dosage ?? "جرعة مجدولة"
-        let scheduledTime = beneficiary.scheduledTime ?? medicationService.missedMedicationsToday.first?.timeString ?? "11:30 م"
+        let schedule = currentSchedule
+        let medName = beneficiary.delayedMedicationName ?? schedule.missedMedications.first?.name ?? schedule.activeMedication?.name ?? "الدواء"
+        let dosage = beneficiary.delayedDosage ?? schedule.missedMedications.first?.dosage ?? "جرعة مجدولة"
+        let scheduledTime = beneficiary.scheduledTime ?? schedule.missedMedications.first?.timeString ?? "11:30 م"
         let noticeTitle = beneficiary.delayNotice ?? "30 د تأخير، \(medName)"
 
         VStack(alignment: .leading, spacing: 6) {
@@ -207,8 +224,10 @@ public struct CaregiverPatientDetailView: View {
     // MARK: - 2.5 Pending Deletion Requests Section (UC-11 Collaborative Approval)
     @ViewBuilder
     private var pendingDeletionRequestsSection: some View {
-        let requests = medicationService.pendingDeletionRequests.filter {
-            $0.patientDisplayName == beneficiary.name || $0.patientId == beneficiary.id.uuidString || $0.patientId == "patient_wjd"
+        // Match by the real patient id only (never by display name or a fixed id).
+        let requests = medicationService.pendingDeletionRequests.filter { req in
+            guard let patientId = beneficiary.patientId else { return false }
+            return req.patientId == patientId
         }
         if !requests.isEmpty {
             VStack(alignment: .leading, spacing: 12) {
@@ -331,6 +350,8 @@ public struct CaregiverPatientDetailView: View {
     // MARK: - 4. Medications Section
     @ViewBuilder
     private var medicationsSection: some View {
+        let schedule = currentSchedule
+        let patientMedications = currentPatientMedications
         VStack(alignment: .leading, spacing: 12) {
             HStack {
                 Text("الادوية")
@@ -352,10 +373,10 @@ public struct CaregiverPatientDetailView: View {
                 .accessibilityLabel("إضافة دواء جديد للمستفيد")
             }
 
-            if medicationService.remainingDoses == 0 && !medicationService.medications.isEmpty {
+            if schedule.remainingDoses == 0 && !patientMedications.isEmpty {
                 // All doses completed state: show all medications of the day at the top with "تم أخذها" badge
                 allDosesCompletedView
-            } else if let activeMedication = medicationService.activeMedication {
+            } else if let activeMedication = schedule.activeMedication {
                 activeMedicationCard(activeMedication)
             } else {
                 emptyMedicationsCard
@@ -366,9 +387,10 @@ public struct CaregiverPatientDetailView: View {
     // MARK: - All Doses Completed State (Native iOS List)
     @ViewBuilder
     private var allDosesCompletedView: some View {
+        let patientMedications = currentPatientMedications
         VStack(spacing: 0) {
-            ForEach(medicationService.medications.indices, id: \.self) { index in
-                let med = medicationService.medications[index]
+            ForEach(patientMedications.indices, id: \.self) { index in
+                let med = patientMedications[index]
                 HStack(spacing: 12) {
                     Image(systemName: "checkmark.circle.fill")
                         .font(.system(size: 22, weight: .semibold))
@@ -423,7 +445,7 @@ public struct CaregiverPatientDetailView: View {
                 .padding(.horizontal, 16)
                 .padding(.vertical, 12)
 
-                if index < medicationService.medications.count - 1 {
+                if index < patientMedications.count - 1 {
                     Divider()
                         .padding(.leading, 50)
                 }
@@ -582,16 +604,18 @@ public struct CaregiverPatientDetailView: View {
     // MARK: - 5. Daily Schedule Section (Formerly "باقي اليوم" -> "جدول اليوم")
     @ViewBuilder
     private var upcomingDosesSection: some View {
+        let schedule = currentSchedule
+        let patientMedications = currentPatientMedications
         // When all doses of the day are taken (remainingDoses == 0), the schedule collapses into "أدويتي" at the top
-        if medicationService.remainingDoses > 0 && !medicationService.upcomingDoses.isEmpty {
+        if schedule.remainingDoses > 0 && !schedule.upcomingDoses.isEmpty {
             VStack(alignment: .leading, spacing: 10) {
                 Text("جدول اليوم")
                     .font(.system(size: 20, weight: .bold))
                     .foregroundStyle(.primary)
 
                 VStack(spacing: 0) {
-                    ForEach(medicationService.upcomingDoses.indices, id: \.self) { index in
-                        let dose = medicationService.upcomingDoses[index]
+                    ForEach(schedule.upcomingDoses.indices, id: \.self) { index in
+                        let dose = schedule.upcomingDoses[index]
                         HStack(spacing: 12) {
                             VStack(alignment: .leading, spacing: 3) {
                                 Text(dose.name)
@@ -631,7 +655,7 @@ public struct CaregiverPatientDetailView: View {
 
                             HStack(spacing: 6) {
                                 Button {
-                                    if let med = medicationService.medications.first(where: { $0.id == dose.id }) {
+                                    if let med = patientMedications.first(where: { $0.id == dose.id }) {
                                         medicationToDelete = med
                                         showingCaregiverDeleteAlert = true
                                     }
@@ -646,10 +670,10 @@ public struct CaregiverPatientDetailView: View {
                                 .accessibilityLabel("حذف دواء \(dose.name)")
 
                                 Button {
-                                    if let med = medicationService.medications.first(where: { $0.id == dose.id }) {
+                                    if let med = patientMedications.first(where: { $0.id == dose.id }) {
                                         editingMedication = med
                                     } else {
-                                        editingMedication = MedicationItem(name: dose.name, dosage: dose.dosage, timeString: dose.timeString)
+                                        editingMedication = MedicationItem(patientId: beneficiaryPatientId, name: dose.name, dosage: dose.dosage, timeString: dose.timeString)
                                     }
                                 } label: {
                                     Image(systemName: "pencil")
@@ -665,7 +689,7 @@ public struct CaregiverPatientDetailView: View {
                         .padding(.vertical, 12)
                         .padding(.horizontal, 16)
 
-                        if index < medicationService.upcomingDoses.count - 1 {
+                        if index < schedule.upcomingDoses.count - 1 {
                             Divider()
                                 .padding(.leading, 16)
                         }

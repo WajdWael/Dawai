@@ -761,7 +761,7 @@ public struct PatientHomeView: View {
                             if let med = medicationService.medications.first(where: { $0.id == dose.id }) {
                                 editingMedication = med
                             } else {
-                                editingMedication = MedicationItem(name: dose.name, dosage: dose.dosage, timeString: dose.timeString)
+                                editingMedication = MedicationItem(patientId: identity.id, name: dose.name, dosage: dose.dosage, timeString: dose.timeString)
                             }
                         } label: {
                             Image(systemName: "pencil")

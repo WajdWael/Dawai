@@ -11,6 +11,9 @@ import Foundation
 // MARK: - Medication Item Model
 public struct MedicationItem: Identifiable, Codable, Equatable {
     public let id: UUID
+    /// Identity id of the patient who owns this medication. Medication lists, missed-dose checks
+    /// and caregiver screens all filter by this value. It is also the ownership key for future sync.
+    public var patientId: String
     public var name: String
     public var dosage: String
     public var timeString: String
@@ -26,11 +29,12 @@ public struct MedicationItem: Identifiable, Codable, Equatable {
     public var isPendingDeletion: Bool
 
     enum CodingKeys: String, CodingKey {
-        case id, name, dosage, timeString, scheduledDate, days, frequency, duration, instructions, imageData, isTaken, takenAt, createdAt, isPendingDeletion
+        case id, patientId, name, dosage, timeString, scheduledDate, days, frequency, duration, instructions, imageData, isTaken, takenAt, createdAt, isPendingDeletion
     }
 
     public init(
         id: UUID = UUID(),
+        patientId: String,
         name: String,
         dosage: String,
         timeString: String,
@@ -46,6 +50,7 @@ public struct MedicationItem: Identifiable, Codable, Equatable {
         isPendingDeletion: Bool = false
     ) {
         self.id = id
+        self.patientId = patientId
         self.name = name
         self.dosage = dosage
         self.timeString = timeString
@@ -64,6 +69,10 @@ public struct MedicationItem: Identifiable, Codable, Equatable {
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         id = try container.decode(UUID.self, forKey: .id)
+        // Items saved before `patientId` existed belong to the patient using this device.
+        patientId = try container.decodeIfPresent(String.self, forKey: .patientId)
+            ?? (decoder.userInfo[MedicationItem.legacyPatientIdUserInfoKey] as? String)
+            ?? MedicationItem.currentIdentityPatientId
         name = try container.decode(String.self, forKey: .name)
         dosage = try container.decode(String.self, forKey: .dosage)
         timeString = try container.decode(String.self, forKey: .timeString)
@@ -77,6 +86,18 @@ public struct MedicationItem: Identifiable, Codable, Equatable {
         takenAt = try container.decodeIfPresent(Date.self, forKey: .takenAt)
         createdAt = try container.decodeIfPresent(Date.self, forKey: .createdAt) ?? Date()
         isPendingDeletion = try container.decodeIfPresent(Bool.self, forKey: .isPendingDeletion) ?? false
+    }
+
+    /// Owner used before any identity exists, and for Debug demo data shown to caregivers.
+    public static let fallbackPatientId = "default_patient"
+
+    /// Decoder `userInfo` key that supplies the owner of legacy items saved without `patientId`.
+    /// Set it once per decode so the Keychain is not read for every item.
+    public static let legacyPatientIdUserInfoKey = CodingUserInfoKey(rawValue: "dawai.legacyPatientId")!
+
+    /// Identity id of the user on this device, or `fallbackPatientId` before onboarding.
+    public static var currentIdentityPatientId: String {
+        KeychainService.shared.loadUserIdentity()?.id ?? fallbackPatientId
     }
 }
 
@@ -169,7 +190,11 @@ public struct CaregiverLink: Identifiable {
 
 // MARK: - Beneficiary Summary Model (For Caregiver View)
 public struct BeneficiarySummary: Identifiable, Equatable {
+    /// Identity of this list row only (for a linked patient, the relationship id). Never use it as a patient id.
     public let id: UUID
+    /// The patient's identity id (`ActiveRelationship.patientId`). Use this for permission checks,
+    /// medication filtering, reports and deletion requests. `nil` when there is no real patient behind the row.
+    public var patientId: String?
     public var name: String
     public var hasDelayAlert: Bool
     public var delayNotice: String?
@@ -181,6 +206,7 @@ public struct BeneficiarySummary: Identifiable, Equatable {
 
     public init(
         id: UUID = UUID(),
+        patientId: String? = nil,
         name: String,
         hasDelayAlert: Bool = false,
         delayNotice: String? = nil,
@@ -191,6 +217,7 @@ public struct BeneficiarySummary: Identifiable, Equatable {
         phoneNumber: String? = "0501234567"
     ) {
         self.id = id
+        self.patientId = patientId
         self.name = name
         self.hasDelayAlert = hasDelayAlert
         self.delayNotice = delayNotice
@@ -208,6 +235,7 @@ public struct BeneficiarySummary: Identifiable, Equatable {
 #if DEBUG
 public enum HomeMockData {
     public static let activeMedication = MedicationItem(
+        patientId: MedicationItem.fallbackPatientId,
         name: "اسبرين",
         dosage: "حبتان قبل الاكل",
         timeString: "الساعة 12:00 ص",
@@ -226,6 +254,7 @@ public enum HomeMockData {
     // Caregiver Data
     public static let beneficiaries: [BeneficiarySummary] = [
         BeneficiarySummary(
+            patientId: MedicationItem.fallbackPatientId,
             name: "عمر",
             hasDelayAlert: true,
             delayNotice: "30 د تأخير، اسبرين (500 ملغ)",
@@ -236,6 +265,7 @@ public enum HomeMockData {
             phoneNumber: "0501234567"
         ),
         BeneficiarySummary(
+            patientId: MedicationItem.fallbackPatientId,
             name: "خلود",
             hasDelayAlert: false,
             delayNotice: nil,
@@ -243,6 +273,7 @@ public enum HomeMockData {
             isInvitation: false
         ),
         BeneficiarySummary(
+            patientId: MedicationItem.fallbackPatientId,
             name: "احمد",
             hasDelayAlert: false,
             delayNotice: nil,

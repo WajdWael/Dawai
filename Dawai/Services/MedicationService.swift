@@ -17,7 +17,13 @@ public final class MedicationService: ObservableObject {
     public static let shared = MedicationService()
 
     // MARK: - Published State
+    /// Every medication stored on this device, for all patients. Screens should not list this directly:
+    /// use `medications` (the patient using this device) or `medicationList(forPatient:)` / `daySchedule(forPatient:)`.
+    @Published public private(set) var allMedications: [MedicationItem] = []
+    /// Medications owned by the patient using this device (`currentPatientId`).
     @Published public private(set) var medications: [MedicationItem] = []
+    /// Patient whose schedule drives `medications`, `todayMedications`, `activeMedication`, `upcomingDoses` and `remainingDoses`.
+    @Published public private(set) var currentPatientId: String = MedicationItem.fallbackPatientId
     @Published public var activeMedication: MedicationItem?
     @Published public var upcomingDoses: [UpcomingDose] = []
     /// Untaken doses scheduled for today. Always derived from the real schedule in `refreshDerivedState()`.
@@ -74,19 +80,51 @@ public final class MedicationService: ObservableObject {
 
     // MARK: - Persistence & Initial State
     public func loadPersistedMedications() {
+        let identity = KeychainService.shared.loadUserIdentity()
+        let decoder = JSONDecoder()
+        // Items saved before `patientId` existed are assigned to the identity using this device.
+        decoder.userInfo[MedicationItem.legacyPatientIdUserInfoKey] = identity?.id ?? MedicationItem.fallbackPatientId
+
         if let data = UserDefaults.standard.data(forKey: storageKey),
-           let decoded = try? JSONDecoder().decode([MedicationItem].self, from: data) {
-            self.medications = decoded.map { item in
+           let decoded = try? decoder.decode([MedicationItem].self, from: data) {
+            self.allMedications = decoded.map { item in
                 var m = item
                 m.timeString = m.timeString.westernNumerals
                 m.dosage = m.dosage.westernNumerals
                 return m
             }
+            reassignLegacyCaregiverMedications(identity: identity)
         } else {
             // A new user starts with no medications.
-            self.medications = []
+            self.allMedications = []
         }
         refreshDerivedState()
+    }
+
+    /// A caregiver never owns medications. Legacy items on a caregiver's device were assigned to the caregiver's
+    /// own id when decoded; when exactly one patient is linked, they can only belong to that patient.
+    private func reassignLegacyCaregiverMedications(identity: UserIdentity?) {
+        guard let identity, identity.role == .caregiver else { return }
+        let linkedPatientIds = Set(
+            RelationshipService.shared.activeRelationships
+                .filter { $0.caregiverId == identity.id && $0.isActive }
+                .map(\.patientId)
+        )
+        guard linkedPatientIds.count == 1, let patientId = linkedPatientIds.first else { return }
+
+        var changed = false
+        for idx in allMedications.indices where allMedications[idx].patientId == identity.id {
+            allMedications[idx].patientId = patientId
+            changed = true
+        }
+        if changed {
+            persistMedications()
+        }
+    }
+
+    /// Medications owned by `patientId`.
+    public func medicationList(forPatient patientId: String) -> [MedicationItem] {
+        allMedications.filter { $0.patientId == patientId }
     }
 
     // MARK: - Reset (wipes all medication data on this device)
@@ -95,7 +133,7 @@ public final class MedicationService: ObservableObject {
         center.removeAllPendingNotificationRequests()
         center.removeAllDeliveredNotifications()
 
-        medications = []
+        allMedications = []
         pendingDeletionRequests = []
         toastMessage = nil
         notificationWarning = nil
@@ -108,10 +146,15 @@ public final class MedicationService: ObservableObject {
     #if DEBUG
     // MARK: - Demo data (Debug builds only, loaded on request from Settings)
     public func loadDemoData() {
-        medications = [
-            HomeMockData.activeMedication,
-            MedicationItem(name: "ميترفين", dosage: "حبة واحدة بعد الأكل", timeString: "12:00 ص", scheduledDate: nil, days: ["كل يوم"], frequency: "مرة يوميًا"),
-            MedicationItem(name: "فيتامين د", dosage: "قطرة واحدة يوميًا", timeString: "10:00 ص", scheduledDate: nil, days: ["كل يوم"], frequency: "مرة يوميًا")
+        // A patient owns the demo medications; on a caregiver's device they belong to the demo beneficiaries.
+        let identity = KeychainService.shared.loadUserIdentity()
+        let owner = identity?.role == .patient ? (identity?.id ?? MedicationItem.fallbackPatientId) : MedicationItem.fallbackPatientId
+        var demoAspirin = HomeMockData.activeMedication
+        demoAspirin.patientId = owner
+        allMedications = [
+            demoAspirin,
+            MedicationItem(patientId: owner, name: "ميترفين", dosage: "حبة واحدة بعد الأكل", timeString: "12:00 ص", scheduledDate: nil, days: ["كل يوم"], frequency: "مرة يوميًا"),
+            MedicationItem(patientId: owner, name: "فيتامين د", dosage: "قطرة واحدة يوميًا", timeString: "10:00 ص", scheduledDate: nil, days: ["كل يوم"], frequency: "مرة يوميًا")
         ]
         persistMedications()
         refreshDerivedState()
@@ -119,7 +162,7 @@ public final class MedicationService: ObservableObject {
     #endif
 
     private func persistMedications() {
-        if let encoded = try? JSONEncoder().encode(medications) {
+        if let encoded = try? JSONEncoder().encode(allMedications) {
             UserDefaults.standard.set(encoded, forKey: storageKey)
         }
     }
@@ -229,33 +272,43 @@ public final class MedicationService: ObservableObject {
 
     /// Reconciles taken flags from previous days, handles doses crossing midnight without losing their state,
     /// and retroactively marks any past unrecorded scheduled doses whose cutoff window has elapsed as `.missed`.
-    private func reconcilePastAndMidnightDoses(at now: Date, patientId: String) {
+    /// Every dose record is written under the medication's own `patientId`.
+    private func reconcilePastAndMidnightDoses(at now: Date) {
         let calendar = Calendar.current
         let todayStart = calendar.startOfDay(for: now)
 
         // 1. Preserve previous-day `isTaken` state in AdherenceService BEFORE resetting `isTaken` for the new day
         var didResetStaleDay = false
-        for idx in medications.indices {
-            if medications[idx].isTaken,
-               let takenAt = medications[idx].takenAt,
+        var resetMedications: [MedicationItem] = []
+        for idx in allMedications.indices {
+            if allMedications[idx].isTaken,
+               let takenAt = allMedications[idx].takenAt,
                !calendar.isDate(takenAt, inSameDayAs: now) {
                 AdherenceService.shared.recordDoseTaken(
-                    medication: medications[idx],
-                    patientId: patientId,
+                    medication: allMedications[idx],
+                    patientId: allMedications[idx].patientId,
                     takenAt: takenAt,
                     scheduledDay: takenAt
                 )
-                medications[idx].isTaken = false
-                medications[idx].takenAt = nil
+                allMedications[idx].isTaken = false
+                allMedications[idx].takenAt = nil
                 didResetStaleDay = true
+                resetMedications.append(allMedications[idx])
             }
         }
         if didResetStaleDay {
             persistMedications()
+            // Confirming yesterday's dose removed the repeating missed-dose alert (`cancelMissedDoseAlert`).
+            // The dose is open again today, so the alert must be scheduled again.
+            Task {
+                for med in resetMedications {
+                    await self.scheduleMissedDoseAlert(for: med)
+                }
+            }
         }
 
         // 2. Retroactive backfill for past days (only when the confirmation window has fully expired)
-        for med in medications {
+        for med in allMedications {
             let createdDay = calendar.startOfDay(for: med.createdAt)
             let earliestLookback = calendar.date(byAdding: .day, value: -DoseWindowConfig.retroactiveLookbackDays, to: todayStart) ?? createdDay
             var day = max(createdDay, earliestLookback)
@@ -271,7 +324,7 @@ public final class MedicationService: ObservableObject {
                         if elapsedMinutes >= DoseWindowConfig.missedCutoffMinutes && !AdherenceService.shared.hasRecord(for: med.id, on: day) {
                             AdherenceService.shared.recordDoseMissedIfNeeded(
                                 medication: med,
-                                patientId: patientId,
+                                patientId: med.patientId,
                                 on: day
                             )
                         }
@@ -283,40 +336,35 @@ public final class MedicationService: ObservableObject {
         }
     }
 
-    // MARK: - UC-12 S#1, S#2, S#3: Automatically Sort & Prioritize by Scheduled Time
-    public func refreshDerivedState() {
-        let now = AppClock.shared.now
-        let calendar = Calendar.current
-        let currentPatientId = KeychainService.shared.loadUserIdentity()?.id ?? "default_patient"
+    // MARK: - Per-Patient Day Schedule
+    /// Today's schedule for one patient, derived only from that patient's medications.
+    public struct PatientDaySchedule: Equatable {
+        public let patientId: String
+        /// Medications scheduled today (or still open from yesterday past midnight), sorted chronologically.
+        public let todayMedications: [MedicationItem]
+        public let activeMedication: MedicationItem?
+        public let upcomingDoses: [UpcomingDose]
+        /// Untaken doses that can still be confirmed today (excludes taken and missed doses).
+        public let remainingDoses: Int
+        /// Today's doses still unconfirmed past `DoseWindowConfig.lateThresholdMinutes`.
+        public let missedMedications: [MedicationItem]
 
-        // Reconcile day rollover, midnight carryover, and past unrecorded missed doses before evaluating today
-        reconcilePastAndMidnightDoses(at: now, patientId: currentPatientId)
+        public var hasMissedDoses: Bool { !missedMedications.isEmpty }
+    }
+
+    /// UC-12 S#1, S#2, S#3: computes `patientId`'s schedule for the day containing `date`. Has no side effects.
+    public func daySchedule(forPatient patientId: String, at date: Date? = nil) -> PatientDaySchedule {
+        let now = date ?? AppClock.shared.now
 
         // 1. UC-12 S#1: Retrieve registered medications scheduled for today OR still active from yesterday past midnight
-        let todaysList = medications.filter {
-            isScheduledForToday($0, on: now) || hasActiveCarryoverFromYesterday($0, at: now)
+        let todaysList = allMedications.filter {
+            $0.patientId == patientId &&
+            (isScheduledForToday($0, on: now) || hasActiveCarryoverFromYesterday($0, at: now))
         }
 
         // 2. UC-12 S#2: Automatically sort daily medications chronologically by active occurrence date
         let sortedTodaysList = todaysList.sorted { a, b in
             activeOccurrenceDate(for: a, at: now) < activeOccurrenceDate(for: b, at: now)
-        }
-        self.todayMedications = sortedTodaysList
-
-        // Automatically record any dose today that crossed the missed cutoff as `.missed` ("فائتة") in AdherenceService
-        let createdTodayCutoffCheck = { (item: MedicationItem) -> Bool in
-            let createdMinuteStart = calendar.date(bySetting: .second, value: 0, of: item.createdAt) ?? item.createdAt
-            let schedToday = self.scheduledDateTime(for: item, on: now)
-            return schedToday >= createdMinuteStart || !calendar.isDate(item.createdAt, inSameDayAs: now)
-        }
-        for item in sortedTodaysList where doseInteractionState(for: item, at: now) == .missed {
-            if createdTodayCutoffCheck(item) {
-                AdherenceService.shared.recordDoseMissedIfNeeded(
-                    medication: item,
-                    patientId: currentPatientId,
-                    on: now
-                )
-            }
         }
 
         // 3. UC-12 S#2: Prioritize confirmable or upcoming medications (excluding taken and missed doses)
@@ -325,6 +373,7 @@ public final class MedicationService: ObservableObject {
             return state == .dueOnTime || state == .overdueLate || state == .upcomingBeforeWindow
         }
 
+        let active: MedicationItem?
         if !actionableUntaken.isEmpty {
             let confirmableNow = actionableUntaken.filter { item in
                 let state = doseInteractionState(for: item, at: now)
@@ -336,35 +385,80 @@ public final class MedicationService: ObservableObject {
 
             if !confirmableNow.isEmpty {
                 // Prioritize the confirmable dose (within -15m ..< +120m window) closest to `now`
-                self.activeMedication = confirmableNow.min(by: {
+                active = confirmableNow.min(by: {
                     abs(now.timeIntervalSince(activeOccurrenceDate(for: $0, at: now))) <
                     abs(now.timeIntervalSince(activeOccurrenceDate(for: $1, at: now)))
                 }) ?? confirmableNow.first
             } else {
                 // All remaining actionable doses are in the future today; pick the earliest upcoming one
-                self.activeMedication = futureToday.min(by: {
+                active = futureToday.min(by: {
                     activeOccurrenceDate(for: $0, at: now) < activeOccurrenceDate(for: $1, at: now)
                 }) ?? actionableUntaken.first
             }
         } else {
             // All doses for today are either taken or missed: show the most recent or first in schedule
-            self.activeMedication = sortedTodaysList.last ?? sortedTodaysList.first
+            active = sortedTodaysList.last ?? sortedTodaysList.first
         }
 
         // 4. Generate schedule doses for other medications (excluding the active highlighted card)
-        let otherMeds = sortedTodaysList.filter { $0.id != self.activeMedication?.id }
-        self.upcomingDoses = otherMeds.map { item in
-            UpcomingDose(
-                id: item.id,
-                name: item.name,
-                timeString: item.timeString.westernNumerals,
-                dosage: item.dosage.westernNumerals,
-                isTaken: item.isTaken
+        let upcoming = sortedTodaysList
+            .filter { $0.id != active?.id }
+            .map { item in
+                UpcomingDose(
+                    id: item.id,
+                    name: item.name,
+                    timeString: item.timeString.westernNumerals,
+                    dosage: item.dosage.westernNumerals,
+                    isTaken: item.isTaken
+                )
+            }
+
+        return PatientDaySchedule(
+            patientId: patientId,
+            todayMedications: sortedTodaysList,
+            activeMedication: active,
+            upcomingDoses: upcoming,
+            // 5. Count remaining actionable untaken doses for today (excludes taken and missed doses)
+            remainingDoses: actionableUntaken.count,
+            missedMedications: sortedTodaysList.filter { isDoseMissed($0, at: now) }
+        )
+    }
+
+    // MARK: - UC-12 S#1, S#2, S#3: Automatically Sort & Prioritize by Scheduled Time
+    public func refreshDerivedState() {
+        let now = AppClock.shared.now
+        let calendar = Calendar.current
+        let patientId = MedicationItem.currentIdentityPatientId
+
+        // Reconcile day rollover, midnight carryover, and past unrecorded missed doses before evaluating today
+        reconcilePastAndMidnightDoses(at: now)
+
+        // Automatically record any dose today that crossed the missed cutoff as `.missed` ("فائتة") in AdherenceService,
+        // for every patient whose medications are stored on this device.
+        let createdTodayCutoffCheck = { (item: MedicationItem) -> Bool in
+            let createdMinuteStart = calendar.date(bySetting: .second, value: 0, of: item.createdAt) ?? item.createdAt
+            let schedToday = self.scheduledDateTime(for: item, on: now)
+            return schedToday >= createdMinuteStart || !calendar.isDate(item.createdAt, inSameDayAs: now)
+        }
+        for item in allMedications
+        where (isScheduledForToday(item, on: now) || hasActiveCarryoverFromYesterday(item, at: now))
+            && doseInteractionState(for: item, at: now) == .missed
+            && createdTodayCutoffCheck(item) {
+            AdherenceService.shared.recordDoseMissedIfNeeded(
+                medication: item,
+                patientId: item.patientId,
+                on: now
             )
         }
 
-        // 5. Count remaining actionable untaken doses for today (excludes taken and missed doses)
-        self.remainingDoses = actionableUntaken.count
+        // Published state describes only the patient using this device
+        let schedule = daySchedule(forPatient: patientId, at: now)
+        self.currentPatientId = patientId
+        self.medications = medicationList(forPatient: patientId)
+        self.todayMedications = schedule.todayMedications
+        self.activeMedication = schedule.activeMedication
+        self.upcomingDoses = schedule.upcomingDoses
+        self.remainingDoses = schedule.remainingDoses
     }
 
     // MARK: - Use-Case 5 (UC-5): Missed Dose Calculations (30-Minute Grace Period)
@@ -375,13 +469,13 @@ public final class MedicationService: ObservableObject {
         return state == .overdueLate || state == .missed
     }
 
-    /// List of medications scheduled for today whose late threshold has passed without confirmation
+    /// The current patient's medications scheduled for today whose late threshold has passed without confirmation
     public var missedMedicationsToday: [MedicationItem] {
         let now = AppClock.shared.now
         return todayMedications.filter { isDoseMissed($0, at: now) }
     }
 
-    /// True when any scheduled medication has remained unconfirmed 30 minutes past its due time
+    /// True when any of the current patient's medications has remained unconfirmed 30 minutes past its due time
     public var hasMissedDosesToday: Bool {
         !missedMedicationsToday.isEmpty
     }
@@ -457,13 +551,19 @@ public final class MedicationService: ObservableObject {
             try validateImageData(imgData)
         }
 
-        // 3. Authorization check for Caregiver (UC-3 Alternate Course S#8)
+        // 3. Authorization check for Caregiver (UC-3 Alternate Course S#8) and ownership:
+        // a caregiver adds to a linked patient's schedule, a patient adds to their own.
         if currentUser.role == .caregiver {
             try validateCaregiverPermission(caregiverId: currentUser.id, targetPatientId: targetPatientId)
+            guard let targetPatientId else { throw MedicationError.unauthorizedCaregiver }
+            cleanItem.patientId = targetPatientId
+        } else {
+            cleanItem.patientId = currentUser.id
         }
 
-        // 4. Prevent duplicate medication record with same name and time
-        let duplicate = medications.contains { existing in
+        // 4. Prevent duplicate medication record with same name and time for the same patient
+        let duplicate = allMedications.contains { existing in
+            existing.patientId == cleanItem.patientId &&
             existing.name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ==
                 cleanItem.name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() &&
             existing.timeString == cleanItem.timeString
@@ -475,7 +575,7 @@ public final class MedicationService: ObservableObject {
         }
 
         // 5. Save to database / local store (UC-3 S#5)
-        medications.insert(cleanItem, at: 0)
+        allMedications.insert(cleanItem, at: 0)
         persistMedications()
         refreshDerivedState()
 
@@ -514,15 +614,21 @@ public final class MedicationService: ObservableObject {
             try validateImageData(imgData)
         }
 
-        if let user = currentUser, user.role == .caregiver {
-            try validateCaregiverPermission(caregiverId: user.id, targetPatientId: targetPatientId)
-        }
-
-        guard let index = medications.firstIndex(where: { $0.id == cleanItem.id }) else {
+        guard let index = allMedications.firstIndex(where: { $0.id == cleanItem.id }) else {
             throw MedicationError.saveFailed
         }
 
-        medications[index] = cleanItem
+        // Ownership never changes on edit; a caregiver must be linked to the medication's owner.
+        let ownerId = allMedications[index].patientId
+        cleanItem.patientId = ownerId
+        if let user = currentUser, user.role == .caregiver {
+            if let targetPatientId, targetPatientId != ownerId {
+                throw MedicationError.unauthorizedCaregiver
+            }
+            try validateCaregiverPermission(caregiverId: user.id, targetPatientId: ownerId)
+        }
+
+        allMedications[index] = cleanItem
         persistMedications()
         refreshDerivedState()
 
@@ -547,11 +653,11 @@ public final class MedicationService: ObservableObject {
     // MARK: - Use-Case 11 (UC-11): Delete Medication
     /// Direct permanent deletion (when no caregiver is connected or when requested directly)
     public func deleteMedicationDirectly(id: UUID) {
-        if let item = medications.first(where: { $0.id == id }) {
+        if let item = allMedications.first(where: { $0.id == id }) {
             // UC-11 S#5: Cancel future scheduled reminders
             cancelReminder(id: id)
             // UC-11 S#4: Remove medication from active medication list and update system database
-            medications.removeAll(where: { $0.id == id })
+            allMedications.removeAll(where: { $0.id == id })
             pendingDeletionRequests.removeAll(where: { $0.medicationId == id })
             persistMedications()
             persistDeletionRequests()
@@ -569,11 +675,11 @@ public final class MedicationService: ObservableObject {
     /// UC-11: Caregiver deletes a medication directly
     /// Removes it permanently from the patient's schedule, cancels reminders, and updates views immediately.
     public func deleteMedicationByCaregiver(id: UUID, patientName: String? = nil) {
-        guard let item = medications.first(where: { $0.id == id }) else { return }
+        guard let item = allMedications.first(where: { $0.id == id }) else { return }
         // UC-11 S#5: Cancels the medication's future scheduled reminders
         cancelReminder(id: id)
         // UC-11 S#4: Removes the medication from active medication list
-        medications.removeAll(where: { $0.id == id })
+        allMedications.removeAll(where: { $0.id == id })
         pendingDeletionRequests.removeAll(where: { $0.medicationId == id })
         persistMedications()
         persistDeletionRequests()
@@ -592,7 +698,7 @@ public final class MedicationService: ObservableObject {
         patient: UserIdentity,
         caregivers: [ActiveRelationship]
     ) {
-        guard let item = medications.first(where: { $0.id == medicationId }) else { return }
+        guard let item = allMedications.first(where: { $0.id == medicationId }) else { return }
 
         // If no caregiver is connected, delete directly
         if caregivers.isEmpty {
@@ -601,8 +707,8 @@ public final class MedicationService: ObservableObject {
         }
 
         // Mark medication as pending deletion
-        if let index = medications.firstIndex(where: { $0.id == medicationId }) {
-            medications[index].isPendingDeletion = true
+        if let index = allMedications.firstIndex(where: { $0.id == medicationId }) {
+            allMedications[index].isPendingDeletion = true
             persistMedications()
             refreshDerivedState()
         }
@@ -635,7 +741,7 @@ public final class MedicationService: ObservableObject {
         cancelReminder(id: request.medicationId)
 
         // 2. Remove medication permanently (UC-11 S#4)
-        medications.removeAll(where: { $0.id == request.medicationId })
+        allMedications.removeAll(where: { $0.id == request.medicationId })
 
         // 3. Remove request
         pendingDeletionRequests.remove(at: reqIndex)
@@ -654,8 +760,8 @@ public final class MedicationService: ObservableObject {
         let request = pendingDeletionRequests[reqIndex]
 
         // 1. Restore medication (clear pending flag, keep active in schedule)
-        if let medIndex = medications.firstIndex(where: { $0.id == request.medicationId }) {
-            medications[medIndex].isPendingDeletion = false
+        if let medIndex = allMedications.firstIndex(where: { $0.id == request.medicationId }) {
+            allMedications[medIndex].isPendingDeletion = false
             persistMedications()
             refreshDerivedState()
         }
@@ -672,43 +778,43 @@ public final class MedicationService: ObservableObject {
     /// Single unified entry point for all dose confirmations; ignores duplicate, early, or expired confirmations.
     @discardableResult
     public func confirmDoseTaken(id: UUID, patient: UserIdentity) -> Bool {
-        guard let index = medications.firstIndex(where: { $0.id == id }) else { return false }
+        guard let index = allMedications.firstIndex(where: { $0.id == id && $0.patientId == patient.id }) else { return false }
         let now = AppClock.shared.now
 
         // Guard against double-tap / already confirmed dose or out-of-window dose
-        let currentState = doseInteractionState(for: medications[index], at: now)
-        guard !medications[index].isTaken, (currentState == .dueOnTime || currentState == .overdueLate) else {
+        let currentState = doseInteractionState(for: allMedications[index], at: now)
+        guard !allMedications[index].isTaken, (currentState == .dueOnTime || currentState == .overdueLate) else {
             if currentState == .missed {
                 AdherenceService.shared.recordDoseMissedIfNeeded(
-                    medication: medications[index],
+                    medication: allMedications[index],
                     patientId: patient.id,
                     on: now
                 )
-                showToast("انتهى وقت تأكيد جرعة «\(medications[index].name)» وتم تسجيلها كجرعة فائتة.")
+                showToast("انتهى وقت تأكيد جرعة «\(allMedications[index].name)» وتم تسجيلها كجرعة فائتة.")
             }
             return false
         }
 
-        let medName = medications[index].name
-        let isCarryover = hasActiveCarryoverFromYesterday(medications[index], at: now)
+        let medName = allMedications[index].name
+        let isCarryover = hasActiveCarryoverFromYesterday(allMedications[index], at: now)
         let yesterday = Calendar.current.date(byAdding: .day, value: -1, to: now)
 
         if isCarryover, let yesterday {
             // Confirm yesterday's midnight-crossing occurrence without marking today's future dose as taken
             AdherenceService.shared.recordDoseTaken(
-                medication: medications[index],
+                medication: allMedications[index],
                 patientId: patient.id,
                 takenAt: now,
                 scheduledDay: yesterday
             )
         } else {
-            medications[index].isTaken = true
-            medications[index].takenAt = now
+            allMedications[index].isTaken = true
+            allMedications[index].takenAt = now
             persistMedications()
 
             // UC-7: Record in dose log for weekly adherence report
             AdherenceService.shared.recordDoseTaken(
-                medication: medications[index],
+                medication: allMedications[index],
                 patientId: patient.id,
                 takenAt: now,
                 scheduledDay: now
@@ -720,6 +826,10 @@ public final class MedicationService: ObservableObject {
 
         // UC-5: Dose confirmed -> cancel caregiver missed dose alert
         cancelMissedDoseAlert(id: id)
+        if isCarryover, let med = allMedications.first(where: { $0.id == id }) {
+            // Only yesterday's dose was confirmed; today's dose is still open and needs its alert.
+            Task { await self.scheduleMissedDoseAlert(for: med) }
+        }
 
         // UC-6 S#6: Notify connected caregivers
         RelationshipService.shared.notifyCaregiversDoseTaken(
@@ -738,7 +848,7 @@ public final class MedicationService: ObservableObject {
     // MARK: - Notification Action Handling (Quick Actions & Notification Taps)
     public func handleNotificationAction(medicationId: UUID, actionIdentifier: String, appState: AppState?) {
         refreshDerivedState()
-        guard let med = medications.first(where: { $0.id == medicationId }) else { return }
+        guard let med = allMedications.first(where: { $0.id == medicationId }) else { return }
 
         let now = AppClock.shared.now
         let state = doseInteractionState(for: med, at: now)
@@ -750,8 +860,7 @@ public final class MedicationService: ObservableObject {
                     _ = confirmDoseTaken(id: medicationId, patient: patient)
                 }
             case .missed:
-                let patientId = appState?.currentIdentity?.id ?? KeychainService.shared.loadUserIdentity()?.id ?? "default_patient"
-                reconcilePastAndMidnightDoses(at: now, patientId: patientId)
+                reconcilePastAndMidnightDoses(at: now)
                 showToast("انتهى وقت تأكيد جرعة «\(med.name)» وتم تسجيلها كجرعة فائتة.")
             case .upcomingBeforeWindow:
                 showToast("لم يحن موعد جرعة «\(med.name)» بعد (الموعد الساعة \(med.timeString.westernNumerals)).")
@@ -760,8 +869,7 @@ public final class MedicationService: ObservableObject {
             }
         } else {
             if state == .missed {
-                let patientId = appState?.currentIdentity?.id ?? KeychainService.shared.loadUserIdentity()?.id ?? "default_patient"
-                reconcilePastAndMidnightDoses(at: now, patientId: patientId)
+                reconcilePastAndMidnightDoses(at: now)
                 showToast("انتهى وقت تأكيد جرعة «\(med.name)» وتم تسجيلها كجرعة فائتة.")
             }
             appState?.openDoseConfirmation(for: medicationId)
@@ -800,11 +908,14 @@ public final class MedicationService: ObservableObject {
         }
     }
 
+    /// A caregiver may change a patient's schedule only through an active link to that exact patient.
     private func validateCaregiverPermission(caregiverId: String, targetPatientId: String?) throws {
+        guard let targetPatientId else {
+            throw MedicationError.unauthorizedCaregiver
+        }
         let activeRels = RelationshipService.shared.activeRelationships
         let hasActiveConnection = activeRels.contains { rel in
-            rel.caregiverId == caregiverId && rel.isActive &&
-            (targetPatientId == nil || rel.patientId == targetPatientId)
+            rel.caregiverId == caregiverId && rel.isActive && rel.patientId == targetPatientId
         }
 
         if !hasActiveConnection {
@@ -866,35 +977,49 @@ public final class MedicationService: ObservableObject {
             try await center.add(request)
 
             // UC-5 S#2 & S#3: Schedule Missed-Dose Alert for Caregiver (30 minutes after scheduled time)
-            let missedContent = UNMutableNotificationContent()
-            missedContent.title = "تنبيه تأخر جرعة: \(item.name)"
-            missedContent.body = "لم يتم تأكيد أخذ جرعة \(item.name) (\(item.dosage)) بعد مرور 30 دقيقة من موعدها."
-            missedContent.sound = .default
-            missedContent.userInfo = [
-                "medicationId": item.id.uuidString,
-                "medicationName": item.name,
-                "dosage": item.dosage,
-                "type": "missed_dose_alert"
-            ]
-
-            var missedComps = DateComponents()
-            let schedMinutes = scheduledMinutes(for: item)
-            let alertMinutes = (schedMinutes + DoseWindowConfig.lateThresholdMinutes) % 1440
-            missedComps.hour = alertMinutes / 60
-            missedComps.minute = alertMinutes % 60
-
-            let missedTrigger = UNCalendarNotificationTrigger(dateMatching: missedComps, repeats: true)
-            let missedRequest = UNNotificationRequest(
-                identifier: "medication_missed_dose_\(item.id.uuidString)",
-                content: missedContent,
-                trigger: missedTrigger
-            )
-            try? await center.add(missedRequest)
+            await scheduleMissedDoseAlert(for: item)
 
             return true
         } catch {
             return false
         }
+    }
+
+    /// UC-5 S#2 & S#3: Schedules the repeating missed-dose alert 30 minutes after `item`'s scheduled time.
+    /// Does nothing when reminders are switched off in Settings or notifications are not authorized.
+    public func scheduleMissedDoseAlert(for item: MedicationItem) async {
+        let enabled = UserDefaults.standard.object(forKey: "dawai_notifications_enabled") as? Bool ?? true
+        guard enabled else { return }
+
+        let center = UNUserNotificationCenter.current()
+        let settings = await center.notificationSettings()
+        guard settings.authorizationStatus == .authorized || settings.authorizationStatus == .provisional else { return }
+
+        let missedContent = UNMutableNotificationContent()
+        missedContent.title = "تنبيه تأخر جرعة: \(item.name)"
+        missedContent.body = "لم يتم تأكيد أخذ جرعة \(item.name) (\(item.dosage)) بعد مرور 30 دقيقة من موعدها."
+        missedContent.sound = .default
+        missedContent.userInfo = [
+            "medicationId": item.id.uuidString,
+            "medicationName": item.name,
+            "dosage": item.dosage,
+            "patientId": item.patientId,
+            "type": "missed_dose_alert"
+        ]
+
+        var missedComps = DateComponents()
+        let schedMinutes = scheduledMinutes(for: item)
+        let alertMinutes = (schedMinutes + DoseWindowConfig.lateThresholdMinutes) % 1440
+        missedComps.hour = alertMinutes / 60
+        missedComps.minute = alertMinutes % 60
+
+        let missedTrigger = UNCalendarNotificationTrigger(dateMatching: missedComps, repeats: true)
+        let missedRequest = UNNotificationRequest(
+            identifier: "medication_missed_dose_\(item.id.uuidString)",
+            content: missedContent,
+            trigger: missedTrigger
+        )
+        try? await center.add(missedRequest)
     }
 
     public func cancelReminder(id: UUID) {
@@ -984,6 +1109,7 @@ public final class MedicationService: ObservableObject {
             "medicationId": item.id.uuidString,
             "medicationName": item.name,
             "dosage": item.dosage,
+            "patientId": item.patientId,
             "type": "missed_dose_alert"
         ]
 
@@ -1054,7 +1180,7 @@ public final class MedicationService: ObservableObject {
 
             // Reschedule reminders for all upcoming medications
             var scheduledCount = 0
-            for med in medications where !med.isTaken {
+            for med in allMedications where !med.isTaken {
                 let success = await scheduleReminder(for: med)
                 if success { scheduledCount += 1 }
             }
@@ -1114,18 +1240,26 @@ public final class NotificationDelegate: NSObject, UNUserNotificationCenterDeleg
             // UC-5 S#5: Caregiver opens missed-dose notification -> system routes directly to patient detail
             let medName = userInfo["medicationName"] as? String ?? "الدواء"
             let dosage = userInfo["dosage"] as? String ?? ""
-            let beneficiary = BeneficiarySummary(
-                id: UUID(),
-                name: "الوالد",
-                hasDelayAlert: true,
-                delayNotice: "30 د تأخير، \(medName)",
-                scheduledTime: nil,
-                isInvitation: false,
-                delayedMedicationName: medName,
-                delayedDosage: dosage,
-                phoneNumber: "0501234567"
-            )
+            let payloadPatientId = userInfo["patientId"] as? String
+            let medicationId = (userInfo["medicationId"] as? String).flatMap(UUID.init(uuidString:))
             Task { @MainActor in
+                // Resolve the real patient: from the payload, or (for alerts scheduled before the
+                // payload carried it) from the medication's owner.
+                let patientId = payloadPatientId
+                    ?? medicationId.flatMap { id in MedicationService.shared.allMedications.first(where: { $0.id == id })?.patientId }
+                let relationship = RelationshipService.shared.activeRelationships.first { $0.patientId == patientId && $0.isActive }
+                let beneficiary = BeneficiarySummary(
+                    id: relationship?.id ?? UUID(),
+                    patientId: patientId,
+                    name: relationship?.patientDisplayName ?? "المستفيد",
+                    hasDelayAlert: true,
+                    delayNotice: "30 د تأخير، \(medName)",
+                    scheduledTime: nil,
+                    isInvitation: false,
+                    delayedMedicationName: medName,
+                    delayedDosage: dosage,
+                    phoneNumber: "0501234567"
+                )
                 self.appState?.openCaregiverPatientDetail(for: beneficiary)
             }
         } else if let medIdString = userInfo["medicationId"] as? String,

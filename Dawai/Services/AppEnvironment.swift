@@ -152,7 +152,9 @@ public final class DemoModeService: ObservableObject {
     public func isDemoPatient(_ idOrName: String) -> Bool {
         #if DEBUG
         guard isActive else { return false }
-        return HomeMockData.beneficiaries.contains { $0.id.uuidString == idOrName || $0.name == idOrName }
+        return HomeMockData.beneficiaries.contains {
+            $0.patientId == idOrName || $0.id.uuidString == idOrName || $0.name == idOrName
+        }
         #else
         return false
         #endif
