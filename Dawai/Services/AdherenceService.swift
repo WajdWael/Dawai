@@ -49,7 +49,9 @@ public final class AdherenceService: ObservableObject {
 
     // MARK: - Demo data (Loaded on request from Settings for testing)
     public func loadDemoHistory() {
+        #if DEBUG
         seedRealisticDoseHistory()
+        #endif
     }
 
     /// A record belongs to a patient only when the ids match.

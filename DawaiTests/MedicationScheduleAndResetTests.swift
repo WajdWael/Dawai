@@ -414,5 +414,178 @@ final class MedicationScheduleAndResetTests: XCTestCase {
         XCTAssertEqual(Set(reminders.compactMap(\.weekday)), [1, 4])
         XCTAssertTrue(reminders.allSatisfy { $0.repeats && $0.hour == 8 && $0.minute == 0 })
     }
+
+    // MARK: - 8. Waking-Hours Defaults Tests
+    func testWakingHoursDefaultsDistribution() {
+        XCTAssertEqual(MedicationWakingHoursDefaults.defaultMinutes(forCount: 1), [480]) // 8:00 ص
+        XCTAssertEqual(MedicationWakingHoursDefaults.defaultMinutes(forCount: 2), [480, 1200]) // 8:00 ص، 8:00 م
+        XCTAssertEqual(MedicationWakingHoursDefaults.defaultMinutes(forCount: 3), [480, 840, 1200]) // 8:00 ص، 2:00 م، 8:00 م
+        XCTAssertEqual(MedicationWakingHoursDefaults.defaultMinutes(forCount: 4), [480, 720, 960, 1200]) // 8:00 ص، 12:00 م، 4:00 م، 8:00 م
+    }
+
+    // MARK: - 9. Legacy JSON Migration Tests
+    func testLegacyMedicationScheduleMigration() throws {
+        // Test 1: Legacy JSON without scheduleType and without customDoseTimesMinutes
+        let legacyJson = """
+        {
+            "id": "11111111-2222-3333-4444-555555555555",
+            "patientId": "p_mig",
+            "name": "بنادول قديم",
+            "dosage": "حبتين",
+            "timeString": "08:00 ص",
+            "days": ["كل يوم"],
+            "frequency": "مرتان يومياً",
+            "duration": "اسبوع",
+            "instructions": "على الريق",
+            "isTaken": false
+        }
+        """.data(using: .utf8)!
+
+        let decoded = try JSONDecoder().decode(MedicationItem.self, from: legacyJson)
+        XCTAssertEqual(decoded.scheduleType, .daily)
+        XCTAssertEqual(decoded.customDoseTimesMinutes, [480, 1200])
+        XCTAssertEqual(decoded.duration, "أسبوع")
+        XCTAssertNotNil(decoded.endDate)
+        XCTAssertTrue(decoded.instructions?.contains("على الريق") ?? false)
+
+        // Test 2: "عند اللزوم" migration
+        let asNeededJson = """
+        {
+            "id": "22222222-3333-4444-5555-666666666666",
+            "patientId": "p_mig2",
+            "name": "بخاخ ربو",
+            "dosage": "بختين",
+            "timeString": "08:00 ص",
+            "days": ["كل يوم"],
+            "frequency": "عند اللزوم",
+            "duration": "دائم",
+            "isTaken": false
+        }
+        """.data(using: .utf8)!
+
+        let asNeededDecoded = try JSONDecoder().decode(MedicationItem.self, from: asNeededJson)
+        XCTAssertEqual(asNeededDecoded.scheduleType, .asNeeded)
+        XCTAssertEqual(asNeededDecoded.customDoseTimesMinutes, [])
+        XCTAssertEqual(asNeededDecoded.duration, "مستمر")
+        XCTAssertNil(asNeededDecoded.endDate)
+
+        // Test 3: "كل يومين" migration
+        let everyOtherDayJson = """
+        {
+            "id": "33333333-4444-5555-6666-777777777777",
+            "patientId": "p_mig3",
+            "name": "دواء يوم بعد يوم",
+            "dosage": "حبة",
+            "timeString": "08:00 ص",
+            "days": ["كل يوم"],
+            "frequency": "كل يومين",
+            "duration": "5 ايام",
+            "isTaken": false
+        }
+        """.data(using: .utf8)!
+
+        let eodDecoded = try JSONDecoder().decode(MedicationItem.self, from: everyOtherDayJson)
+        XCTAssertEqual(eodDecoded.scheduleType, .everyOtherDay)
+        XCTAssertEqual(eodDecoded.duration, "5 أيام")
+        XCTAssertNotNil(eodDecoded.endDate)
+    }
+
+    // MARK: - 10. End Date Reminder Expiration Tests
+    func testEndDateReminderExpiration() {
+        let h = makeHarness()
+        let cal = h.calendar
+        let start = date(year: 2026, month: 11, day: 1, hour: 8, minute: 0, calendar: cal)
+        let end = date(year: 2026, month: 11, day: 3, hour: 23, minute: 59, calendar: cal)
+
+        let med = MedicationItem(
+            patientId: "p_end",
+            name: "مضاد حيوي",
+            dosage: "حبة",
+            timeString: "08:00 ص",
+            scheduleType: .daily,
+            customDoseTimesMinutes: [480],
+            startDate: start,
+            endDate: end
+        )
+
+        // Day 1 (Nov 1): within range
+        XCTAssertTrue(h.medicationService.isScheduledForToday(med, on: start))
+        // Day 3 (Nov 3): last day
+        let day3 = date(year: 2026, month: 11, day: 3, hour: 10, minute: 0, calendar: cal)
+        XCTAssertTrue(h.medicationService.isScheduledForToday(med, on: day3))
+        // Day 4 (Nov 4): after end date -> expired!
+        let day4 = date(year: 2026, month: 11, day: 4, hour: 8, minute: 0, calendar: cal)
+        XCTAssertFalse(h.medicationService.isScheduledForToday(med, on: day4))
+
+        // Check planned reminders on Day 4: should be completely empty
+        let remindersAfterEnd = h.medicationService.plannedReminders(for: med, at: day4)
+        XCTAssertTrue(remindersAfterEnd.isEmpty)
+    }
+
+    // MARK: - 11. Every Other Day Schedule Execution Tests
+    func testEveryOtherDayScheduleExecution() {
+        let h = makeHarness()
+        let cal = h.calendar
+        let start = date(year: 2026, month: 11, day: 1, hour: 8, minute: 0, calendar: cal)
+
+        let med = MedicationItem(
+            patientId: "p_eod",
+            name: "دواء يوم بعد يوم",
+            dosage: "حبة",
+            timeString: "08:00 ص",
+            scheduleType: .everyOtherDay,
+            customDoseTimesMinutes: [480],
+            startDate: start
+        )
+
+        // Day 1 (Nov 1, diff = 0): scheduled
+        let day1 = date(year: 2026, month: 11, day: 1, hour: 9, minute: 0, calendar: cal)
+        XCTAssertTrue(h.medicationService.isScheduledForToday(med, on: day1))
+
+        // Day 2 (Nov 2, diff = 1): NOT scheduled
+        let day2 = date(year: 2026, month: 11, day: 2, hour: 9, minute: 0, calendar: cal)
+        XCTAssertFalse(h.medicationService.isScheduledForToday(med, on: day2))
+
+        // Day 3 (Nov 3, diff = 2): scheduled
+        let day3 = date(year: 2026, month: 11, day: 3, hour: 9, minute: 0, calendar: cal)
+        XCTAssertTrue(h.medicationService.isScheduledForToday(med, on: day3))
+
+        // Day 4 (Nov 4, diff = 3): NOT scheduled
+        let day4 = date(year: 2026, month: 11, day: 4, hour: 9, minute: 0, calendar: cal)
+        XCTAssertFalse(h.medicationService.isScheduledForToday(med, on: day4))
+    }
+
+    // MARK: - 12. As-Needed Schedule (No Reminders & Manual Logging) Tests
+    func testAsNeededScheduleNoRemindersAndManualLog() {
+        let h = makeHarness()
+        let cal = h.calendar
+        let patient = UserIdentity(id: "p_as_needed", role: .patient, displayName: "سعد", keyFingerprint: "fp_as_needed")
+        let now = date(year: 2026, month: 11, day: 1, hour: 10, minute: 0, calendar: cal)
+
+        let med = MedicationItem(
+            patientId: patient.id,
+            name: "مسكن عند اللزوم",
+            dosage: "حبة",
+            timeString: "08:00 ص",
+            scheduleType: .asNeeded,
+            customDoseTimesMinutes: [],
+            startDate: now
+        )
+
+        // No daily dose slots
+        XCTAssertTrue(h.medicationService.dailyDoseTimesMinutes(for: med).isEmpty)
+        // Not scheduled in regular daily schedule
+        XCTAssertFalse(h.medicationService.isScheduledForToday(med, on: now))
+        // No planned reminders or alerts
+        XCTAssertTrue(h.medicationService.plannedReminders(for: med, at: now).isEmpty)
+        XCTAssertTrue(h.medicationService.plannedMissedDoseAlerts(for: med, at: now).isEmpty)
+
+        // Manual dose logging
+        h.medicationService.logAsNeededDose(for: med, patient: patient, at: now)
+        let records = h.adherenceService.doseHistory(forPatient: patient.id)
+        XCTAssertEqual(records.count, 1)
+        XCTAssertEqual(records.first?.medicationId, med.id)
+        XCTAssertEqual(records.first?.status, .takenOnTime)
+    }
 }
 

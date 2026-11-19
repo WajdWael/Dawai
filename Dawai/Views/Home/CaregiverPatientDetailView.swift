@@ -18,6 +18,7 @@ public struct CaregiverPatientDetailView: View {
     @ObservedObject private var themeService = ThemeService.shared
 
     @State private var showingCallAlert = false
+    @State private var enteredPhoneNumber: String = ""
     @State private var showingUnlinkAlert = false
     @State private var showingReportSheet = false
     @State private var showingAddMedicationSheet = false
@@ -72,6 +73,7 @@ public struct CaregiverPatientDetailView: View {
 
                     medicationsSection
                     upcomingDosesSection
+                    asNeededMedicationsSection
                 }
                 .padding(.horizontal, 20)
                 .padding(.bottom, 80)
@@ -114,15 +116,28 @@ public struct CaregiverPatientDetailView: View {
         }
         .preferredColorScheme(themeService.colorScheme)
         .alert("الاتصال بـ \(beneficiary.name)", isPresented: $showingCallAlert) {
-            Button("اتصال هاتفي") {
-                let phone = (beneficiary.phoneNumber ?? "0501234567").replacingOccurrences(of: " ", with: "")
-                if let url = URL(string: "tel://\(phone)"), UIApplication.shared.canOpenURL(url) {
+            TextField("رقم الجوال (مثال: 05XXXXXXXX)", text: $enteredPhoneNumber)
+                .keyboardType(.phonePad)
+
+            Button("اتصال") {
+                let clean = enteredPhoneNumber.trimmingCharacters(in: .whitespacesAndNewlines).replacingOccurrences(of: " ", with: "")
+                if !clean.isEmpty {
+                    UserDefaults.standard.set(clean, forKey: "saved_phone_\(beneficiary.name)")
+                    if let url = URL(string: "tel://\(clean)"), UIApplication.shared.canOpenURL(url) {
+                        UIApplication.shared.open(url)
+                    }
+                }
+            }
+
+            Button("فتح تطبيق الهاتف") {
+                if let url = URL(string: "tel://") {
                     UIApplication.shared.open(url)
                 }
             }
+
             Button("إلغاء", role: .cancel) {}
         } message: {
-            Text("يمكنك الاتصال المباشر بالمستفيد للاطمئنان على أخذ الجرعة.")
+            Text("أدخل رقم جوال \(beneficiary.name) للاتصال المباشر به، أو افتح تطبيق الهاتف.")
         }
         .sheet(isPresented: $showingReportSheet) {
             let caregiverUser = appState.currentIdentity ?? UserIdentity(role: .caregiver, displayName: "مقدم الرعاية", keyFingerprint: "cg_default")
@@ -231,6 +246,8 @@ public struct CaregiverPatientDetailView: View {
             // Trailing side (LEFT in RTL): Call & Report Sheet buttons
             HStack(spacing: 8) {
                 Button {
+                    let saved = UserDefaults.standard.string(forKey: "saved_phone_\(beneficiary.name)")
+                    enteredPhoneNumber = saved ?? (beneficiary.phoneNumber == "0501234567" ? "" : (beneficiary.phoneNumber ?? ""))
                     showingCallAlert = true
                 } label: {
                     Image(systemName: "phone.fill")
@@ -299,11 +316,11 @@ public struct CaregiverPatientDetailView: View {
         .frame(maxWidth: .infinity)
         .background(
             RoundedRectangle(cornerRadius: 20, style: .continuous)
-                .fill(Color.dawaiWarningBackground)
+                .fill(Color(uiColor: .secondarySystemGroupedBackground))
         )
         .overlay(
             RoundedRectangle(cornerRadius: 20, style: .continuous)
-                .stroke(Color.dawaiWarningBorder, lineWidth: 1.2)
+                .stroke(Color.dawaiWarning.opacity(0.3), lineWidth: 1.0)
         )
     }
 
@@ -559,11 +576,12 @@ public struct CaregiverPatientDetailView: View {
                 }
             }
         }
+        .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
         .background(
             ZStack {
-                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                RoundedRectangle(cornerRadius: 22, style: .continuous)
                     .fill(.ultraThinMaterial)
-                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                RoundedRectangle(cornerRadius: 22, style: .continuous)
                     .fill(
                         Color(uiColor: UIColor { trait in
                             trait.userInterfaceStyle == .dark
@@ -571,7 +589,7 @@ public struct CaregiverPatientDetailView: View {
                                 : UIColor.white.withAlphaComponent(0.85)
                         })
                     )
-                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                RoundedRectangle(cornerRadius: 22, style: .continuous)
                     .fill(
                         Color(uiColor: UIColor { trait in
                             trait.userInterfaceStyle == .dark
@@ -582,7 +600,7 @@ public struct CaregiverPatientDetailView: View {
             }
         )
         .overlay(
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
+            RoundedRectangle(cornerRadius: 22, style: .continuous)
                 .stroke(Color.dawaiGlassBorder, lineWidth: 1)
         )
     }
@@ -1028,11 +1046,12 @@ public struct CaregiverPatientDetailView: View {
                         }
                     }
                 }
+                .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
                 .background(
                     ZStack {
-                        RoundedRectangle(cornerRadius: 16, style: .continuous)
+                        RoundedRectangle(cornerRadius: 22, style: .continuous)
                             .fill(.ultraThinMaterial)
-                        RoundedRectangle(cornerRadius: 16, style: .continuous)
+                        RoundedRectangle(cornerRadius: 22, style: .continuous)
                             .fill(
                                 Color(uiColor: UIColor { trait in
                                     trait.userInterfaceStyle == .dark
@@ -1040,7 +1059,7 @@ public struct CaregiverPatientDetailView: View {
                                         : UIColor.white.withAlphaComponent(0.85)
                                 })
                             )
-                        RoundedRectangle(cornerRadius: 16, style: .continuous)
+                        RoundedRectangle(cornerRadius: 22, style: .continuous)
                             .fill(
                                 Color(uiColor: UIColor { trait in
                                     trait.userInterfaceStyle == .dark
@@ -1051,8 +1070,76 @@ public struct CaregiverPatientDetailView: View {
                     }
                 )
                 .overlay(
-                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    RoundedRectangle(cornerRadius: 22, style: .continuous)
                         .stroke(Color.dawaiGlassBorder, lineWidth: 1)
+                )
+            }
+        }
+    }
+
+    // MARK: - 5.5 As-Needed Medications Section («أدوية عند الحاجة»)
+    @ViewBuilder
+    private var asNeededMedicationsSection: some View {
+        let asNeededMeds = currentPatientMedications.filter {
+            $0.scheduleType == .asNeeded && !$0.isPendingDeletion
+        }
+        if !asNeededMeds.isEmpty {
+            VStack(alignment: .leading, spacing: 12) {
+                Text("أدوية عند الحاجة")
+                    .dawaiFont(size: 20, weight: .bold)
+                    .foregroundStyle(.primary)
+
+                VStack(spacing: 0) {
+                    ForEach(asNeededMeds.indices, id: \.self) { index in
+                        let med = asNeededMeds[index]
+                        let itemId = "asneeded_\(med.id)"
+                        CaregiverSwipeableContainer(
+                            itemId: itemId,
+                            swipedItemId: $swipedItemId,
+                            onEdit: {
+                                editingMedication = med
+                            },
+                            onDelete: {
+                                medicationToDelete = med
+                                showingCaregiverDeleteAlert = true
+                            }
+                        ) {
+                            HStack(spacing: 12) {
+                                Button {
+                                    previewingMedication = med
+                                } label: {
+                                    HStack(spacing: 12) {
+                                        medicationRowThumbnail(imageData: med.imageData, isTaken: false)
+
+                                        VStack(alignment: .leading, spacing: 3) {
+                                            Text(med.name)
+                                                .dawaiFont(size: 17, weight: .semibold)
+                                                .foregroundStyle(.primary)
+
+                                            Text("\(med.dosage) • عند الحاجة (بدون تذكير)")
+                                                .dawaiFont(size: 13, weight: .medium)
+                                                .foregroundStyle(.secondary)
+                                        }
+                                    }
+                                    .contentShape(Rectangle())
+                                }
+                                .buttonStyle(.plain)
+
+                                Spacer()
+                            }
+                            .padding(.horizontal, 16)
+                            .padding(.vertical, 12)
+                        }
+
+                        if index < asNeededMeds.count - 1 {
+                            Divider().padding(.leading, 16)
+                        }
+                    }
+                }
+                .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
+                .background(
+                    RoundedRectangle(cornerRadius: 22, style: .continuous)
+                        .fill(Color(uiColor: .secondarySystemGroupedBackground))
                 )
             }
         }
@@ -1151,8 +1238,10 @@ public struct CaregiverPatientDetailView: View {
                         )
                     }
                 }
+                .frame(maxWidth: .infinity)
                 .padding(20)
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(Color.dawaiBackground.ignoresSafeArea())
             .navigationTitle("تفاصيل الدواء")
             .navigationBarTitleDisplayMode(.inline)
@@ -1195,27 +1284,26 @@ private struct CaregiverSwipeableContainer<Content: View>: View {
     @ViewBuilder let content: () -> Content
 
     @State private var dragOffset: CGFloat = 0
-    private let actionButtonsWidth: CGFloat = 160 // 80 for Edit, 80 for Delete
+    private let actionButtonsWidth: CGFloat = 130
 
     private var isOpen: Bool {
         swipedItemId == itemId
     }
 
     private var currentOffset: CGFloat {
-        if isOpen {
-            return -actionButtonsWidth + dragOffset
-        } else {
-            return min(0, dragOffset)
-        }
+        let base: CGFloat = isOpen ? -actionButtonsWidth : 0
+        let total = base + dragOffset
+        // Clamp to prevent over-dragging to the right, allow slight rubber-band to the left
+        return min(10, max(-actionButtonsWidth - 25, total))
     }
 
     var body: some View {
         ZStack(alignment: .trailing) {
             // Action Buttons behind the row
-            HStack(spacing: 0) {
+            HStack(spacing: 8) {
                 Spacer()
 
-                // 1. Delete Button (Red)
+                // 1. Delete Button (Red Circle)
                 Button {
                     withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
                         swipedItemId = nil
@@ -1223,20 +1311,15 @@ private struct CaregiverSwipeableContainer<Content: View>: View {
                     }
                     onDelete()
                 } label: {
-                    VStack(spacing: 4) {
-                        Image(systemName: "trash")
-                            .dawaiFont(size: 20, weight: .bold)
-                        Text("حذف")
-                            .dawaiFont(size: 14, weight: .bold)
-                    }
-                    .foregroundStyle(.white)
-                    .frame(width: 80)
-                    .frame(maxHeight: .infinity)
-                    .background(Color.red)
+                    Image(systemName: "trash")
+                        .dawaiFont(size: 18, weight: .bold)
+                        .foregroundStyle(.white)
+                        .frame(width: 50, height: 50)
+                        .background(Color.red, in: Circle())
                 }
                 .buttonStyle(.plain)
 
-                // 2. Edit Button (Primary Color)
+                // 2. Edit Button (Teal Circle)
                 Button {
                     withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
                         swipedItemId = nil
@@ -1244,59 +1327,73 @@ private struct CaregiverSwipeableContainer<Content: View>: View {
                     }
                     onEdit()
                 } label: {
-                    VStack(spacing: 4) {
-                        Image(systemName: "pencil")
-                            .dawaiFont(size: 20, weight: .bold)
-                        Text("تعديل")
-                            .dawaiFont(size: 14, weight: .bold)
-                    }
-                    .foregroundStyle(.white)
-                    .frame(width: 80)
-                    .frame(maxHeight: .infinity)
-                    .background(Color.dawaiPrimary)
+                    Image(systemName: "pencil")
+                        .dawaiFont(size: 18, weight: .bold)
+                        .foregroundStyle(.white)
+                        .frame(width: 50, height: 50)
+                        .background(Color.dawaiPrimary, in: Circle())
                 }
                 .buttonStyle(.plain)
             }
-            .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+            .padding(.trailing, 8)
 
             // Main Row Content sliding horizontally
             content()
+                .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
+                .background(
+                    RoundedRectangle(cornerRadius: 22, style: .continuous)
+                        .fill(
+                            Color(uiColor: UIColor { trait in
+                                trait.userInterfaceStyle == .dark
+                                    ? UIColor.secondarySystemGroupedBackground
+                                    : UIColor.white
+                            })
+                        )
+                )
                 .offset(x: currentOffset)
                 .contentShape(Rectangle())
-                .highPriorityGesture(
-                    DragGesture(minimumDistance: 20, coordinateSpace: .local)
+                .simultaneousGesture(
+                    DragGesture(minimumDistance: 10, coordinateSpace: .local)
                         .onChanged { value in
-                            // RTL horizontal drag detection
-                            let translation = value.translation.width
-                            if abs(translation) > abs(value.translation.height) {
+                            let hTranslation = value.translation.width
+                            let vTranslation = value.translation.height
+                            
+                            // Only claim if movement is primarily horizontal
+                            guard abs(hTranslation) > abs(vTranslation) else { return }
+
+                            withAnimation(.interactiveSpring(response: 0.25, dampingFraction: 0.86)) {
                                 if isOpen {
-                                    // Can slide back right towards 0
-                                    let candidate = translation
-                                    if candidate > 0 {
-                                        dragOffset = min(actionButtonsWidth, candidate)
+                                    // Moving right closes the swipe
+                                    if hTranslation > 0 {
+                                        dragOffset = hTranslation
                                     } else {
-                                        dragOffset = candidate * 0.2 // resistance
+                                        // Slight resistance when pulling further left
+                                        dragOffset = hTranslation * 0.3
                                     }
                                 } else {
-                                    // Can slide left (negative) to reveal buttons
-                                    if translation < 0 {
-                                        dragOffset = max(-actionButtonsWidth - 20, translation)
+                                    // Moving left opens the swipe
+                                    if hTranslation < 0 {
+                                        dragOffset = hTranslation
                                     } else {
-                                        dragOffset = 0
+                                        // Slight resistance when pulling right while closed
+                                        dragOffset = hTranslation * 0.15
                                     }
                                 }
                             }
                         }
                         .onEnded { value in
-                            let translation = value.translation.width
+                            let hTranslation = value.translation.width
                             let velocity = value.predictedEndTranslation.width
-                            withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
+                            
+                            withAnimation(.spring(response: 0.32, dampingFraction: 0.78)) {
                                 if isOpen {
-                                    if translation > 40 || velocity > 80 {
+                                    // If pulled right by 25pt or swiped with velocity, close it
+                                    if hTranslation > 25 || velocity > 40 {
                                         swipedItemId = nil
                                     }
                                 } else {
-                                    if translation < -50 || velocity < -100 {
+                                    // If pulled left by 35pt or flicked left, open it smoothly
+                                    if hTranslation < -35 || velocity < -50 {
                                         swipedItemId = itemId
                                     }
                                 }

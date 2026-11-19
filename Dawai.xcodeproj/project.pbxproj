@@ -448,7 +448,7 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_ENTITLEMENTS = Dawai/Dawai.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 17;
+				CURRENT_PROJECT_VERSION = 19;
 				DEVELOPMENT_TEAM = F3FXMY5BHX;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
@@ -459,6 +459,7 @@
 				INFOPLIST_KEY_NSCameraUsageDescription = "يحتاج تطبيق دواي إلى الكاميرا لالتقاط صورة عبوة الدواء لتسهيل التعرف عليه عند موعد الجرعة.";
 				INFOPLIST_KEY_NSPhotoLibraryUsageDescription = "يحتاج تطبيق دواي إلى مكتبة الصور لاختيار صورة عبوة الدواء وإرفاقها في جدولك.";
 				INFOPLIST_KEY_NSSupportsLiveActivities = YES;
+				INFOPLIST_KEY_NSSupportsLiveActivitiesFrequentUpdates = YES;
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
@@ -489,7 +490,7 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_ENTITLEMENTS = Dawai/Dawai.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 17;
+				CURRENT_PROJECT_VERSION = 19;
 				DEVELOPMENT_TEAM = F3FXMY5BHX;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
@@ -500,6 +501,7 @@
 				INFOPLIST_KEY_NSCameraUsageDescription = "يحتاج تطبيق دواي إلى الكاميرا لالتقاط صورة عبوة الدواء لتسهيل التعرف عليه عند موعد الجرعة.";
 				INFOPLIST_KEY_NSPhotoLibraryUsageDescription = "يحتاج تطبيق دواي إلى مكتبة الصور لاختيار صورة عبوة الدواء وإرفاقها في جدولك.";
 				INFOPLIST_KEY_NSSupportsLiveActivities = YES;
+				INFOPLIST_KEY_NSSupportsLiveActivitiesFrequentUpdates = YES;
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
@@ -572,7 +574,7 @@
 			buildSettings = {
 				APPLICATION_EXTENSION_API_ONLY = YES;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 17;
+				CURRENT_PROJECT_VERSION = 19;
 				DEVELOPMENT_TEAM = F3FXMY5BHX;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = DawaiWidgets/Info.plist;
@@ -602,7 +604,7 @@
 			buildSettings = {
 				APPLICATION_EXTENSION_API_ONLY = YES;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 17;
+				CURRENT_PROJECT_VERSION = 19;
 				DEVELOPMENT_TEAM = F3FXMY5BHX;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = DawaiWidgets/Info.plist;

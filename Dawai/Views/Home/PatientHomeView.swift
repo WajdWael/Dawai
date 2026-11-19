@@ -75,6 +75,9 @@ public struct PatientHomeView: View {
                     // 4. Daily Schedule
                     upcomingDosesSection
 
+                    // 4.5 As-Needed Medications Section («عند الحاجة»)
+                    asNeededMedicationsSection
+
                     // 5. Caregivers System List
                     caregiversSection
                 }
@@ -584,13 +587,14 @@ public struct PatientHomeView: View {
                                 medicationToDelete = dose.medication
                                 showingDeleteConfirmationAlert = true
                             } label: {
-                                Label("حذف", systemImage: "trash")
+                                Image(systemName: "trash")
                             }
+                            .tint(.red)
 
                             Button {
                                 editingMedication = dose.medication
                             } label: {
-                                Label("تعديل", systemImage: "pencil")
+                                Image(systemName: "pencil")
                             }
                             .tint(Color.dawaiPrimary)
                         }
@@ -705,14 +709,15 @@ public struct PatientHomeView: View {
                         medicationToDelete = med
                         showingDeleteConfirmationAlert = true
                     } label: {
-                        Label("حذف", systemImage: "trash")
+                        Image(systemName: "trash")
                     }
+                    .tint(.red)
                 }
 
                 Button {
                     editingMedication = med
                 } label: {
-                    Label("تعديل", systemImage: "pencil")
+                    Image(systemName: "pencil")
                 }
                 .tint(Color.dawaiPrimary)
             }
@@ -1187,15 +1192,16 @@ public struct PatientHomeView: View {
                                 showingDeleteConfirmationAlert = true
                             }
                         } label: {
-                            Label("حذف", systemImage: "trash")
+                            Image(systemName: "trash")
                         }
+                        .tint(.red)
 
                         Button {
                             if let med = medicationService.medications.first(where: { $0.id == dose.medicationId }) {
                                 editingMedication = med
                             }
                         } label: {
-                            Label("تعديل", systemImage: "pencil")
+                            Image(systemName: "pencil")
                         }
                         .tint(Color.dawaiPrimary)
                     }
@@ -1206,6 +1212,81 @@ public struct PatientHomeView: View {
                     .foregroundStyle(.primary)
                     .textCase(nil)
             }
+        }
+    }
+
+    // MARK: - 4.5 As-Needed Medications Section («عند الحاجة»)
+    @ViewBuilder
+    private var asNeededMedicationsSection: some View {
+        let asNeededMeds = medicationService.medications.filter {
+            $0.scheduleType == .asNeeded && !$0.isPendingDeletion
+        }
+        if !asNeededMeds.isEmpty {
+            Section {
+                ForEach(asNeededMeds) { med in
+                    asNeededMedicationRow(med: med)
+                }
+            } header: {
+                Text("أدوية عند الحاجة")
+                    .dawaiFont(size: 20, weight: .bold)
+                    .foregroundStyle(.primary)
+                    .textCase(nil)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func asNeededMedicationRow(med: MedicationItem) -> some View {
+        HStack(spacing: 12) {
+            medicationRowThumbnail(imageData: med.imageData, isTaken: false)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(med.name)
+                    .dawaiFont(size: 16, weight: .bold)
+                    .foregroundStyle(.primary)
+
+                Text("\(med.dosage) • عند الحاجة (بدون تذكير)")
+                    .dawaiFont(size: 13, weight: .medium)
+                    .foregroundStyle(.secondary)
+            }
+
+            Spacer()
+
+            Button {
+                withAnimation(.spring(response: 0.35, dampingFraction: 0.7)) {
+                    medicationService.logAsNeededDose(for: med, patient: identity)
+                }
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "checkmark")
+                        .dawaiFont(size: 11, weight: .bold)
+                    Text("أخذت الجرعة")
+                        .dawaiFont(size: 12, weight: .bold)
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .background(Color.dawaiPrimary, in: Capsule())
+                .foregroundStyle(.white)
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.vertical, 4)
+        .listRowBackground(glassRowBackground)
+        .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+            Button(role: .destructive) {
+                medicationToDelete = med
+                showingDeleteConfirmationAlert = true
+            } label: {
+                Image(systemName: "trash")
+            }
+            .tint(.red)
+
+            Button {
+                editingMedication = med
+            } label: {
+                Image(systemName: "pencil")
+            }
+            .tint(Color.dawaiPrimary)
         }
     }
 

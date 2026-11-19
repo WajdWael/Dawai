@@ -8,6 +8,36 @@
 
 import Foundation
 
+// MARK: - Medication Schedule Type & Waking Hours Defaults
+public enum MedicationScheduleType: String, Codable, Equatable, Sendable {
+    case daily = "daily"
+    case specificWeekdays = "specific_weekdays"
+    case everyOtherDay = "every_other_day"
+    case asNeeded = "as_needed"
+}
+
+public enum MedicationWakingHoursDefaults {
+    /// Returns default dose times (minutes after midnight) spread over waking hours:
+    /// 1 dose -> [8:00 ص] (480)
+    /// 2 doses -> [8:00 ص (480), 8:00 م (1200)]
+    /// 3 doses -> [8:00 ص (480), 2:00 م (840), 8:00 م (1200)]
+    /// 4 doses -> [8:00 ص (480), 12:00 م (720), 4:00 م (960), 8:00 م (1200)]
+    public static func defaultMinutes(forCount count: Int) -> [Int] {
+        switch count {
+        case 1:
+            return [8 * 60] // 08:00 AM
+        case 2:
+            return [8 * 60, 20 * 60] // 08:00 AM, 08:00 PM
+        case 3:
+            return [8 * 60, 14 * 60, 20 * 60] // 08:00 AM, 02:00 PM, 08:00 PM
+        case 4:
+            return [8 * 60, 12 * 60, 16 * 60, 20 * 60] // 08:00 AM, 12:00 PM, 04:00 PM, 08:00 PM
+        default:
+            return [8 * 60]
+        }
+    }
+}
+
 // MARK: - Medication Weekday Model
 /// Gregorian weekday values matching `Calendar.current.component(.weekday, from:)` (1 = Sunday ... 7 = Saturday).
 public enum MedicationWeekday: Int, CaseIterable, Codable, Hashable, Comparable, Identifiable {
@@ -27,13 +57,13 @@ public enum MedicationWeekday: Int, CaseIterable, Codable, Hashable, Comparable,
 
     public var optionTitle: String {
         switch self {
-        case .sunday: return "كل الاحد"
-        case .monday: return "كل الاثنين"
-        case .tuesday: return "كل الثلاثاء"
-        case .wednesday: return "كل الاربعاء"
-        case .thursday: return "كل الخميس"
-        case .friday: return "كل الجمعه"
-        case .saturday: return "كل السبت"
+        case .sunday: return "الأحد"
+        case .monday: return "الاثنين"
+        case .tuesday: return "الثلاثاء"
+        case .wednesday: return "الأربعاء"
+        case .thursday: return "الخميس"
+        case .friday: return "الجمعة"
+        case .saturday: return "السبت"
         }
     }
 
@@ -102,8 +132,15 @@ public struct MedicationItem: Identifiable, Codable, Equatable, Sendable {
     public var scheduleUpdatedAt: Date
     public var isPendingDeletion: Bool
 
+    // Structured Schedule Fields
+    public var scheduleType: MedicationScheduleType
+    public var customDoseTimesMinutes: [Int]
+    public var startDate: Date
+    public var endDate: Date?
+
     enum CodingKeys: String, CodingKey {
         case id, patientId, name, dosage, timeString, scheduledDate, days, selectedWeekdays, frequency, duration, instructions, imageData, isTaken, takenAt, takenSlotsToday, createdAt, scheduleUpdatedAt, isPendingDeletion
+        case scheduleType, customDoseTimesMinutes, startDate, endDate
     }
 
     public init(
@@ -115,8 +152,8 @@ public struct MedicationItem: Identifiable, Codable, Equatable, Sendable {
         scheduledDate: Date? = nil,
         days: [String] = ["كل يوم"],
         selectedWeekdays: Set<Int>? = nil,
-        frequency: String = "مرة يوميًا",
-        duration: String = "دائم",
+        frequency: String = "مرة يومياً",
+        duration: String = "مستمر",
         instructions: String? = nil,
         imageData: Data? = nil,
         isTaken: Bool = false,
@@ -124,7 +161,11 @@ public struct MedicationItem: Identifiable, Codable, Equatable, Sendable {
         takenSlotsToday: [Int: Date] = [:],
         createdAt: Date = AppClock.shared.now,
         scheduleUpdatedAt: Date? = nil,
-        isPendingDeletion: Bool = false
+        isPendingDeletion: Bool = false,
+        scheduleType: MedicationScheduleType? = nil,
+        customDoseTimesMinutes: [Int]? = nil,
+        startDate: Date? = nil,
+        endDate: Date? = nil
     ) {
         self.id = id
         self.patientId = patientId
@@ -132,16 +173,22 @@ public struct MedicationItem: Identifiable, Codable, Equatable, Sendable {
         self.dosage = dosage
         self.timeString = timeString
         self.scheduledDate = scheduledDate
+
+        let resolvedWeekdays: Set<Int>
+        let resolvedDays: [String]
         if let selectedWeekdays {
             let normalized = Set(selectedWeekdays.filter { (1...7).contains($0) })
-            self.selectedWeekdays = normalized.count == 7 ? [] : normalized
-            self.days = (days == ["كل يوم"] && !self.selectedWeekdays.isEmpty)
-                ? MedicationWeekday.displayDays(from: self.selectedWeekdays)
+            resolvedWeekdays = normalized.count == 7 ? [] : normalized
+            resolvedDays = (days == ["كل يوم"] && !resolvedWeekdays.isEmpty)
+                ? MedicationWeekday.displayDays(from: resolvedWeekdays)
                 : days
         } else {
-            self.days = days
-            self.selectedWeekdays = MedicationWeekday.parseWeekdayNumbers(from: days)
+            resolvedDays = days
+            resolvedWeekdays = MedicationWeekday.parseWeekdayNumbers(from: days)
         }
+        self.days = resolvedDays
+        self.selectedWeekdays = resolvedWeekdays
+
         self.frequency = frequency
         self.duration = duration
         self.instructions = instructions
@@ -152,41 +199,291 @@ public struct MedicationItem: Identifiable, Codable, Equatable, Sendable {
         self.createdAt = createdAt
         self.scheduleUpdatedAt = scheduleUpdatedAt ?? createdAt
         self.isPendingDeletion = isPendingDeletion
+
+        let effectiveStart = startDate ?? createdAt
+        self.startDate = effectiveStart
+        self.endDate = endDate
+
+        // Derive or set scheduleType
+        let resolvedScheduleType: MedicationScheduleType
+        if let scheduleType {
+            resolvedScheduleType = scheduleType
+        } else {
+            if resolvedDays.contains("عند الحاجة") || resolvedDays.contains("عند اللزوم") || frequency.contains("عند الحاجة") || frequency.contains("عند اللزوم") {
+                resolvedScheduleType = .asNeeded
+            } else if resolvedDays.contains("يوم بعد يوم") || frequency.contains("يوم بعد يوم") || frequency.contains("كل يومين") || frequency.contains("كل 3 أيام") {
+                resolvedScheduleType = .everyOtherDay
+            } else if !resolvedWeekdays.isEmpty {
+                resolvedScheduleType = .specificWeekdays
+            } else {
+                resolvedScheduleType = .daily
+            }
+        }
+        self.scheduleType = resolvedScheduleType
+
+        // Derive or set customDoseTimesMinutes
+        let resolvedDoseTimes: [Int]
+        if let customDoseTimesMinutes, !customDoseTimesMinutes.isEmpty {
+            resolvedDoseTimes = customDoseTimesMinutes.sorted()
+        } else {
+            let primaryMinute: Int = {
+                if let d = scheduledDate {
+                    let comps = Calendar.current.dateComponents([.hour, .minute], from: d)
+                    return (comps.hour ?? 8) * 60 + (comps.minute ?? 0)
+                }
+                return MedicationItem.parseMinutes(from: timeString)
+            }()
+            let count = MedicationItem.parseDoseCount(from: frequency)
+            if count <= 1 {
+                resolvedDoseTimes = [primaryMinute]
+            } else {
+                let defaults = MedicationWakingHoursDefaults.defaultMinutes(forCount: count)
+                var times = [primaryMinute]
+                for def in defaults.dropFirst() {
+                    times.append(def)
+                }
+                resolvedDoseTimes = times.sorted()
+            }
+        }
+        self.customDoseTimesMinutes = resolvedDoseTimes
+    }
+
+    /// Convenience initializer accepting `selectedWeekdays` as `[Int]?`
+    public init(
+        id: UUID = UUID(),
+        patientId: String = MedicationItem.currentIdentityPatientId,
+        name: String,
+        dosage: String,
+        timeString: String,
+        scheduledDate: Date? = nil,
+        days: [String] = ["كل يوم"],
+        selectedWeekdays: [Int]?,
+        frequency: String = "مرة يومياً",
+        duration: String = "مستمر",
+        instructions: String? = nil,
+        imageData: Data? = nil,
+        isTaken: Bool = false,
+        takenAt: Date? = nil,
+        takenSlotsToday: [Int: Date] = [:],
+        createdAt: Date = AppClock.shared.now,
+        scheduleUpdatedAt: Date? = nil,
+        isPendingDeletion: Bool = false,
+        scheduleType: MedicationScheduleType? = nil,
+        customDoseTimesMinutes: [Int]? = nil,
+        startDate: Date? = nil,
+        endDate: Date? = nil
+    ) {
+        self.init(
+            id: id,
+            patientId: patientId,
+            name: name,
+            dosage: dosage,
+            timeString: timeString,
+            scheduledDate: scheduledDate,
+            days: days,
+            selectedWeekdays: selectedWeekdays.map { Set($0) },
+            frequency: frequency,
+            duration: duration,
+            instructions: instructions,
+            imageData: imageData,
+            isTaken: isTaken,
+            takenAt: takenAt,
+            takenSlotsToday: takenSlotsToday,
+            createdAt: createdAt,
+            scheduleUpdatedAt: scheduleUpdatedAt,
+            isPendingDeletion: isPendingDeletion,
+            scheduleType: scheduleType,
+            customDoseTimesMinutes: customDoseTimesMinutes,
+            startDate: startDate,
+            endDate: endDate
+        )
     }
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        id = try container.decode(UUID.self, forKey: .id)
-        // Items saved before `patientId` existed belong to the patient using this device.
-        patientId = try container.decodeIfPresent(String.self, forKey: .patientId)
+        let decId = try container.decode(UUID.self, forKey: .id)
+        let decPatientId = try container.decodeIfPresent(String.self, forKey: .patientId)
             ?? (decoder.userInfo[MedicationItem.legacyPatientIdUserInfoKey] as? String)
             ?? MedicationItem.currentIdentityPatientId
-        name = try container.decode(String.self, forKey: .name)
-        dosage = try container.decode(String.self, forKey: .dosage)
-        timeString = try container.decode(String.self, forKey: .timeString)
-        scheduledDate = try container.decodeIfPresent(Date.self, forKey: .scheduledDate)
+        let decName = try container.decode(String.self, forKey: .name)
+        let decDosage = try container.decode(String.self, forKey: .dosage)
+        let decTimeString = try container.decode(String.self, forKey: .timeString)
+        let decScheduledDate = try container.decodeIfPresent(Date.self, forKey: .scheduledDate)
+
         let decodedDays = try container.decodeIfPresent([String].self, forKey: .days) ?? ["كل يوم"]
+        let resolvedWeekdays: Set<Int>
+        let resolvedDays: [String]
         if let decodedWeekdays = try container.decodeIfPresent(Set<Int>.self, forKey: .selectedWeekdays) {
             let normalized = Set(decodedWeekdays.filter { (1...7).contains($0) })
-            selectedWeekdays = normalized.count == 7 ? [] : normalized
-            days = (decodedDays == ["كل يوم"] && !selectedWeekdays.isEmpty)
-                ? MedicationWeekday.displayDays(from: selectedWeekdays)
+            resolvedWeekdays = normalized.count == 7 ? [] : normalized
+            resolvedDays = (decodedDays == ["كل يوم"] && !resolvedWeekdays.isEmpty)
+                ? MedicationWeekday.displayDays(from: resolvedWeekdays)
                 : decodedDays
         } else {
-            days = decodedDays
-            selectedWeekdays = MedicationWeekday.parseWeekdayNumbers(from: decodedDays)
+            resolvedDays = decodedDays
+            resolvedWeekdays = MedicationWeekday.parseWeekdayNumbers(from: decodedDays)
         }
-        frequency = try container.decodeIfPresent(String.self, forKey: .frequency) ?? "مرة يوميًا"
-        duration = try container.decodeIfPresent(String.self, forKey: .duration) ?? "دائم"
-        instructions = try container.decodeIfPresent(String.self, forKey: .instructions)
-        imageData = try container.decodeIfPresent(Data.self, forKey: .imageData)
-        isTaken = try container.decodeIfPresent(Bool.self, forKey: .isTaken) ?? false
-        takenAt = try container.decodeIfPresent(Date.self, forKey: .takenAt)
-        takenSlotsToday = try container.decodeIfPresent([Int: Date].self, forKey: .takenSlotsToday) ?? [:]
+
+        let decFrequency = try container.decodeIfPresent(String.self, forKey: .frequency) ?? "مرة يومياً"
+        let decDuration = try container.decodeIfPresent(String.self, forKey: .duration) ?? "دائم"
+        let decInstructions = try container.decodeIfPresent(String.self, forKey: .instructions)
+        let decImageData = try container.decodeIfPresent(Data.self, forKey: .imageData)
+        let decIsTaken = try container.decodeIfPresent(Bool.self, forKey: .isTaken) ?? false
+        let decTakenAt = try container.decodeIfPresent(Date.self, forKey: .takenAt)
+        let decTakenSlotsToday = try container.decodeIfPresent([Int: Date].self, forKey: .takenSlotsToday) ?? [:]
         let decodedCreatedAt = try container.decodeIfPresent(Date.self, forKey: .createdAt) ?? Date()
-        createdAt = decodedCreatedAt
-        scheduleUpdatedAt = try container.decodeIfPresent(Date.self, forKey: .scheduleUpdatedAt) ?? decodedCreatedAt
-        isPendingDeletion = try container.decodeIfPresent(Bool.self, forKey: .isPendingDeletion) ?? false
+        let decScheduleUpdatedAt = try container.decodeIfPresent(Date.self, forKey: .scheduleUpdatedAt) ?? decodedCreatedAt
+        let decIsPendingDeletion = try container.decodeIfPresent(Bool.self, forKey: .isPendingDeletion) ?? false
+
+        let decodedStartDate = try container.decodeIfPresent(Date.self, forKey: .startDate) ?? decodedCreatedAt
+        var decodedEndDate = try container.decodeIfPresent(Date.self, forKey: .endDate)
+
+        // Decode scheduleType or migrate from legacy days & frequency
+        let resolvedScheduleType: MedicationScheduleType
+        if let explicitType = try container.decodeIfPresent(MedicationScheduleType.self, forKey: .scheduleType) {
+            resolvedScheduleType = explicitType
+        } else {
+            if resolvedDays.contains("عند الحاجة") || resolvedDays.contains("عند اللزوم") || decFrequency.contains("عند الحاجة") || decFrequency.contains("عند اللزوم") {
+                resolvedScheduleType = .asNeeded
+            } else if resolvedDays.contains("يوم بعد يوم") || decFrequency.contains("يوم بعد يوم") || decFrequency.contains("كل يومين") || decFrequency.contains("كل 3 أيام") {
+                resolvedScheduleType = .everyOtherDay
+            } else if !resolvedWeekdays.isEmpty {
+                resolvedScheduleType = .specificWeekdays
+            } else {
+                resolvedScheduleType = .daily
+            }
+        }
+
+        // Migrate instructions with legacy dropdown tags if found
+        var migratedInstructions = decInstructions
+        let specialNotes = ["على الريق", "مع الوجبات", "قبل النوم"]
+        for note in specialNotes where decFrequency.contains(note) {
+            if let existing = migratedInstructions, !existing.contains(note) {
+                migratedInstructions = "\(existing) • \(note)"
+            } else if migratedInstructions == nil {
+                migratedInstructions = note
+            }
+        }
+        if decFrequency.contains("كل 4 ساعات") {
+            let note = "تؤخذ كل 4 ساعات"
+            if let existing = migratedInstructions, !existing.contains(note) {
+                migratedInstructions = "\(existing) • \(note)"
+            } else if migratedInstructions == nil {
+                migratedInstructions = note
+            }
+        }
+        if decFrequency.contains("شهرياً") || decFrequency.contains("شهريا") {
+            let note = "جرعة شهرية"
+            if let existing = migratedInstructions, !existing.contains(note) {
+                migratedInstructions = "\(existing) • \(note)"
+            } else if migratedInstructions == nil {
+                migratedInstructions = note
+            }
+        }
+
+        // Migrate duration to endDate if needed
+        if decodedEndDate == nil && decDuration != "دائم" && decDuration != "مستمر" {
+            let calendar = Calendar.current
+            if decDuration.contains("3 ايام") || decDuration.contains("3 أيام") {
+                decodedEndDate = calendar.date(byAdding: .day, value: 3, to: decodedStartDate)
+            } else if decDuration.contains("5 ايام") || decDuration.contains("5 أيام") {
+                decodedEndDate = calendar.date(byAdding: .day, value: 5, to: decodedStartDate)
+            } else if decDuration.contains("اسبوعين") || decDuration.contains("أسبوعين") {
+                decodedEndDate = calendar.date(byAdding: .day, value: 14, to: decodedStartDate)
+            } else if decDuration.contains("اسبوع") || decDuration.contains("أسبوع") {
+                decodedEndDate = calendar.date(byAdding: .day, value: 7, to: decodedStartDate)
+            } else if decDuration.contains("10") {
+                decodedEndDate = calendar.date(byAdding: .day, value: 10, to: decodedStartDate)
+            } else if decDuration.contains("3 اسابيع") || decDuration.contains("3 أسابيع") {
+                decodedEndDate = calendar.date(byAdding: .day, value: 21, to: decodedStartDate)
+            } else if decDuration.contains("4 اسابيع") || decDuration.contains("4 أسابيع") {
+                decodedEndDate = calendar.date(byAdding: .day, value: 28, to: decodedStartDate)
+            } else if decDuration.contains("شهر") {
+                decodedEndDate = calendar.date(byAdding: .month, value: 1, to: decodedStartDate)
+            }
+        }
+
+        // Decode customDoseTimesMinutes or calculate waking-hours defaults
+        let resolvedDoseTimes: [Int]
+        if let explicitTimes = try container.decodeIfPresent([Int].self, forKey: .customDoseTimesMinutes), !explicitTimes.isEmpty {
+            resolvedDoseTimes = explicitTimes.sorted()
+        } else {
+            let primaryMinute: Int = {
+                if let d = decScheduledDate {
+                    let comps = Calendar.current.dateComponents([.hour, .minute], from: d)
+                    return (comps.hour ?? 8) * 60 + (comps.minute ?? 0)
+                }
+                return MedicationItem.parseMinutes(from: decTimeString)
+            }()
+            let count = MedicationItem.parseDoseCount(from: decFrequency)
+            if count <= 1 {
+                resolvedDoseTimes = [primaryMinute]
+            } else {
+                let defaults = MedicationWakingHoursDefaults.defaultMinutes(forCount: count)
+                var times = [primaryMinute]
+                for def in defaults.dropFirst() {
+                    times.append(def)
+                }
+                resolvedDoseTimes = times.sorted()
+            }
+        }
+
+        self.id = decId
+        self.patientId = decPatientId
+        self.name = decName
+        self.dosage = decDosage
+        self.timeString = decTimeString
+        self.scheduledDate = decScheduledDate
+        self.days = resolvedDays
+        self.selectedWeekdays = resolvedWeekdays
+        self.frequency = decFrequency
+        self.duration = decDuration
+        self.instructions = migratedInstructions
+        self.imageData = decImageData
+        self.isTaken = decIsTaken
+        self.takenAt = decTakenAt
+        self.takenSlotsToday = decTakenSlotsToday
+        self.createdAt = decodedCreatedAt
+        self.scheduleUpdatedAt = decScheduleUpdatedAt
+        self.isPendingDeletion = decIsPendingDeletion
+        self.scheduleType = resolvedScheduleType
+        self.customDoseTimesMinutes = resolvedDoseTimes
+        self.startDate = decodedStartDate
+        self.endDate = decodedEndDate
+    }
+
+    // MARK: - Helpers for Parsing Time & Frequency
+    public static func parseMinutes(from timeStr: String) -> Int {
+        let clean = timeStr.westernNumerals.trimmingCharacters(in: .whitespaces)
+        let isPM = clean.contains("م") || clean.lowercased().contains("pm")
+        let isAM = clean.contains("ص") || clean.lowercased().contains("am")
+
+        let digits = clean.replacingOccurrences(of: "[^0-9:]", with: "", options: .regularExpression)
+        let parts = digits.split(separator: ":")
+        guard let hStr = parts.first, let h = Int(hStr) else { return 8 * 60 }
+        let m = parts.count > 1 ? (Int(parts[1]) ?? 0) : 0
+
+        var hour = h
+        if isPM && hour < 12 {
+            hour += 12
+        } else if isAM && hour == 12 {
+            hour = 0
+        }
+        return hour * 60 + m
+    }
+
+    public static func parseDoseCount(from freq: String) -> Int {
+        let clean = freq.trimmingCharacters(in: .whitespacesAndNewlines)
+        if clean.contains("4 مرات") || clean.contains("أربع مرات") || clean.contains("كل 4 ساعات") || clean.contains("كل 6 ساعات") {
+            return 4
+        }
+        if clean.contains("3 مرات") || clean.contains("ثلاث مرات") || clean.contains("كل 8 ساعات") {
+            return 3
+        }
+        if clean.contains("مرتان") || clean.contains("مرتين") || clean.contains("كل 12 ساعة") {
+            return 2
+        }
+        return 1
     }
 
     /// Owner used before any identity exists, and for Debug demo data shown to caregivers.

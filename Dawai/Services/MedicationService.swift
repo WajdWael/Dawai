@@ -1083,8 +1083,18 @@ public final class MedicationService: ObservableObject {
         return nil
     }
 
-    /// Returns sorted unique scheduled times of day in minutes from midnight (0..<1440) derived from `item`'s start time and `frequency`.
+    /// Returns sorted unique scheduled times of day in minutes from midnight (0..<1440) derived from `item`'s structured times or legacy frequency.
     public func dailyDoseTimesMinutes(for item: MedicationItem) -> [Int] {
+        // 1. As needed medications do not have daily dose scheduled times
+        if item.scheduleType == .asNeeded {
+            return []
+        }
+
+        // 2. If user specifically configured custom dose times, return them
+        if !item.customDoseTimesMinutes.isEmpty {
+            return item.customDoseTimesMinutes.sorted()
+        }
+
         let start = ((scheduledMinutes(for: item) % 1440) + 1440) % 1440
 
         if let hours = parsedHourlyInterval(from: item.frequency) {
@@ -1130,14 +1140,49 @@ public final class MedicationService: ObservableObject {
 
     /// UC-12 S#1: Identifies medications scheduled for the current day
     public func isScheduledForToday(_ item: MedicationItem, on date: Date = Date()) -> Bool {
+        // 1. As-needed medications have no recurring scheduled day
+        if item.scheduleType == .asNeeded {
+            return false
+        }
+
         let calendar = Calendar.current
+        let targetDay = calendar.startOfDay(for: date)
+
+        // 2. Check endDate (reminders stop after last day)
+        if let endDate = item.endDate {
+            let endDay = calendar.startOfDay(for: endDate)
+            if targetDay > endDay {
+                return false
+            }
+        }
+
+        // 3. Check startDate (cannot be scheduled before start date)
+        let anchorDay = calendar.startOfDay(for: effectiveScheduleStart(for: item))
+        if targetDay < anchorDay {
+            return false
+        }
+
+        // 4. Check schedule type: every other day
+        if item.scheduleType == .everyOtherDay {
+            let diff = calendar.dateComponents([.day], from: anchorDay, to: targetDay).day ?? 0
+            return diff >= 0 && diff % 2 == 0
+        }
+
+        // 5. Check schedule type: specific weekdays
+        if item.scheduleType == .specificWeekdays || !item.selectedWeekdays.isEmpty {
+            let weekdays: Set<Int> = item.selectedWeekdays.isEmpty
+                ? Set(scheduledWeekdays(for: item) ?? [])
+                : item.selectedWeekdays
+            let weekday = calendar.component(.weekday, from: date)
+            return weekdays.contains(weekday)
+        }
+
+        // 6. Legacy frequency intervals check
         if let weekdays = scheduledWeekdays(for: item) {
             let weekday = calendar.component(.weekday, from: date)
             return weekdays.contains(weekday)
         }
         if let interval = dayInterval(for: item.frequency) {
-            let anchorDay = calendar.startOfDay(for: effectiveScheduleStart(for: item))
-            let targetDay = calendar.startOfDay(for: date)
             let diff = calendar.dateComponents([.day], from: anchorDay, to: targetDay).day ?? 0
             return diff >= 0 && diff % interval == 0
         }
@@ -1146,6 +1191,7 @@ public final class MedicationService: ObservableObject {
             let targetDayNum = calendar.component(.day, from: date)
             return anchorDayNum == targetDayNum
         }
+
         return true
     }
 
@@ -1718,6 +1764,32 @@ public final class MedicationService: ObservableObject {
         return true
     }
 
+    // MARK: - As-Needed Dose Logging («عند الحاجة»)
+    public func logAsNeededDose(
+        for item: MedicationItem,
+        patient: UserIdentity,
+        at overrideNow: Date? = nil
+    ) {
+        let now = overrideNow ?? AppClock.shared.now
+        let calendar = Calendar.current
+        let comps = calendar.dateComponents([.hour, .minute], from: now)
+        let currentMinutes = (comps.hour ?? 0) * 60 + (comps.minute ?? 0)
+
+        adherenceService.recordDoseTaken(
+            medication: item,
+            patientId: patient.id,
+            takenAt: now,
+            scheduledDay: now,
+            slotMinutes: currentMinutes
+        )
+
+        showToast("تم تسجيل أخذ جرعة «\(item.name)» بنجاح.")
+        relationshipService.notifyCaregiversDoseTaken(
+            medicationName: item.name,
+            patientName: patient.displayName
+        )
+    }
+
     // MARK: - Notification Action Handling (Quick Actions & Notification Taps)
     public func handleNotificationAction(
         medicationId: UUID,
@@ -1851,6 +1923,11 @@ public final class MedicationService: ObservableObject {
 
     /// Computes all dose reminder notification triggers for `item` across its daily frequency slots and selected weekdays/intervals.
     public func plannedReminders(for item: MedicationItem, at date: Date? = nil) -> [PlannedNotification] {
+        // As-needed medications never receive scheduled notifications
+        if item.scheduleType == .asNeeded {
+            return []
+        }
+
         let now = date ?? AppClock.shared.now
         let calendar = Calendar.current
         let slots = dailyDoseTimesMinutes(for: item)
@@ -1861,38 +1938,17 @@ public final class MedicationService: ObservableObject {
         let anchorWeekday = calendar.component(.weekday, from: anchorDate)
         let anchorDayOfMonth = calendar.component(.day, from: anchorDate)
 
+        // Rolling window: if medication has an endDate, or is every other day, schedule concrete dates for next 7 days
+        let requiresConcreteWindow = (item.endDate != nil) || (item.scheduleType == .everyOtherDay) || (interval != nil && interval! > 1) || isMonthly
+
         var plans: [PlannedNotification] = []
         for slotMin in slots {
             let hour = slotMin / 60
             let minute = slotMin % 60
-            if let weekdays {
-                for weekday in weekdays {
-                    plans.append(
-                        PlannedNotification(
-                            identifier: "medication_reminder_\(item.id.uuidString)_s\(slotMin)_w\(weekday)",
-                            hour: hour,
-                            minute: minute,
-                            weekday: weekday,
-                            repeats: true,
-                            slotMinutes: slotMin
-                        )
-                    )
-                }
-            } else if interval == 7 {
-                plans.append(
-                    PlannedNotification(
-                        identifier: "medication_reminder_\(item.id.uuidString)_s\(slotMin)_w\(anchorWeekday)",
-                        hour: hour,
-                        minute: minute,
-                        weekday: anchorWeekday,
-                        repeats: true,
-                        slotMinutes: slotMin
-                    )
-                )
-            } else if let interval, interval > 1 {
-                // Multi-day interval (e.g. every 2 or 3 days): schedule concrete upcoming dates instead of daily repeating
+
+            if requiresConcreteWindow {
                 var queued = 0
-                for dayOffset in 0...30 where queued < 7 {
+                for dayOffset in 0...7 where queued < 7 {
                     guard let candidateDay = calendar.date(byAdding: .day, value: dayOffset, to: now),
                           isScheduledForToday(item, on: candidateDay) else {
                         continue
@@ -1914,13 +1970,26 @@ public final class MedicationService: ObservableObject {
                     )
                     queued += 1
                 }
-            } else if isMonthly {
+            } else if let weekdays {
+                for weekday in weekdays {
+                    plans.append(
+                        PlannedNotification(
+                            identifier: "medication_reminder_\(item.id.uuidString)_s\(slotMin)_w\(weekday)",
+                            hour: hour,
+                            minute: minute,
+                            weekday: weekday,
+                            repeats: true,
+                            slotMinutes: slotMin
+                        )
+                    )
+                }
+            } else if interval == 7 {
                 plans.append(
                     PlannedNotification(
-                        identifier: "medication_reminder_\(item.id.uuidString)_s\(slotMin)_m\(anchorDayOfMonth)",
+                        identifier: "medication_reminder_\(item.id.uuidString)_s\(slotMin)_w\(anchorWeekday)",
                         hour: hour,
                         minute: minute,
-                        day: anchorDayOfMonth,
+                        weekday: anchorWeekday,
                         repeats: true,
                         slotMinutes: slotMin
                     )
@@ -1946,6 +2015,11 @@ public final class MedicationService: ObservableObject {
         at date: Date? = nil,
         skippingToday: Bool? = nil
     ) -> [PlannedNotification] {
+        // As-needed medications never trigger missed dose alerts
+        if item.scheduleType == .asNeeded {
+            return []
+        }
+
         let now = date ?? AppClock.shared.now
         let calendar = Calendar.current
         let slots = dailyDoseTimesMinutes(for: item)
@@ -1955,6 +2029,9 @@ public final class MedicationService: ObservableObject {
         let anchorDate = effectiveScheduleStart(for: item)
         let anchorWeekday = calendar.component(.weekday, from: anchorDate)
         let anchorDayOfMonth = calendar.component(.day, from: anchorDate)
+
+        // Rolling window: if medication has an endDate, or is every other day, schedule concrete dates for next 7 days
+        let requiresConcreteWindow = (item.endDate != nil) || (item.scheduleType == .everyOtherDay) || (interval != nil && interval! > 1) || isMonthly
 
         var plans: [PlannedNotification] = []
         for slotMin in slots {
@@ -1969,7 +2046,35 @@ public final class MedicationService: ObservableObject {
             let slotTakenToday = skippingToday ?? isSlotTakenToday(item, slotMinutes: slotMin, on: now)
             let shouldSkipToday = slotTakenToday && isScheduledForToday(item, on: now) && now < todayAlertDate
 
-            if shouldSkipToday {
+            if requiresConcreteWindow {
+                var queuedCount = 0
+                for dayOffset in 0...7 where queuedCount < 7 {
+                    guard let candidateDay = calendar.date(byAdding: .day, value: dayOffset, to: now),
+                          isScheduledForToday(item, on: candidateDay) else {
+                        continue
+                    }
+                    if dayOffset == 0 && shouldSkipToday {
+                        continue
+                    }
+                    let nextAlertDate = scheduledDateTime(for: item, on: candidateDay, slotMinutes: slotMin)
+                        .addingTimeInterval(TimeInterval(DoseWindowConfig.lateThresholdMinutes * 60))
+                    guard nextAlertDate > now else { continue }
+                    let comps = calendar.dateComponents([.year, .month, .day, .hour, .minute], from: nextAlertDate)
+                    plans.append(
+                        PlannedNotification(
+                            identifier: "medication_missed_dose_\(item.id.uuidString)_s\(slotMin)_next_\(queuedCount)",
+                            hour: comps.hour ?? alertHour,
+                            minute: comps.minute ?? alertMinute,
+                            year: comps.year,
+                            month: comps.month,
+                            day: comps.day,
+                            repeats: false,
+                            slotMinutes: slotMin
+                        )
+                    )
+                    queuedCount += 1
+                }
+            } else if shouldSkipToday {
                 if let weekdays, weekdays.count > 1 {
                     let todayWeekday = calendar.component(.weekday, from: now)
                     for weekday in weekdays where weekday != todayWeekday {
@@ -2004,7 +2109,7 @@ public final class MedicationService: ObservableObject {
                     }
                 } else {
                     var queuedCount = 0
-                    let searchHorizon = isMonthly ? 95 : 28
+                    let searchHorizon = 7
                     for dayOffset in 1...searchHorizon where queuedCount < 3 {
                         guard let candidateDay = calendar.date(byAdding: .day, value: dayOffset, to: now),
                               isScheduledForToday(item, on: candidateDay) else {
@@ -2054,69 +2159,6 @@ public final class MedicationService: ObservableObject {
                         slotMinutes: slotMin
                     )
                 )
-            } else if let interval, interval > 1 {
-                var queuedCount = 0
-                for dayOffset in 0...30 where queuedCount < 7 {
-                    guard let candidateDay = calendar.date(byAdding: .day, value: dayOffset, to: now),
-                          isScheduledForToday(item, on: candidateDay) else {
-                        continue
-                    }
-                    let nextAlertDate = scheduledDateTime(for: item, on: candidateDay, slotMinutes: slotMin)
-                        .addingTimeInterval(TimeInterval(DoseWindowConfig.lateThresholdMinutes * 60))
-                    guard nextAlertDate > now else { continue }
-                    let comps = calendar.dateComponents([.year, .month, .day, .hour, .minute], from: nextAlertDate)
-                    plans.append(
-                        PlannedNotification(
-                            identifier: "medication_missed_dose_\(item.id.uuidString)_s\(slotMin)_next_\(queuedCount)",
-                            hour: comps.hour ?? alertHour,
-                            minute: comps.minute ?? alertMinute,
-                            year: comps.year,
-                            month: comps.month,
-                            day: comps.day,
-                            repeats: false,
-                            slotMinutes: slotMin
-                        )
-                    )
-                    queuedCount += 1
-                }
-            } else if isMonthly {
-                if !crossesMidnight {
-                    plans.append(
-                        PlannedNotification(
-                            identifier: "medication_missed_dose_\(item.id.uuidString)_s\(slotMin)_m\(anchorDayOfMonth)",
-                            hour: alertHour,
-                            minute: alertMinute,
-                            day: anchorDayOfMonth,
-                            repeats: true,
-                            slotMinutes: slotMin
-                        )
-                    )
-                } else {
-                    var queuedCount = 0
-                    for dayOffset in 0...95 where queuedCount < 3 {
-                        guard let candidateDay = calendar.date(byAdding: .day, value: dayOffset, to: now),
-                              isScheduledForToday(item, on: candidateDay) else {
-                            continue
-                        }
-                        let nextAlertDate = scheduledDateTime(for: item, on: candidateDay, slotMinutes: slotMin)
-                            .addingTimeInterval(TimeInterval(DoseWindowConfig.lateThresholdMinutes * 60))
-                        guard nextAlertDate > now else { continue }
-                        let comps = calendar.dateComponents([.year, .month, .day, .hour, .minute], from: nextAlertDate)
-                        plans.append(
-                            PlannedNotification(
-                                identifier: "medication_missed_dose_\(item.id.uuidString)_s\(slotMin)_next_\(queuedCount)",
-                                hour: comps.hour ?? alertHour,
-                                minute: comps.minute ?? alertMinute,
-                                year: comps.year,
-                                month: comps.month,
-                                day: comps.day,
-                                repeats: false,
-                                slotMinutes: slotMin
-                            )
-                        )
-                        queuedCount += 1
-                    }
-                }
             } else {
                 plans.append(
                     PlannedNotification(

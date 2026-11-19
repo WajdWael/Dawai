@@ -2,18 +2,14 @@
 //  MedicationFormView.swift
 //  Dawai
 //
-//  Use-Case 3 (UC-3) Add / Edit Medication Form
-//  Implements Mockup Screens 1, 2, 3, 4, 5:
-//  Screen 1: Main Medication Entry Form ("إضافة الدواء" / "تعديل الدواء")
-//  Screen 2: Dose Time Configuration ("اضف وقت الجرعة")
-//  Screen 3: Duration Selection ("المدة")
-//  Screen 4: Days Selection ("الايام")
-//  Screen 5: Frequency Selection ("التكرار خلال اليوم")
+//  Created by Dawai Team.
+//  Medication Add/Edit Form - Simplified native iOS design (all in one screen).
 //
 
 import SwiftUI
+import UIKit
 
-public enum MedicationFormMode {
+public enum MedicationFormMode: Equatable {
     case add
     case edit(MedicationItem)
 
@@ -30,14 +26,6 @@ public enum MedicationFormMode {
     }
 }
 
-public enum MedicationSubscreen {
-    case main
-    case doseTime
-    case duration
-    case days
-    case frequency
-}
-
 public struct MedicationFormView: View {
     public let mode: MedicationFormMode
     public let currentUser: UserIdentity
@@ -49,20 +37,25 @@ public struct MedicationFormView: View {
     @ObservedObject private var medicationService = MedicationService.shared
     @ObservedObject private var themeService = ThemeService.shared
 
-    // Navigation Subscreen State
-    @State private var currentSubscreen: MedicationSubscreen = .main
-
     // Form Inputs
     @State private var name: String = ""
-    @State private var dosage: String = ""
-    @State private var selectedTime: Date = Date()
-    @State private var hasConfiguredTime: Bool = false
-    @State private var selectedDays: [String] = ["كل يوم"]
-    @State private var selectedFrequency: String = "مرة يوميًا"
-    @State private var customFrequencyText: String = ""
-    @State private var selectedDuration: String = "دائم"
-    @State private var customDurationValue: String = ""
-    @State private var customDurationUnit: String = "شهر"
+    @State private var strength: String = ""
+    @State private var doseTimes: [Date] = [MedicationFormView.defaultInitialDoseTime()]
+    @State private var expandedDoseIndex: Int? = nil
+
+    // Frequency & Duration Sheets
+    @State private var showingFrequencySheet: Bool = false
+    @State private var showingDurationSheet: Bool = false
+
+    // Frequency state: .daily, .everyOtherDay, .specificWeekdays
+    @State private var frequencyType: MedicationScheduleType = .daily
+    @State private var selectedWeekdays: Set<Int> = []
+
+    // Duration state: continuous vs forDays(1...90)
+    @State private var isContinuousDuration: Bool = true
+    @State private var durationDaysCount: Int = 7
+
+    // Additional Fields
     @State private var instructions: String = ""
     @State private var imageData: Data? = nil
 
@@ -98,7 +91,6 @@ public struct MedicationFormView: View {
                     .ignoresSafeArea()
 
                 VStack(spacing: 0) {
-                    // Error Banner if validation fails (UC-3 Alternate Course)
                     if let err = errorMessage {
                         HStack(spacing: 8) {
                             Image(systemName: "exclamationmark.triangle.fill")
@@ -114,20 +106,29 @@ public struct MedicationFormView: View {
                         .transition(.move(edge: .top).combined(with: .opacity))
                     }
 
-                    // Content based on active subscreen
                     ScrollView {
                         VStack(spacing: 20) {
-                            switch currentSubscreen {
-                            case .main:
-                                mainFormContent
-                            case .doseTime:
-                                doseTimeContent
-                            case .duration:
-                                durationContent
-                            case .days:
-                                daysContent
-                            case .frequency:
-                                frequencyContent
+                            // أ) مجموعة: "اسم الدواء" و"القوة"
+                            nameAndStrengthSection
+
+                            // ب) قسم بعنوان "الأوقات": قائمة الجرعات + زر "+ إضافة وقت"
+                            timesSection
+
+                            // ج) مجموعة فيها صفّين: "التكرار" و"المدة"
+                            frequencyAndDurationSection
+
+                            // د) حقل "تعليمات"
+                            instructionsSection
+
+                            // هـ) صف "إضافة صورة الدواء"
+                            imageSection
+
+                            // و) صندوق ملخص بخلفية خضراء فاتحة ونص أخضر
+                            summaryBoxSection
+
+                            // حذف الدواء (في وضع التعديل)
+                            if mode.isEditing {
+                                deleteButtonSection
                             }
                         }
                         .padding(.horizontal, 16)
@@ -136,35 +137,21 @@ public struct MedicationFormView: View {
                     }
                 }
             }
-            .navigationTitle(currentHeaderTitle)
+            .navigationTitle(mode.title)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
-                    Button {
-                        handleDismissOrBack()
-                    } label: {
-                        if currentSubscreen == .main || currentSubscreen == .doseTime {
-                            Text("إلغاء")
-                                .dawaiFont(size: 17, weight: .regular)
-                        } else {
-                            HStack(spacing: 4) {
-                                Image(systemName: "chevron.right")
-                                    .dawaiFont(size: 14, weight: .semibold)
-                                Text("رجوع")
-                                    .dawaiFont(size: 17, weight: .regular)
-                            }
-                        }
+                    Button("إلغاء") {
+                        closeForm()
                     }
                     .foregroundStyle(Color.dawaiPrimary)
                 }
 
                 ToolbarItem(placement: .topBarTrailing) {
-                    Button {
-                        handleConfirmOrSave()
-                    } label: {
-                        Text(currentSubscreen == .main ? "حفظ" : "تم")
-                            .dawaiFont(size: 17, weight: .semibold)
+                    Button("حفظ") {
+                        saveMedication()
                     }
+                    .dawaiFont(size: 17, weight: .semibold)
                     .foregroundStyle(Color.dawaiPrimary)
                     .disabled(isSaving)
                 }
@@ -177,6 +164,12 @@ public struct MedicationFormView: View {
             .onAppear(perform: initializeFormValues)
             .fullScreenCover(isPresented: $showingCameraView) {
                 MedicationCameraView(capturedImageData: $imageData)
+            }
+            .sheet(isPresented: $showingFrequencySheet) {
+                frequencySheetView
+            }
+            .sheet(isPresented: $showingDurationSheet) {
+                durationSheetView
             }
             .alert("حذف الدواء", isPresented: $showingDeleteAlert) {
                 Button(
@@ -222,217 +215,175 @@ public struct MedicationFormView: View {
 
         if case .edit(let item) = mode {
             self.name = item.name
-            self.dosage = item.dosage
-            self.selectedTime = dateFromItem(item)
-            self.hasConfiguredTime = true
-            self.selectedDays = item.selectedWeekdays.isEmpty
-                ? (item.days.isEmpty ? ["كل يوم"] : item.days)
-                : MedicationWeekday.displayDays(from: item.selectedWeekdays)
-            
-            let standardFrequencies = ["مرة يوميًا", "كل 4 ساعات", "كل 6 ساعات", "كل 8 ساعات", "كل 12 ساعة"]
-            if standardFrequencies.contains(item.frequency) {
-                self.selectedFrequency = item.frequency
-            } else {
-                self.selectedFrequency = "تكرار مخصص"
-                self.customFrequencyText = item.frequency
-            }
-
-            self.selectedDuration = item.duration
+            self.strength = item.dosage
             self.instructions = item.instructions ?? ""
             self.imageData = item.imageData
-        }
-    }
 
-    private var currentHeaderTitle: String {
-        switch currentSubscreen {
-        case .main:
-            return mode.title
-        case .doseTime:
-            return "اضف وقت الجرعة"
-        case .duration:
-            return "المدة"
-        case .days:
-            return "الايام"
-        case .frequency:
-            return "التكرار خلال اليوم"
-        }
-    }
+            // Times
+            let minutesList = !item.customDoseTimesMinutes.isEmpty
+                ? item.customDoseTimesMinutes
+                : medicationService.dailyDoseTimesMinutes(for: item)
 
-    private func handleDismissOrBack() {
-        switch currentSubscreen {
-        case .main:
-            closeForm()
-        case .doseTime:
-            currentSubscreen = .main
-        case .duration, .days, .frequency:
-            currentSubscreen = .doseTime
-        }
-    }
-
-    private func handleConfirmOrSave() {
-        switch currentSubscreen {
-        case .main:
-            saveMedication()
-        case .doseTime:
-            hasConfiguredTime = true
-            currentSubscreen = .main
-        case .duration, .days, .frequency:
-            currentSubscreen = .doseTime
-        }
-    }
-
-    // MARK: - 2. Screen 1: Main Form Content (Native iOS Inset Grouped)
-    private var mainFormContent: some View {
-        VStack(spacing: 20) {
-            // Section 1: Medication Name & Dosage
-            VStack(spacing: 0) {
-                HStack {
-                    Text("اسم الدواء")
-                        .dawaiFont(size: 17, weight: .regular)
-                        .foregroundStyle(.primary)
-                        .frame(width: 90, alignment: .leading)
-
-                    TextField("مثال: ميتروفين", text: $name)
-                        .dawaiFont(size: 17)
-                }
-                .padding(.horizontal, 16)
-                .frame(minHeight: 48)
-
-                Divider().padding(.leading, 16)
-
-                HStack {
-                    Text("الجرعة")
-                        .dawaiFont(size: 17, weight: .regular)
-                        .foregroundStyle(.primary)
-                        .frame(width: 90, alignment: .leading)
-
-                    TextField("نصف حبة - حبتين، 10 مل", text: $dosage)
-                        .dawaiFont(size: 17)
-                }
-                .padding(.horizontal, 16)
-                .frame(minHeight: 48)
+            if !minutesList.isEmpty {
+                self.doseTimes = Array(minutesList.prefix(6)).map { dateFromMinutes($0) }
+            } else {
+                let firstMin = medicationService.scheduledMinutes(for: item)
+                self.doseTimes = [dateFromMinutes(firstMin)]
             }
-            .background(Color(uiColor: .secondarySystemGroupedBackground))
-            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
 
-            // Section 2: Dose Schedule (opens Dose Time subscreen)
+            // Frequency
+            if item.scheduleType == .everyOtherDay || item.frequency.contains("يوم بعد يوم") || item.days.contains("يوم بعد يوم") {
+                self.frequencyType = .everyOtherDay
+                self.selectedWeekdays = []
+            } else if !item.selectedWeekdays.isEmpty || item.scheduleType == .specificWeekdays {
+                self.frequencyType = .specificWeekdays
+                self.selectedWeekdays = item.selectedWeekdays
+            } else {
+                self.frequencyType = .daily
+                self.selectedWeekdays = []
+            }
+
+            // Duration
+            if item.duration.isEmpty || item.duration == "دائم" || item.duration == "مستمر" || item.endDate == nil {
+                self.isContinuousDuration = true
+                self.durationDaysCount = 7
+            } else {
+                self.isContinuousDuration = false
+                let days = parseDaysCount(from: item.duration) ?? 7
+                self.durationDaysCount = max(1, min(90, days))
+            }
+        }
+    }
+
+    // MARK: - 1. Name & Strength Section
+    private var nameAndStrengthSection: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text("اسم الدواء")
+                    .dawaiFont(size: 17, weight: .regular)
+                    .foregroundStyle(.primary)
+                    .frame(width: 90, alignment: .leading)
+
+                TextField("مثال: فيفادول", text: $name)
+                    .dawaiFont(size: 17)
+            }
+            .padding(.horizontal, 16)
+            .frame(minHeight: 48)
+
+            Divider().padding(.leading, 16)
+
+            HStack {
+                Text("القوة")
+                    .dawaiFont(size: 17, weight: .regular)
+                    .foregroundStyle(.primary)
+                    .frame(width: 90, alignment: .leading)
+
+                TextField("مثال: 500 ملغ، حبة واحدة", text: $strength)
+                    .dawaiFont(size: 17)
+            }
+            .padding(.horizontal, 16)
+            .frame(minHeight: 48)
+        }
+        .background(Color(uiColor: .secondarySystemGroupedBackground))
+        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+    }
+
+    // MARK: - 2. Times Section (Dose List + Add Time Button)
+    private var timesSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("الأوقات")
+                .dawaiFont(size: 14, weight: .regular)
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 16)
+
             VStack(spacing: 0) {
-                Button {
-                    withAnimation(.easeInOut(duration: 0.2)) {
-                        currentSubscreen = .doseTime
-                    }
-                } label: {
-                    HStack {
-                        Text("وقت الجرعة")
-                            .dawaiFont(size: 17, weight: .regular)
-                            .foregroundStyle(.primary)
+                ForEach(doseTimes.indices, id: \.self) { index in
+                    VStack(spacing: 0) {
+                        HStack(spacing: 12) {
+                            // Dose Title (الجرعة / الأولى / الثانية...)
+                            Text(doseTitle(for: index, count: doseTimes.count))
+                                .dawaiFont(size: 17, weight: .regular)
+                                .foregroundStyle(.primary)
 
-                        Spacer()
+                            Spacer()
 
-                        if hasConfiguredTime {
-                            VStack(alignment: .trailing, spacing: 2) {
-                                Text(formatDoseTime(selectedTime))
+                            // Time capsule button (opens/closes inline wheel)
+                            Button {
+                                withAnimation(.easeInOut(duration: 0.25)) {
+                                    if expandedDoseIndex == index {
+                                        expandedDoseIndex = nil
+                                    } else {
+                                        expandedDoseIndex = index
+                                    }
+                                }
+                            } label: {
+                                Text(formatDoseTime(doseTimes[index]))
                                     .dawaiFont(size: 17, weight: .semibold)
                                     .foregroundStyle(Color.dawaiPrimary)
-
-                                Text("\(selectedFrequencySummary) • \(selectedDays.joined(separator: "، "))")
-                                    .dawaiFont(size: 12)
-                                    .foregroundStyle(.secondary)
-                            }
-                        } else {
-                            Text("اضف وقت الجرعة")
-                                .dawaiFont(size: 17, weight: .regular)
-                                .foregroundStyle(.secondary)
-                        }
-
-                        Image(systemName: "chevron.left")
-                            .dawaiFont(size: 14, weight: .semibold)
-                            .foregroundStyle(Color(uiColor: .tertiaryLabel))
-                    }
-                    .padding(.horizontal, 16)
-                    .frame(minHeight: 48)
-                }
-                .buttonStyle(.plain)
-            }
-            .background(Color(uiColor: .secondarySystemGroupedBackground))
-            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-
-            // Section 3: Additional Instructions
-            VStack(spacing: 0) {
-                HStack {
-                    Text("تعليمات")
-                        .dawaiFont(size: 17, weight: .regular)
-                        .foregroundStyle(.primary)
-                        .frame(width: 90, alignment: .leading)
-
-                    TextField("مثال: بعد الإفطار", text: $instructions)
-                        .dawaiFont(size: 17)
-                }
-                .padding(.horizontal, 16)
-                .frame(minHeight: 48)
-            }
-            .background(Color(uiColor: .secondarySystemGroupedBackground))
-            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-
-            // Section 4: Medication Image
-            VStack(spacing: 0) {
-                if let data = imageData, let uiImage = UIImage(data: data) {
-                    VStack(spacing: 0) {
-                        ZStack(alignment: .topTrailing) {
-                            Image(uiImage: uiImage)
-                                .resizable()
-                                .scaledToFill()
-                                .frame(maxWidth: .infinity)
-                                .frame(height: 160)
-                                .clipped()
-
-                            Button {
-                                withAnimation { self.imageData = nil }
-                            } label: {
-                                Image(systemName: "xmark.circle.fill")
-                                    .dawaiFont(size: 24)
-                                    .foregroundStyle(.white, Color.black.opacity(0.65))
-                                    .padding(10)
+                                    .padding(.horizontal, 14)
+                                    .padding(.vertical, 7)
+                                    .background(
+                                        Color(uiColor: .tertiarySystemFill),
+                                        in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                    )
                             }
                             .buttonStyle(.plain)
-                        }
 
-                        Divider()
-
-                        Button {
-                            showingCameraView = true
-                        } label: {
-                            HStack(spacing: 8) {
-                                Image(systemName: "camera.rotate")
-                                    .dawaiFont(size: 15, weight: .semibold)
-                                Text("تغيير صورة الدواء")
-                                    .dawaiFont(size: 15, weight: .semibold)
-                                Spacer()
-                                Image(systemName: "chevron.left")
-                                    .dawaiFont(size: 14, weight: .semibold)
-                                    .foregroundStyle(Color(uiColor: .tertiaryLabel))
+                            // Delete button (X) when more than 1 dose time
+                            if doseTimes.count > 1 {
+                                Button {
+                                    withAnimation(.easeInOut(duration: 0.2)) {
+                                        deleteTime(at: index)
+                                    }
+                                } label: {
+                                    Image(systemName: "xmark")
+                                        .dawaiFont(size: 14, weight: .bold)
+                                        .foregroundStyle(Color.red)
+                                        .frame(width: 24, height: 24)
+                                }
+                                .buttonStyle(.plain)
                             }
-                            .foregroundStyle(Color.dawaiPrimary)
-                            .padding(.horizontal, 16)
-                            .frame(minHeight: 44)
                         }
-                        .buttonStyle(.plain)
+                        .padding(.horizontal, 16)
+                        .frame(minHeight: 48)
+
+                        // Inline DatePicker Wheel when capsule is tapped
+                        if expandedDoseIndex == index {
+                            Divider().padding(.horizontal, 16)
+
+                            DatePicker(
+                                "",
+                                selection: $doseTimes[index],
+                                displayedComponents: .hourAndMinute
+                            )
+                            .datePickerStyle(.wheel)
+                            .labelsHidden()
+                            .environment(\.layoutDirection, .leftToRight)
+                            .environment(\.locale, Locale.dawaiArabic)
+                            .frame(height: 180)
+                            .frame(maxWidth: .infinity)
+                            .transition(.opacity.combined(with: .move(edge: .top)))
+                        }
                     }
-                } else {
+
+                    if index < doseTimes.count - 1 || doseTimes.count < 6 {
+                        Divider().padding(.leading, 16)
+                    }
+                }
+
+                // Add Time Button: up to 6 times
+                if doseTimes.count < 6 {
                     Button {
-                        showingCameraView = true
+                        withAnimation(.easeInOut(duration: 0.25)) {
+                            addNewTime()
+                        }
                     } label: {
                         HStack {
-                            Image(systemName: "camera")
-                                .dawaiFont(size: 18)
-                                .foregroundStyle(Color.dawaiPrimary)
-                            Text("إضافة صورة الدواء")
-                                .dawaiFont(size: 17, weight: .regular)
+                            Spacer()
+                            Text("+ إضافة وقت")
+                                .dawaiFont(size: 17, weight: .semibold)
                                 .foregroundStyle(Color.dawaiPrimary)
                             Spacer()
-                            Image(systemName: "chevron.left")
-                                .dawaiFont(size: 14, weight: .semibold)
-                                .foregroundStyle(Color(uiColor: .tertiaryLabel))
                         }
                         .padding(.horizontal, 16)
                         .frame(minHeight: 48)
@@ -442,454 +393,579 @@ public struct MedicationFormView: View {
             }
             .background(Color(uiColor: .secondarySystemGroupedBackground))
             .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-
-            // Section 5: Delete Medication (in Edit Mode, like Delete Alarm in Apple Clock)
-            if mode.isEditing {
-                Button {
-                    showingDeleteAlert = true
-                } label: {
-                    HStack {
-                        Spacer()
-                        Text("حذف الدواء")
-                            .dawaiFont(size: 17, weight: .regular)
-                            .foregroundStyle(Color.red)
-                        Spacer()
-                    }
-                    .frame(minHeight: 48)
-                }
-                .buttonStyle(.plain)
-                .background(Color(uiColor: .secondarySystemGroupedBackground))
-                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-            }
         }
     }
 
-    // MARK: - 3. Screen 2: Dose Time Content ("اضف وقت الجرعة" - Pure Apple Clock Alarm Style)
-    private var doseTimeContent: some View {
-        VStack(spacing: 24) {
-            // Apple Clock Bare Wheel Time Picker (Completely native, with explicit LTR wheel geometry so digits & am/pm scroll smoothly in Arabic RTL)
-            DatePicker("", selection: $selectedTime, displayedComponents: .hourAndMinute)
-                .datePickerStyle(.wheel)
-                .labelsHidden()
-                .environment(\.layoutDirection, .leftToRight)
-                .frame(height: 216)
-                .frame(maxWidth: .infinity)
-
-            // Apple Clock Inset Grouped Section (Rows underneath)
-            VStack(spacing: 0) {
-                // Row 1: الايام
-                Button {
-                    withAnimation(.easeInOut(duration: 0.2)) {
-                        currentSubscreen = .days
-                    }
-                } label: {
-                    HStack {
-                        Text("الايام")
-                            .dawaiFont(size: 17, weight: .regular)
-                            .foregroundStyle(.primary)
-
-                        Spacer()
-
-                        Text(selectedDays.joined(separator: "، "))
-                            .dawaiFont(size: 17, weight: .regular)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-
-                        Image(systemName: "chevron.left")
-                            .dawaiFont(size: 14, weight: .semibold)
-                            .foregroundStyle(Color(uiColor: .tertiaryLabel))
-                    }
-                    .padding(.horizontal, 16)
-                    .frame(minHeight: 48)
-                }
-                .buttonStyle(.plain)
-
-                Divider()
-                    .padding(.leading, 16)
-
-                // Row 2: التكرار خلال اليوم
-                Button {
-                    withAnimation(.easeInOut(duration: 0.2)) {
-                        currentSubscreen = .frequency
-                    }
-                } label: {
-                    HStack {
-                        Text("التكرار خلال اليوم")
-                            .dawaiFont(size: 17, weight: .regular)
-                            .foregroundStyle(.primary)
-
-                        Spacer()
-
-                        Text(selectedFrequencySummary)
-                            .dawaiFont(size: 17, weight: .regular)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-
-                        Image(systemName: "chevron.left")
-                            .dawaiFont(size: 14, weight: .semibold)
-                            .foregroundStyle(Color(uiColor: .tertiaryLabel))
-                    }
-                    .padding(.horizontal, 16)
-                    .frame(minHeight: 48)
-                }
-                .buttonStyle(.plain)
-
-                Divider()
-                    .padding(.leading, 16)
-
-                // Row 3: المدة
-                Button {
-                    withAnimation(.easeInOut(duration: 0.2)) {
-                        currentSubscreen = .duration
-                    }
-                } label: {
-                    HStack {
-                        Text("المدة")
-                            .dawaiFont(size: 17, weight: .regular)
-                            .foregroundStyle(.primary)
-
-                        Spacer()
-
-                        Text(selectedDurationSummary)
-                            .dawaiFont(size: 17, weight: .regular)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-
-                        Image(systemName: "chevron.left")
-                            .dawaiFont(size: 14, weight: .semibold)
-                            .foregroundStyle(Color(uiColor: .tertiaryLabel))
-                    }
-                    .padding(.horizontal, 16)
-                    .frame(minHeight: 48)
-                }
-                .buttonStyle(.plain)
-            }
-            .background(Color(uiColor: .secondarySystemGroupedBackground))
-            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+    private func doseTitle(for index: Int, count: Int) -> String {
+        if count == 1 {
+            return "الجرعة"
+        }
+        switch index {
+        case 0: return "الجرعة الأولى"
+        case 1: return "الجرعة الثانية"
+        case 2: return "الجرعة الثالثة"
+        case 3: return "الجرعة الرابعة"
+        case 4: return "الجرعة الخامسة"
+        case 5: return "الجرعة السادسة"
+        default: return "الجرعة \(index + 1)"
         }
     }
 
-    // MARK: - 4. Screen 3: Duration Content ("المدة")
-    private let durationOptions = [
-        "3 ايام",
-        "اسبوع",
-        "3 اسابيع",
-        "4 اسابيع",
-        "دائم"
-    ]
+    private func addNewTime() {
+        guard doseTimes.count < 6 else { return }
+        let lastTime = doseTimes.last ?? MedicationFormView.defaultInitialDoseTime()
+        // Add 6 hours
+        let newTime = Calendar.current.date(byAdding: .hour, value: 6, to: lastTime) ?? lastTime
+        doseTimes.append(newTime)
+        expandedDoseIndex = doseTimes.count - 1
+    }
 
-    private var durationContent: some View {
-        VStack(spacing: 16) {
-            VStack(spacing: 0) {
-                ForEach(durationOptions.indices, id: \.self) { index in
-                    let option = durationOptions[index]
-                    selectionOptionRow(
-                        title: option,
-                        isSelected: selectedDuration == option
-                    ) {
-                        selectedDuration = option
-                    }
-
-                    if index < durationOptions.count - 1 {
-                        Divider().padding(.leading, 16)
-                    }
-                }
-            }
-            .background(Color(uiColor: .secondarySystemGroupedBackground))
-            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-
-            // Custom "أخرى (مدة مخصصة)"
-            VStack(spacing: 0) {
-                selectionOptionRow(
-                    title: "أخرى (مدة مخصصة)",
-                    isSelected: selectedDuration == "اخرى"
-                ) {
-                    selectedDuration = "اخرى"
-                }
-
-                if selectedDuration == "اخرى" {
-                    Divider().padding(.leading, 16)
-
-                    HStack(spacing: 12) {
-                        Text("المدة")
-                            .dawaiFont(size: 17, weight: .regular)
-                            .foregroundStyle(.secondary)
-
-                        TextField("مثال: 10", text: $customDurationValue)
-                            .keyboardType(.numberPad)
-                            .dawaiFont(size: 17)
-
-                        Spacer()
-
-                        Picker("الوحدة", selection: $customDurationUnit) {
-                            Text("يوم").tag("يوم")
-                            Text("أسبوع").tag("اسبوع")
-                            Text("شهر").tag("شهر")
-                        }
-                        .pickerStyle(.menu)
-                    }
-                    .padding(.horizontal, 16)
-                    .frame(minHeight: 48)
-                }
-            }
-            .background(Color(uiColor: .secondarySystemGroupedBackground))
-            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+    private func deleteTime(at index: Int) {
+        guard doseTimes.count > 1, index < doseTimes.count else { return }
+        doseTimes.remove(at: index)
+        if expandedDoseIndex == index {
+            expandedDoseIndex = nil
+        } else if let expanded = expandedDoseIndex, expanded > index {
+            expandedDoseIndex = expanded - 1
         }
     }
 
-    private var selectedDurationSummary: String {
-        if selectedDuration == "اخرى" {
-            let val = customDurationValue.isEmpty ? "1" : customDurationValue
-            return "\(val) \(customDurationUnit)"
-        }
-        return selectedDuration
-    }
-
-    // MARK: - 5. Screen 4: Days Content ("الايام")
-    private let dayOptions = [
-        "كل يوم",
-        "كل الاحد",
-        "كل الاثنين",
-        "كل الثلاثاء",
-        "كل الاربعاء",
-        "كل الخميس",
-        "كل الجمعه",
-        "كل السبت"
-    ]
-
-    private var daysContent: some View {
+    // MARK: - 3. Frequency & Duration Section
+    private var frequencyAndDurationSection: some View {
         VStack(spacing: 0) {
-            ForEach(dayOptions.indices, id: \.self) { index in
-                let day = dayOptions[index]
-                selectionOptionRow(
-                    title: day,
-                    isSelected: selectedDays.contains(day)
-                ) {
-                    toggleDay(day)
-                }
+            // Row: التكرار
+            Button {
+                showingFrequencySheet = true
+            } label: {
+                HStack {
+                    Text("التكرار")
+                        .dawaiFont(size: 17, weight: .regular)
+                        .foregroundStyle(.primary)
 
-                if index < dayOptions.count - 1 {
-                    Divider().padding(.leading, 16)
+                    Spacer()
+
+                    HStack(spacing: 4) {
+                        Image(systemName: "chevron.down")
+                            .dawaiFont(size: 13, weight: .semibold)
+                            .foregroundStyle(Color(uiColor: .tertiaryLabel))
+
+                        Text(frequencyRowSummary)
+                            .dawaiFont(size: 17, weight: .regular)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
                 }
+                .padding(.horizontal, 16)
+                .frame(minHeight: 48)
+            }
+            .buttonStyle(.plain)
+
+            Divider().padding(.leading, 16)
+
+            // Row: المدة
+            Button {
+                showingDurationSheet = true
+            } label: {
+                HStack {
+                    Text("المدة")
+                        .dawaiFont(size: 17, weight: .regular)
+                        .foregroundStyle(.primary)
+
+                    Spacer()
+
+                    HStack(spacing: 4) {
+                        Image(systemName: "chevron.down")
+                            .dawaiFont(size: 13, weight: .semibold)
+                            .foregroundStyle(Color(uiColor: .tertiaryLabel))
+
+                        Text(durationRowSummary)
+                            .dawaiFont(size: 17, weight: .regular)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                }
+                .padding(.horizontal, 16)
+                .frame(minHeight: 48)
+            }
+            .buttonStyle(.plain)
+        }
+        .background(Color(uiColor: .secondarySystemGroupedBackground))
+        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+    }
+
+    // MARK: - 4. Instructions Section
+    private var instructionsSection: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text("تعليمات")
+                    .dawaiFont(size: 17, weight: .regular)
+                    .foregroundStyle(.primary)
+                    .frame(width: 90, alignment: .leading)
+
+                TextField("مثال: بعد الأكل، مع كوب ماء", text: $instructions)
+                    .dawaiFont(size: 17)
+            }
+            .padding(.horizontal, 16)
+            .frame(minHeight: 48)
+        }
+        .background(Color(uiColor: .secondarySystemGroupedBackground))
+        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+    }
+
+    // MARK: - 5. Image Section
+    private var imageSection: some View {
+        VStack(spacing: 0) {
+            if let data = imageData, let uiImage = UIImage(data: data) {
+                VStack(spacing: 0) {
+                    ZStack(alignment: .topTrailing) {
+                        Image(uiImage: uiImage)
+                            .resizable()
+                            .scaledToFill()
+                            .frame(maxWidth: .infinity)
+                            .frame(height: 160)
+                            .clipped()
+
+                        Button {
+                            withAnimation { self.imageData = nil }
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .dawaiFont(size: 24)
+                                .foregroundStyle(.white, Color.black.opacity(0.65))
+                                .padding(10)
+                        }
+                        .buttonStyle(.plain)
+                    }
+
+                    Divider()
+
+                    Button {
+                        showingCameraView = true
+                    } label: {
+                        HStack(spacing: 8) {
+                            Image(systemName: "camera.rotate")
+                                .dawaiFont(size: 15, weight: .semibold)
+                            Text("تغيير صورة الدواء")
+                                .dawaiFont(size: 15, weight: .semibold)
+                            Spacer()
+                            Image(systemName: "chevron.left")
+                                .dawaiFont(size: 14, weight: .semibold)
+                                .foregroundStyle(Color(uiColor: .tertiaryLabel))
+                        }
+                        .foregroundStyle(Color.dawaiPrimary)
+                        .padding(.horizontal, 16)
+                        .frame(minHeight: 44)
+                    }
+                    .buttonStyle(.plain)
+                }
+            } else {
+                Button {
+                    showingCameraView = true
+                } label: {
+                    HStack(spacing: 8) {
+                        Spacer()
+
+                        Image(systemName: "camera")
+                            .dawaiFont(size: 18)
+
+                        Text("إضافة صورة الدواء")
+                            .dawaiFont(size: 17, weight: .regular)
+
+                        Spacer()
+                    }
+                    .foregroundStyle(Color.dawaiPrimary)
+                    .padding(.horizontal, 16)
+                    .frame(minHeight: 48)
+                }
+                .buttonStyle(.plain)
             }
         }
         .background(Color(uiColor: .secondarySystemGroupedBackground))
         .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
     }
 
-    private func toggleDay(_ day: String) {
-        if day == "كل يوم" {
-            selectedDays = ["كل يوم"]
-        } else {
-            selectedDays.removeAll { $0 == "كل يوم" }
-            if selectedDays.contains(day) {
-                selectedDays.removeAll { $0 == day }
-                if selectedDays.isEmpty {
-                    selectedDays = ["كل يوم"]
-                }
-            } else {
-                selectedDays.append(day)
-            }
+    // MARK: - 6. Summary Box Section
+    private var summaryBoxSection: some View {
+        HStack {
+            Spacer()
+            Text(summaryText)
+                .dawaiFont(size: 16, weight: .semibold)
+                .foregroundStyle(Color(red: 0.08, green: 0.65, blue: 0.62))
+                .multilineTextAlignment(.center)
+            Spacer()
+        }
+        .padding(.vertical, 14)
+        .padding(.horizontal, 16)
+        .background(
+            Color(red: 0.08, green: 0.65, blue: 0.62).opacity(0.12),
+            in: RoundedRectangle(cornerRadius: 12, style: .continuous)
+        )
+    }
+
+    private var summaryText: String {
+        let medName = name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "الدواء" : name
+        let countText = timesCountArabic(doseTimes.count)
+        let formattedTimes = doseTimes.map { formatDoseTime($0) }.joined(separator: "، ")
+        let freqText = frequencyRowSummary
+        let durText = durationRowSummary
+        return "\(medName): \(countText) (\(formattedTimes))، \(freqText)، \(durText)."
+    }
+
+    private func timesCountArabic(_ count: Int) -> String {
+        switch count {
+        case 1: return "مرة يومياً"
+        case 2: return "مرتين يومياً"
+        case 3: return "3 مرات يومياً"
+        case 4: return "4 مرات يومياً"
+        case 5: return "5 مرات يومياً"
+        case 6: return "6 مرات يومياً"
+        default: return "\(count) مرات يومياً"
         }
     }
 
-    // MARK: - 6. Screen 5: Frequency Content ("التكرار خلال اليوم")
-    private let standardFrequencyOptions = [
-        "مرة يوميًا",
-        "كل 4 ساعات",
-        "كل 6 ساعات",
-        "كل 8 ساعات",
-        "كل 12 ساعة"
-    ]
-
-    private var isCustomFrequencySelected: Bool {
-        selectedFrequency == "تكرار مخصص"
-    }
-
-    private var frequencyContent: some View {
-        VStack(spacing: 16) {
-            VStack(spacing: 0) {
-                ForEach(standardFrequencyOptions.indices, id: \.self) { index in
-                    let freq = standardFrequencyOptions[index]
-                    selectionOptionRow(
-                        title: freq,
-                        isSelected: selectedFrequency == freq
-                    ) {
-                        selectedFrequency = freq
-                    }
-
-                    if index < standardFrequencyOptions.count - 1 {
-                        Divider().padding(.leading, 16)
-                    }
-                }
-            }
-            .background(Color(uiColor: .secondarySystemGroupedBackground))
-            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-
-            // The last option: iOS Dropdown Menu for custom frequency
-            VStack(spacing: 0) {
-                HStack {
-                    Text("تكرار مخصص")
-                        .dawaiFont(size: 17, weight: .regular)
-                        .foregroundStyle(.primary)
-
-                    Spacer()
-
-                    // Native iOS Dropdown Menu
-                    Menu {
-                        Section("التكرار اليومي") {
-                            Button { selectCustomFrequencyPreset("مرتان يومياً") } label: {
-                                HStack { Text("مرتان يومياً"); if customFrequencyText == "مرتان يومياً" { Image(systemName: "checkmark") } }
-                            }
-                            Button { selectCustomFrequencyPreset("3 مرات يومياً") } label: {
-                                HStack { Text("3 مرات يومياً"); if customFrequencyText == "3 مرات يومياً" { Image(systemName: "checkmark") } }
-                            }
-                            Button { selectCustomFrequencyPreset("4 مرات يومياً") } label: {
-                                HStack { Text("4 مرات يومياً"); if customFrequencyText == "4 مرات يومياً" { Image(systemName: "checkmark") } }
-                            }
-                        }
-
-                        Section("أيام محددة وفترات") {
-                            Button { selectCustomFrequencyPreset("كل يومين") } label: {
-                                HStack { Text("كل يومين"); if customFrequencyText == "كل يومين" { Image(systemName: "checkmark") } }
-                            }
-                            Button { selectCustomFrequencyPreset("كل 3 أيام") } label: {
-                                HStack { Text("كل 3 أيام"); if customFrequencyText == "كل 3 أيام" { Image(systemName: "checkmark") } }
-                            }
-                            Button { selectCustomFrequencyPreset("أسبوعياً") } label: {
-                                HStack { Text("أسبوعياً"); if customFrequencyText == "أسبوعياً" { Image(systemName: "checkmark") } }
-                            }
-                            Button { selectCustomFrequencyPreset("شهرياً") } label: {
-                                HStack { Text("شهرياً"); if customFrequencyText == "شهرياً" { Image(systemName: "checkmark") } }
-                            }
-                        }
-                    } label: {
-                        HStack(spacing: 4) {
-                            Text(customFrequencyMenuTitle)
-                                .dawaiFont(size: 16)
-                                .foregroundStyle(.secondary)
-                            Image(systemName: "chevron.up.chevron.down")
-                                .dawaiFont(size: 12)
-                                .foregroundStyle(Color(uiColor: .tertiaryLabel))
-                        }
-                    }
-
-                    if isCustomFrequencySelected {
-                        Image(systemName: "checkmark")
-                            .dawaiFont(size: 15, weight: .semibold)
-                            .foregroundStyle(Color.dawaiPrimary)
-                    }
-                }
-                .padding(.horizontal, 16)
-                .frame(minHeight: 48)
-                .contentShape(Rectangle())
-                .onTapGesture {
-                    withAnimation(.easeInOut(duration: 0.2)) {
-                        selectedFrequency = "تكرار مخصص"
-                    }
-                }
-
-                // Custom Data Entry Field (when selected)
-                if isCustomFrequencySelected {
-                    Divider().padding(.leading, 16)
-
-                    HStack {
-                        TextField("مثال: 3 مرات يومياً، بعد الأكل", text: $customFrequencyText)
-                            .dawaiFont(size: 17)
-
-                        if !customFrequencyText.isEmpty {
-                            Button {
-                                customFrequencyText = ""
-                            } label: {
-                                Image(systemName: "xmark.circle.fill")
-                                    .dawaiFont(size: 16)
-                                    .foregroundStyle(Color(uiColor: .tertiaryLabel))
-                            }
-                            .buttonStyle(.plain)
-                        }
-                    }
-                    .padding(.horizontal, 16)
-                    .frame(minHeight: 48)
-                }
-            }
-            .background(Color(uiColor: .secondarySystemGroupedBackground))
-            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-        }
-    }
-
-    private func selectCustomFrequencyPreset(_ preset: String) {
-        withAnimation(.easeInOut(duration: 0.2)) {
-            self.selectedFrequency = "تكرار مخصص"
-            self.customFrequencyText = preset
-        }
-    }
-
-    private var customFrequencyMenuTitle: String {
-        let trimmed = customFrequencyText.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !trimmed.isEmpty {
-            return trimmed
-        }
-        return isCustomFrequencySelected ? "اختر التكرار" : "خيارات التكرار"
-    }
-
-    private var selectedFrequencySummary: String {
-        if selectedFrequency == "تكرار مخصص" {
-            let trimmed = customFrequencyText.trimmingCharacters(in: .whitespacesAndNewlines)
-            return trimmed.isEmpty ? "تكرار مخصص" : trimmed
-        }
-        return selectedFrequency
-    }
-
-    private func selectionOptionRow(title: String, isSelected: Bool, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
+    // MARK: - 7. Delete Button Section
+    private var deleteButtonSection: some View {
+        Button {
+            showingDeleteAlert = true
+        } label: {
             HStack {
-                Text(title)
-                    .dawaiFont(size: 17, weight: .regular)
-                    .foregroundStyle(.primary)
-
                 Spacer()
-
-                if isSelected {
-                    Image(systemName: "checkmark")
-                        .dawaiFont(size: 15, weight: .semibold)
-                        .foregroundStyle(Color.dawaiPrimary)
-                }
+                Text("حذف الدواء")
+                    .dawaiFont(size: 17, weight: .regular)
+                    .foregroundStyle(Color.red)
+                Spacer()
             }
-            .padding(.horizontal, 16)
             .frame(minHeight: 48)
         }
         .buttonStyle(.plain)
+        .background(Color(uiColor: .secondarySystemGroupedBackground))
+        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
     }
 
-    // MARK: - Form Submission & Validation (UC-3 S#4 & Alternate Courses)
+    // MARK: - Frequency Sheet («أي أيام تاخذه؟»)
+    private let weekdayItems: [(id: Int, title: String)] = [
+        (1, "الأحد"),
+        (2, "الاثنين"),
+        (3, "الثلاثاء"),
+        (4, "الأربعاء"),
+        (5, "الخميس"),
+        (6, "الجمعة"),
+        (7, "السبت")
+    ]
+
+    private var frequencySheetView: some View {
+        NavigationStack {
+            List {
+                Section {
+                    // Option 1: كل يوم
+                    Button {
+                        frequencyType = .daily
+                        selectedWeekdays.removeAll()
+                    } label: {
+                        HStack {
+                            Text("كل يوم")
+                                .dawaiFont(size: 17)
+                                .foregroundStyle(.primary)
+
+                            Spacer()
+
+                            if frequencyType == .daily {
+                                Image(systemName: "checkmark")
+                                    .dawaiFont(size: 15, weight: .semibold)
+                                    .foregroundStyle(Color.dawaiPrimary)
+                            }
+                        }
+                    }
+
+                    // Option 2: يوم بعد يوم
+                    Button {
+                        frequencyType = .everyOtherDay
+                        selectedWeekdays.removeAll()
+                    } label: {
+                        HStack {
+                            Text("يوم بعد يوم")
+                                .dawaiFont(size: 17)
+                                .foregroundStyle(.primary)
+
+                            Spacer()
+
+                            if frequencyType == .everyOtherDay {
+                                Image(systemName: "checkmark")
+                                    .dawaiFont(size: 15, weight: .semibold)
+                                    .foregroundStyle(Color.dawaiPrimary)
+                            }
+                        }
+                    }
+
+                    // Option 3: أيام محددة
+                    Button {
+                        frequencyType = .specificWeekdays
+                    } label: {
+                        HStack {
+                            Text("أيام محددة")
+                                .dawaiFont(size: 17)
+                                .foregroundStyle(.primary)
+
+                            Spacer()
+
+                            if frequencyType == .specificWeekdays {
+                                Image(systemName: "checkmark")
+                                    .dawaiFont(size: 15, weight: .semibold)
+                                    .foregroundStyle(Color.dawaiPrimary)
+                            }
+                        }
+                    }
+                }
+
+                // If "أيام محددة" selected, show the weekdays list
+                if frequencyType == .specificWeekdays {
+                    Section {
+                        ForEach(weekdayItems, id: \.id) { item in
+                            Button {
+                                toggleWeekday(item.id)
+                            } label: {
+                                HStack {
+                                    Text(item.title)
+                                        .dawaiFont(size: 17)
+                                        .foregroundStyle(.primary)
+
+                                    Spacer()
+
+                                    if selectedWeekdays.contains(item.id) {
+                                        Image(systemName: "checkmark")
+                                            .dawaiFont(size: 15, weight: .semibold)
+                                            .foregroundStyle(Color.dawaiPrimary)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            .navigationTitle("أي أيام تاخذه؟")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button("تم") {
+                        if frequencyType == .specificWeekdays && selectedWeekdays.isEmpty {
+                            errorMessage = "اختر يوم واحد على الأقل"
+                        }
+                        showingFrequencySheet = false
+                    }
+                    .dawaiFont(size: 17, weight: .semibold)
+                    .foregroundStyle(Color.dawaiPrimary)
+                }
+            }
+            .environment(\.layoutDirection, .rightToLeft)
+            .environment(\.locale, Locale.dawaiArabic)
+        }
+        .presentationDetents([.medium, .large])
+    }
+
+    private func toggleWeekday(_ id: Int) {
+        if selectedWeekdays.contains(id) {
+            selectedWeekdays.remove(id)
+        } else {
+            selectedWeekdays.insert(id)
+        }
+    }
+
+    private var frequencyRowSummary: String {
+        switch frequencyType {
+        case .daily:
+            return "كل يوم"
+        case .everyOtherDay:
+            return "يوم بعد يوم"
+        case .specificWeekdays:
+            let names = weekdayItems
+                .filter { selectedWeekdays.contains($0.id) }
+                .map { $0.title }
+            return names.isEmpty ? "اختر الأيام" : names.joined(separator: "، ")
+        case .asNeeded:
+            return "كل يوم"
+        }
+    }
+
+    // MARK: - Duration Sheet («إلى متى تاخذه؟»)
+    private var durationSheetView: some View {
+        NavigationStack {
+            List {
+                Section {
+                    // Option 1: مستمر
+                    Button {
+                        isContinuousDuration = true
+                    } label: {
+                        HStack {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("مستمر")
+                                    .dawaiFont(size: 17)
+                                    .foregroundStyle(.primary)
+
+                                Text("بدون تاريخ نهاية")
+                                    .dawaiFont(size: 13)
+                                    .foregroundStyle(.secondary)
+                            }
+
+                            Spacer()
+
+                            if isContinuousDuration {
+                                Image(systemName: "checkmark")
+                                    .dawaiFont(size: 15, weight: .semibold)
+                                    .foregroundStyle(Color.dawaiPrimary)
+                            }
+                        }
+                    }
+
+                    // Option 2: لعدد أيام
+                    Button {
+                        isContinuousDuration = false
+                    } label: {
+                        HStack {
+                            Text("لعدد أيام")
+                                .dawaiFont(size: 17)
+                                .foregroundStyle(.primary)
+
+                            Spacer()
+
+                            if !isContinuousDuration {
+                                Image(systemName: "checkmark")
+                                    .dawaiFont(size: 15, weight: .semibold)
+                                    .foregroundStyle(Color.dawaiPrimary)
+                            }
+                        }
+                    }
+                }
+
+                // If "لعدد أيام" selected, show the native picker from 1 to 90
+                if !isContinuousDuration {
+                    Section {
+                        HStack {
+                            Picker("عدد الأيام", selection: $durationDaysCount) {
+                                ForEach(1...90, id: \.self) { day in
+                                    Text(formattedDaysCount(day)).tag(day)
+                                }
+                            }
+                            .pickerStyle(.menu)
+                            .dawaiFont(size: 17)
+
+                            Spacer()
+                        }
+                    }
+                }
+            }
+            .navigationTitle("إلى متى تاخذه؟")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button("تم") {
+                        showingDurationSheet = false
+                    }
+                    .dawaiFont(size: 17, weight: .semibold)
+                    .foregroundStyle(Color.dawaiPrimary)
+                }
+            }
+            .environment(\.layoutDirection, .rightToLeft)
+            .environment(\.locale, Locale.dawaiArabic)
+        }
+        .presentationDetents([.medium, .large])
+    }
+
+    private func formattedDaysCount(_ n: Int) -> String {
+        switch n {
+        case 1: return "يوم"
+        case 2: return "يومين"
+        case 3...10: return "\(n) أيام"
+        default: return "\(n) يوم"
+        }
+    }
+
+    private var durationRowSummary: String {
+        if isContinuousDuration {
+            return "مستمر"
+        }
+        return formattedDaysCount(durationDaysCount)
+    }
+
+    // MARK: - Save Medication
     private func saveMedication() {
         errorMessage = nil
+
+        let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedName.isEmpty else {
+            withAnimation {
+                errorMessage = "اكتب اسم الدواء"
+            }
+            return
+        }
+
+        if frequencyType == .specificWeekdays && selectedWeekdays.isEmpty {
+            withAnimation {
+                errorMessage = "اختر يوم واحد على الأقل"
+            }
+            return
+        }
+
         isSaving = true
 
         Task { @MainActor in
             do {
-                let timeStr = formatDoseTime(selectedTime)
-                let durationFinal = selectedDurationSummary
-                let freqFinal = selectedFrequencySummary
+                let chosenMinutes = doseTimes.map { minutesFromDate($0) }.sorted()
+                let firstTimeStr = chosenMinutes.first.map { medicationService.formattedTimeString(forSlotMinutes: $0) }
+                    ?? (doseTimes.first.map { formatDoseTime($0) } ?? "08:00 ص")
+
+                let durationFinal = durationRowSummary
+                let freqFinal = timesCountArabic(doseTimes.count)
+
+                let daysFinal: [String]
+                switch frequencyType {
+                case .daily:
+                    daysFinal = ["كل يوم"]
+                case .everyOtherDay:
+                    daysFinal = ["يوم بعد يوم"]
+                case .specificWeekdays:
+                    let names = weekdayItems.filter { selectedWeekdays.contains($0.id) }.map { $0.title }
+                    daysFinal = names.isEmpty ? ["كل يوم"] : names
+                case .asNeeded:
+                    daysFinal = ["كل يوم"]
+                }
+
+                let finalEndDate: Date?
+                if isContinuousDuration {
+                    finalEndDate = nil
+                } else {
+                    let cal = Calendar.current
+                    let startDay = cal.startOfDay(for: Date())
+                    if let endDay = cal.date(byAdding: .day, value: durationDaysCount - 1, to: startDay) {
+                        var comps = cal.dateComponents([.year, .month, .day], from: endDay)
+                        comps.hour = 23
+                        comps.minute = 59
+                        comps.second = 59
+                        finalEndDate = cal.date(from: comps)
+                    } else {
+                        finalEndDate = nil
+                    }
+                }
+
+                let structuredWeekdays: Set<Int> = (frequencyType == .specificWeekdays) ? selectedWeekdays : []
 
                 switch mode {
                 case .add:
-                    // A caregiver adds to the linked patient's schedule; a patient adds to their own.
-                    // MedicationService re-checks and enforces this owner.
-                    let structuredWeekdays = MedicationWeekday.parseWeekdayNumbers(from: selectedDays)
                     let newMedication = MedicationItem(
                         patientId: currentUser.role == .caregiver ? (targetPatient?.patientId ?? "") : currentUser.id,
-                        name: name,
-                        dosage: dosage,
-                        timeString: timeStr,
-                        scheduledDate: selectedTime,
-                        days: selectedDays,
+                        name: trimmedName,
+                        dosage: strength.isEmpty ? "حبة واحدة" : strength,
+                        timeString: firstTimeStr,
+                        scheduledDate: doseTimes.first,
+                        days: daysFinal,
                         selectedWeekdays: structuredWeekdays,
                         frequency: freqFinal,
                         duration: durationFinal,
                         instructions: instructions.isEmpty ? nil : instructions,
                         imageData: imageData,
-                        isTaken: false
+                        isTaken: false,
+                        scheduleType: frequencyType,
+                        customDoseTimesMinutes: chosenMinutes,
+                        startDate: Date(),
+                        endDate: finalEndDate
                     )
 
                     try await medicationService.addMedication(
@@ -899,18 +975,21 @@ public struct MedicationFormView: View {
                     )
 
                 case .edit(let existing):
-                    let structuredWeekdays = MedicationWeekday.parseWeekdayNumbers(from: selectedDays)
                     var updated = existing
-                    updated.name = name
-                    updated.dosage = dosage
-                    updated.timeString = timeStr
-                    updated.scheduledDate = selectedTime
-                    updated.days = selectedDays
+                    updated.name = trimmedName
+                    updated.dosage = strength.isEmpty ? "حبة واحدة" : strength
+                    updated.timeString = firstTimeStr
+                    updated.scheduledDate = doseTimes.first
+                    updated.days = daysFinal
                     updated.selectedWeekdays = structuredWeekdays
                     updated.frequency = freqFinal
                     updated.duration = durationFinal
                     updated.instructions = instructions.isEmpty ? nil : instructions
                     updated.imageData = imageData
+                    updated.scheduleType = frequencyType
+                    updated.customDoseTimesMinutes = chosenMinutes
+                    updated.startDate = existing.startDate
+                    updated.endDate = finalEndDate
 
                     try await medicationService.updateMedication(
                         item: updated,
@@ -935,6 +1014,7 @@ public struct MedicationFormView: View {
         }
     }
 
+    // MARK: - Date Helpers
     private func formatDoseTime(_ date: Date) -> String {
         let calendar = Calendar.current
         let comps = calendar.dateComponents([.hour, .minute], from: date)
@@ -942,18 +1022,38 @@ public struct MedicationFormView: View {
         return medicationService.formattedTimeString(forSlotMinutes: totalMinutes)
     }
 
-    private func dateFromItem(_ item: MedicationItem) -> Date {
-        if let scheduledDate = item.scheduledDate {
-            return scheduledDate
-        }
-        // Extract hour & minute from item.timeString (e.g. "07:36 م" / "11:30 ص")
-        let totalMinutes = medicationService.scheduledMinutes(for: item)
-        let hour = totalMinutes / 60
-        let minute = totalMinutes % 60
+    private func minutesFromDate(_ date: Date) -> Int {
+        let comps = Calendar.current.dateComponents([.hour, .minute], from: date)
+        return (comps.hour ?? 0) * 60 + (comps.minute ?? 0)
+    }
+
+    private func dateFromMinutes(_ mins: Int) -> Date {
+        let calendar = Calendar.current
+        var comps = calendar.dateComponents([.year, .month, .day], from: Date())
+        comps.hour = mins / 60
+        comps.minute = mins % 60
+        comps.second = 0
+        return calendar.date(from: comps) ?? Date()
+    }
+
+    private static func defaultInitialDoseTime() -> Date {
         var comps = Calendar.current.dateComponents([.year, .month, .day], from: Date())
-        comps.hour = hour
-        comps.minute = minute
+        comps.hour = 8
+        comps.minute = 0
         comps.second = 0
         return Calendar.current.date(from: comps) ?? Date()
+    }
+
+    private func parseDaysCount(from durationStr: String) -> Int? {
+        let clean = durationStr.westernNumerals
+        let digits = clean.replacingOccurrences(of: "[^0-9]", with: "", options: .regularExpression)
+        if let count = Int(digits), count > 0 {
+            return count
+        }
+        if durationStr.contains("يومين") { return 2 }
+        if durationStr.contains("أسبوع") || durationStr.contains("اسبوع") { return 7 }
+        if durationStr.contains("أسبوعين") || durationStr.contains("اسبوعين") { return 14 }
+        if durationStr.contains("شهر") { return 30 }
+        return nil
     }
 }

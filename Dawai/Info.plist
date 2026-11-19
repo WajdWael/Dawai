@@ -21,12 +21,6 @@
 	</array>
 	<key>NSAlarmKitUsageDescription</key>
 	<string>يحتاج تطبيق دواي إلى إذن المنبّه لتشغيل تنبيه صوتي واضح بملء الشاشة عند حلول موعد جرعة الدواء حتى لو كان الجهاز على الوضع الصامت.</string>
-	<key>ITSAppUsesNonExemptEncryption</key>
-	<false/>
-	<key>NSSupportsLiveActivities</key>
-	<true/>
-	<key>NSSupportsLiveActivitiesFrequentUpdates</key>
-	<true/>
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>remote-notification</string>

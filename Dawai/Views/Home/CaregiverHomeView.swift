@@ -368,14 +368,7 @@ public struct CaregiverHomeView: View {
         Rectangle()
             .fill(.ultraThinMaterial)
             .overlay(
-                hasDelayAlert
-                    ? Color.dawaiWarningBackground.opacity(0.9)
-                    : Color(uiColor: .secondarySystemGroupedBackground).opacity(0.6)
-            )
-            .overlay(
-                hasDelayAlert
-                    ? Color.dawaiWarningBorder
-                    : Color.clear
+                Color(uiColor: .secondarySystemGroupedBackground).opacity(0.6)
             )
     }
 
