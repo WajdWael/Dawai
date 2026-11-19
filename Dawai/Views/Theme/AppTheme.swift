@@ -32,11 +32,98 @@ public enum AppAppearance: String, CaseIterable, Identifiable {
     }
 }
 
+// MARK: - Application Text Size (iOS-Style Dynamic Text Scaling)
+public enum AppTextSize: Int, CaseIterable, Identifiable {
+    case small = 0
+    case medium = 1
+    case large = 2       // Default: Large for comfortable readability
+    case extraLarge = 3
+    case maximum = 4
+
+    public var id: Int { rawValue }
+
+    public var titleArabic: String {
+        switch self {
+        case .small: return "صغير"
+        case .medium: return "متوسط"
+        case .large: return "كبير"
+        case .extraLarge: return "كبير جداً"
+        case .maximum: return "الأكبر"
+        }
+    }
+
+    /// Scaled proportionally and gently to preserve layout integrity
+    public var scaleFactor: CGFloat {
+        switch self {
+        case .small: return 0.92
+        case .medium: return 1.00
+        case .large: return 1.08
+        case .extraLarge: return 1.16
+        case .maximum: return 1.24
+        }
+    }
+
+    public var dynamicTypeSize: DynamicTypeSize {
+        switch self {
+        case .small: return .small
+        case .medium: return .medium
+        case .large: return .large
+        case .extraLarge: return .xLarge
+        case .maximum: return .xxLarge
+        }
+    }
+}
+
+private struct DawaiFontScaleKey: EnvironmentKey {
+    static let defaultValue: CGFloat = AppTextSize.large.scaleFactor
+}
+
+public extension EnvironmentValues {
+    var dawaiFontScale: CGFloat {
+        get { self[DawaiFontScaleKey.self] }
+        set { self[DawaiFontScaleKey.self] = newValue }
+    }
+}
+
+private struct DawaiScaledFontModifier: ViewModifier {
+    let baseSize: CGFloat
+    let weight: Font.Weight
+    let design: Font.Design
+    @Environment(\.dawaiFontScale) private var scale
+
+    private var effectiveScale: CGFloat {
+        if baseSize >= 28 {
+            return min(scale, 1.10)
+        } else if baseSize >= 20 {
+            return min(scale, 1.14)
+        } else {
+            return scale
+        }
+    }
+
+    func body(content: Content) -> some View {
+        let scaledSize = (baseSize * effectiveScale).rounded()
+        return content.font(.system(size: scaledSize, weight: weight, design: design))
+    }
+}
+
+public extension View {
+    /// Applies a system font that dynamically scales with the user's selected Text Size setting in Dawai.
+    func dawaiFont(
+        size: CGFloat,
+        weight: Font.Weight = .regular,
+        design: Font.Design = .default
+    ) -> some View {
+        modifier(DawaiScaledFontModifier(baseSize: size, weight: weight, design: design))
+    }
+}
+
 @MainActor
 public final class ThemeService: ObservableObject {
     public static let shared = ThemeService()
 
     private let storageKey = "dawai_app_appearance"
+    private let textSizeStorageKey = "dawai_app_text_size_v1"
 
     @Published public var appearanceRaw: String {
         didSet {
@@ -45,8 +132,26 @@ public final class ThemeService: ObservableObject {
         }
     }
 
+    /// 0...4 matching `AppTextSize`. Defaults to `2` (.large / كبير).
+    @Published public var textSizeStep: Int {
+        didSet {
+            let clamped = min(max(textSizeStep, AppTextSize.small.rawValue), AppTextSize.maximum.rawValue)
+            if clamped != textSizeStep {
+                textSizeStep = clamped
+                return
+            }
+            UserDefaults.standard.set(clamped, forKey: textSizeStorageKey)
+        }
+    }
+
     public init() {
         self.appearanceRaw = UserDefaults.standard.string(forKey: "dawai_app_appearance") ?? "system"
+        if let savedStep = UserDefaults.standard.object(forKey: "dawai_app_text_size_v1") as? Int,
+           AppTextSize(rawValue: savedStep) != nil {
+            self.textSizeStep = savedStep
+        } else {
+            self.textSizeStep = AppTextSize.large.rawValue
+        }
         applyThemeToApp()
     }
 
@@ -56,6 +161,19 @@ public final class ThemeService: ObservableObject {
             appearanceRaw = newValue.rawValue
             applyThemeToApp()
         }
+    }
+
+    public var currentTextSize: AppTextSize {
+        get { AppTextSize(rawValue: textSizeStep) ?? .large }
+        set { textSizeStep = newValue.rawValue }
+    }
+
+    public var fontScale: CGFloat {
+        currentTextSize.scaleFactor
+    }
+
+    public var dynamicTypeSize: DynamicTypeSize {
+        currentTextSize.dynamicTypeSize
     }
 
     public var colorScheme: ColorScheme? {
@@ -114,6 +232,20 @@ extension Color {
         trait.userInterfaceStyle == .dark
             ? UIColor.white.withAlphaComponent(0.12)
             : UIColor.white.withAlphaComponent(0.8)
+    })
+
+    /// Luminous frosted glass backing fill: bright white glass in light mode, elevated dark glass in dark mode
+    public static let dawaiGlassFill = Color(uiColor: UIColor { trait in
+        trait.userInterfaceStyle == .dark
+            ? UIColor.secondarySystemGroupedBackground.withAlphaComponent(0.75)
+            : UIColor.white.withAlphaComponent(0.85)
+    })
+
+    /// Subtle brand tint layered over frosted glass surfaces in light mode
+    public static let dawaiGlassTint = Color(uiColor: UIColor { trait in
+        trait.userInterfaceStyle == .dark
+            ? UIColor.clear
+            : UIColor(red: 0.0 / 255.0, green: 123.0 / 255.0, blue: 120.0 / 255.0, alpha: 0.025)
     })
 
     // MARK: - Refined Warning / Alert Palette (Soft warm amber / terracotta)

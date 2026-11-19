@@ -11,6 +11,7 @@ import SwiftUI
 public struct CaregiverPatientDetailView: View {
     let beneficiary: BeneficiarySummary
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.scenePhase) private var scenePhase
     @EnvironmentObject private var appState: AppState
     @ObservedObject private var medicationService = MedicationService.shared
     @ObservedObject private var relationshipService = RelationshipService.shared
@@ -21,10 +22,12 @@ public struct CaregiverPatientDetailView: View {
     @State private var showingReportSheet = false
     @State private var showingAddMedicationSheet = false
     @State private var editingMedication: MedicationItem? = nil
+    @State private var previewingMedication: MedicationItem? = nil
 
     // UC-11 Direct Deletion by Caregiver
     @State private var medicationToDelete: MedicationItem? = nil
     @State private var showingCaregiverDeleteAlert = false
+    @State private var swipedItemId: String? = nil
 
     public init(beneficiary: BeneficiarySummary) {
         self.beneficiary = beneficiary
@@ -38,7 +41,7 @@ public struct CaregiverPatientDetailView: View {
 
     /// Today's schedule built only from this patient's medications.
     private var currentSchedule: MedicationService.PatientDaySchedule {
-        medicationService.daySchedule(forPatient: beneficiaryPatientId)
+        medicationService.daySchedule(forPatient: beneficiaryPatientId, at: medicationService.lastEvaluatedAt)
     }
 
     /// All medications owned by this patient.
@@ -55,7 +58,7 @@ public struct CaregiverPatientDetailView: View {
     }
 
     public var body: some View {
-        ZStack(alignment: .top) {
+        ZStack(alignment: .bottom) {
             ScrollView {
                 VStack(alignment: .leading, spacing: 20) {
                     navigationBarView
@@ -67,17 +70,19 @@ public struct CaregiverPatientDetailView: View {
                     // UC-11 Collaborative Approval: Pending Deletion Requests
                     pendingDeletionRequestsSection
 
-                    callButton
                     medicationsSection
                     upcomingDosesSection
-
-                    // Only for a real, currently linked patient
-                    if activeRelationship != nil {
-                        unlinkButton
-                    }
                 }
                 .padding(.horizontal, 20)
-                .padding(.bottom, 24)
+                .padding(.bottom, 80)
+            }
+            .refreshable {
+                await CloudKitSyncManager.shared.syncNow(silent: false)
+            }
+
+            // Pinned at the very bottom of the screen (not inside scroll content)
+            if activeRelationship != nil || DemoModeService.shared.isActive {
+                unlinkButton
             }
 
             // Notification Toast (Add / Edit / Delete Feedback)
@@ -94,6 +99,18 @@ public struct CaregiverPatientDetailView: View {
         .toolbar(.hidden, for: .navigationBar)
         .onAppear {
             themeService.applyThemeToApp()
+            medicationService.refreshDerivedState()
+            Task {
+                await CloudKitSyncManager.shared.syncNow(silent: true)
+            }
+        }
+        .onChange(of: scenePhase) { newPhase in
+            if newPhase == .active {
+                medicationService.refreshDerivedState()
+                Task {
+                    await CloudKitSyncManager.shared.syncNow(silent: true)
+                }
+            }
         }
         .preferredColorScheme(themeService.colorScheme)
         .alert("الاتصال بـ \(beneficiary.name)", isPresented: $showingCallAlert) {
@@ -123,6 +140,10 @@ public struct CaregiverPatientDetailView: View {
             }
             .preferredColorScheme(themeService.colorScheme)
         }
+        .sheet(item: $previewingMedication) { med in
+            medicationPreviewSheet(for: med)
+                .preferredColorScheme(themeService.colorScheme)
+        }
         .sheet(item: $editingMedication) { med in
             let caregiverUser = appState.currentIdentity ?? UserIdentity(role: .caregiver, displayName: "مقدم الرعاية", keyFingerprint: "cg_default")
             MedicationFormView(mode: .edit(med), currentUser: caregiverUser, targetPatient: beneficiary) {
@@ -143,7 +164,11 @@ public struct CaregiverPatientDetailView: View {
         } message: {
             Text("هل أنت متأكد من رغبتك في حذف دواء \"\(medicationToDelete?.name ?? "")\"؟ سيتم حذفه نهائياً من جدول \(beneficiary.name) وإلغاء جميع التذكيرات.")
         }
-        .alert("إنهاء الارتباط", isPresented: $showingUnlinkAlert) {
+        .confirmationDialog(
+            "إنهاء الارتباط مع \(beneficiary.name)؟",
+            isPresented: $showingUnlinkAlert,
+            titleVisibility: .visible
+        ) {
             Button("إنهاء الارتباط", role: .destructive) {
                 if let rel = activeRelationship {
                     relationshipService.disconnect(relationshipId: rel.id)
@@ -152,34 +177,25 @@ public struct CaregiverPatientDetailView: View {
             }
             Button("إلغاء", role: .cancel) {}
         } message: {
-            Text("هل أنت متأكد من إنهاء الارتباط مع \(beneficiary.name)؟ لن تتمكن بعد ذلك من متابعة جدول أدويته أو تعديله.")
+            Text("لن تتمكن من متابعة أدوية وجرعات \(beneficiary.name)، ولن تصلك تنبيهات عند فوات جرعة.")
         }
     }
 
-    // MARK: - End Link Button
+    // MARK: - End Link Button (Pinned at Screen Bottom)
     @ViewBuilder
     private var unlinkButton: some View {
         Button(role: .destructive) {
             showingUnlinkAlert = true
         } label: {
-            HStack(spacing: 10) {
-                Image(systemName: "person.crop.circle.badge.xmark")
-                    .font(.system(size: 17, weight: .semibold))
-                Text("إنهاء الارتباط")
-                    .font(.system(size: 17, weight: .bold))
-            }
-            .frame(maxWidth: .infinity)
-            .padding(.vertical, 14)
-            .background(Color.red.opacity(0.08))
-            .foregroundStyle(Color.red)
-            .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: 16, style: .continuous)
-                    .stroke(Color.red.opacity(0.35), lineWidth: 1)
-            )
+            Text("إنهاء الارتباط")
+                .dawaiFont(size: 14, weight: .medium)
+                .foregroundStyle(Color.red)
+                .padding(.vertical, 8)
+                .padding(.horizontal, 16)
         }
         .buttonStyle(.plain)
-        .padding(.top, 8)
+        .padding(.bottom, 8)
+        .frame(maxWidth: .infinity, alignment: .center)
         .accessibilityLabel("إنهاء الارتباط مع \(beneficiary.name)")
     }
 
@@ -192,7 +208,7 @@ public struct CaregiverPatientDetailView: View {
                 dismiss()
             } label: {
                 Image(systemName: "chevron.right")
-                    .font(.system(size: 18, weight: .bold))
+                    .dawaiFont(size: 18, weight: .bold)
                     .foregroundStyle(Color.primary)
                     .frame(width: 44, height: 44)
                     .background(.ultraThinMaterial, in: Circle())
@@ -207,26 +223,43 @@ public struct CaregiverPatientDetailView: View {
 
             // Center: Beneficiary Name
             Text(beneficiary.name)
-                .font(.system(size: 26, weight: .bold, design: .rounded))
+                .dawaiFont(size: 26, weight: .bold, design: .rounded)
                 .foregroundStyle(.primary)
 
             Spacer()
 
-            // Trailing side (LEFT in RTL): Report Sheet button
-            Button {
-                showingReportSheet = true
-            } label: {
-                Image(systemName: "doc.text")
-                    .font(.system(size: 18, weight: .semibold))
-                    .foregroundStyle(Color.dawaiPrimary)
-                    .frame(width: 44, height: 44)
-                    .background(.ultraThinMaterial, in: Circle())
-                    .overlay(
-                        Circle().stroke(Color.dawaiGlassBorder, lineWidth: 1)
-                    )
+            // Trailing side (LEFT in RTL): Call & Report Sheet buttons
+            HStack(spacing: 8) {
+                Button {
+                    showingCallAlert = true
+                } label: {
+                    Image(systemName: "phone.fill")
+                        .dawaiFont(size: 16, weight: .bold)
+                        .foregroundStyle(Color.dawaiPrimary)
+                        .frame(width: 44, height: 44)
+                        .background(.ultraThinMaterial, in: Circle())
+                        .overlay(
+                            Circle().stroke(Color.dawaiGlassBorder, lineWidth: 1)
+                        )
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("اتصال بـ \(beneficiary.name)")
+
+                Button {
+                    showingReportSheet = true
+                } label: {
+                    Image(systemName: "doc.text")
+                        .dawaiFont(size: 18, weight: .semibold)
+                        .foregroundStyle(Color.dawaiPrimary)
+                        .frame(width: 44, height: 44)
+                        .background(.ultraThinMaterial, in: Circle())
+                        .overlay(
+                            Circle().stroke(Color.dawaiGlassBorder, lineWidth: 1)
+                        )
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("تقرير الجرعات")
             }
-            .buttonStyle(.plain)
-            .accessibilityLabel("تقرير الجرعات")
         }
         .padding(.top, 8)
     }
@@ -237,17 +270,17 @@ public struct CaregiverPatientDetailView: View {
         let schedule = currentSchedule
         let medName = beneficiary.delayedMedicationName ?? schedule.missedMedications.first?.name ?? schedule.activeMedication?.name ?? "الدواء"
         let dosage = beneficiary.delayedDosage ?? schedule.missedMedications.first?.dosage ?? "جرعة مجدولة"
-        let scheduledTime = beneficiary.scheduledTime ?? schedule.missedMedications.first?.timeString ?? "11:30 م"
+        let scheduledTime = beneficiary.scheduledTime ?? schedule.missedDoses.first?.timeString ?? schedule.missedMedications.first?.timeString ?? "11:30 م"
         let noticeTitle = beneficiary.delayNotice ?? "30 د تأخير، \(medName)"
 
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 8) {
                 Image(systemName: "exclamationmark.triangle.fill")
-                    .font(.system(size: 20))
+                    .dawaiFont(size: 20)
                     .foregroundStyle(Color.dawaiWarning)
 
                 Text(noticeTitle)
-                    .font(.system(size: 18, weight: .bold))
+                    .dawaiFont(size: 18, weight: .bold)
                     .foregroundStyle(.primary)
 
                 Spacer()
@@ -255,7 +288,7 @@ public struct CaregiverPatientDetailView: View {
 
             HStack {
                 Text("\(dosage)، مجدولة: \(scheduledTime)")
-                    .font(.system(size: 14, weight: .semibold))
+                    .dawaiFont(size: 14, weight: .semibold)
                     .foregroundStyle(Color.dawaiWarning)
 
                 Spacer()
@@ -286,10 +319,10 @@ public struct CaregiverPatientDetailView: View {
             VStack(alignment: .leading, spacing: 12) {
                 HStack(spacing: 8) {
                     Image(systemName: "exclamationmark.bubble.fill")
-                        .font(.system(size: 18))
+                        .dawaiFont(size: 18)
                         .foregroundStyle(Color.dawaiWarning)
                     Text("طلبات حذف الأدوية من المستفيد")
-                        .font(.system(size: 18, weight: .bold))
+                        .dawaiFont(size: 18, weight: .bold)
                         .foregroundStyle(.primary)
                 }
 
@@ -298,18 +331,18 @@ public struct CaregiverPatientDetailView: View {
                         HStack {
                             VStack(alignment: .leading, spacing: 3) {
                                 Text(req.medicationName)
-                                    .font(.system(size: 17, weight: .bold))
+                                    .dawaiFont(size: 17, weight: .bold)
                                     .foregroundStyle(.primary)
                                 Text("\(req.dosage) • \(req.timeString)")
-                                    .font(.system(size: 13, weight: .medium))
+                                    .dawaiFont(size: 13, weight: .medium)
                                     .foregroundStyle(.secondary)
                             }
                             Spacer()
                             HStack(spacing: 4) {
                                 Image(systemName: "hourglass")
-                                    .font(.system(size: 10, weight: .bold))
+                                    .dawaiFont(size: 10, weight: .bold)
                                 Text("طلب حذف")
-                                    .font(.system(size: 11, weight: .bold))
+                                    .dawaiFont(size: 11, weight: .bold)
                             }
                             .foregroundStyle(Color.dawaiWarning)
                             .padding(.horizontal, 8)
@@ -318,7 +351,7 @@ public struct CaregiverPatientDetailView: View {
                         }
 
                         Text("طلب المستفيد حذف هذا الدواء من جدوله. هل توافق على حذفه نهائياً أم ترغب بالاحتفاظ به؟")
-                            .font(.system(size: 13))
+                            .dawaiFont(size: 13)
                             .foregroundStyle(.secondary)
 
                         HStack(spacing: 12) {
@@ -332,13 +365,13 @@ public struct CaregiverPatientDetailView: View {
                             } label: {
                                 HStack(spacing: 6) {
                                     Image(systemName: "trash.fill")
-                                        .font(.system(size: 13, weight: .bold))
+                                        .dawaiFont(size: 13, weight: .bold)
                                     Text("قبول وحذف")
-                                        .font(.system(size: 14, weight: .bold))
+                                        .dawaiFont(size: 14, weight: .bold)
                                 }
                                 .frame(maxWidth: .infinity)
                                 .padding(.vertical, 10)
-                                .background(Color.red.opacity(0.12))
+                                .background(Color.red.opacity(0.1))
                                 .foregroundStyle(Color.red)
                                 .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
                             }
@@ -354,25 +387,25 @@ public struct CaregiverPatientDetailView: View {
                             } label: {
                                 HStack(spacing: 6) {
                                     Image(systemName: "arrow.counterclockwise")
-                                        .font(.system(size: 13, weight: .bold))
+                                        .dawaiFont(size: 13, weight: .bold)
                                     Text("رفض والاحتفاظ")
-                                        .font(.system(size: 14, weight: .bold))
+                                        .dawaiFont(size: 14, weight: .bold)
                                 }
                                 .frame(maxWidth: .infinity)
                                 .padding(.vertical, 10)
-                                .background(Color.dawaiPrimary.opacity(0.12))
-                                .foregroundStyle(Color.dawaiPrimary)
+                                .background(Color(uiColor: .tertiarySystemFill))
+                                .foregroundStyle(.primary)
                                 .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
                             }
                             .buttonStyle(.plain)
                         }
                     }
                     .padding(16)
-                    .background(.ultraThinMaterial)
+                    .background(Color(uiColor: .secondarySystemGroupedBackground))
                     .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
                     .overlay(
                         RoundedRectangle(cornerRadius: 18, style: .continuous)
-                            .stroke(Color.dawaiWarningBorder, lineWidth: 1.2)
+                            .stroke(Color(uiColor: .separator).opacity(0.3), lineWidth: 1)
                     )
                 }
             }
@@ -387,9 +420,9 @@ public struct CaregiverPatientDetailView: View {
         } label: {
             HStack(spacing: 10) {
                 Image(systemName: "phone.fill")
-                    .font(.system(size: 18, weight: .bold))
+                    .dawaiFont(size: 18, weight: .bold)
                 Text("اتصال بالمستفيد")
-                    .font(.system(size: 18, weight: .bold))
+                    .dawaiFont(size: 18, weight: .bold)
             }
             .frame(maxWidth: .infinity)
             .padding(.vertical, 14)
@@ -412,7 +445,7 @@ public struct CaregiverPatientDetailView: View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
                 Text("الادوية")
-                    .font(.system(size: 22, weight: .bold))
+                    .dawaiFont(size: 22, weight: .bold)
                     .foregroundStyle(.primary)
 
                 Spacer()
@@ -421,7 +454,7 @@ public struct CaregiverPatientDetailView: View {
                     showingAddMedicationSheet = true
                 } label: {
                     Image(systemName: "plus")
-                        .font(.system(size: 16, weight: .bold))
+                        .dawaiFont(size: 16, weight: .bold)
                         .foregroundStyle(.white)
                         .frame(width: 36, height: 36)
                         .background(Color.dawaiPrimary, in: Circle())
@@ -430,11 +463,15 @@ public struct CaregiverPatientDetailView: View {
                 .accessibilityLabel("إضافة دواء جديد للمستفيد")
             }
 
-            if schedule.remainingDoses == 0 && !patientMedications.isEmpty {
-                // All doses completed state: show all medications of the day at the top with "تم أخذها" badge
+            if schedule.todayDoses.isEmpty && !patientMedications.isEmpty {
+                noMedicationsTodayCard
+            } else if schedule.remainingDoses == 0 && !schedule.todayDoses.isEmpty {
+                // All doses completed state: show all doses of the day at the top with "تم أخذها" or "فائتة" badge
                 allDosesCompletedView
-            } else if let activeMedication = schedule.activeMedication {
-                activeMedicationCard(activeMedication)
+            } else if !schedule.activeDoses.isEmpty {
+                ForEach(schedule.activeDoses) { dose in
+                    activeDoseCard(dose)
+                }
             } else {
                 emptyMedicationsCard
             }
@@ -444,192 +481,341 @@ public struct CaregiverPatientDetailView: View {
     // MARK: - All Doses Completed State (Native iOS List)
     @ViewBuilder
     private var allDosesCompletedView: some View {
-        let patientMedications = currentPatientMedications
+        let todayDoses = currentSchedule.todayDoses
+        let now = medicationService.lastEvaluatedAt
         VStack(spacing: 0) {
-            ForEach(patientMedications.indices, id: \.self) { index in
-                let med = patientMedications[index]
-                HStack(spacing: 12) {
-                    Image(systemName: "checkmark.circle.fill")
-                        .font(.system(size: 22, weight: .semibold))
-                        .foregroundStyle(Color.dawaiTaken)
-
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text(med.name)
-                            .font(.system(size: 17, weight: .semibold))
-                            .foregroundStyle(.primary)
-
-                        Text("\(med.dosage) • \(med.timeString)")
-                            .font(.system(size: 13, weight: .medium))
-                            .foregroundStyle(.secondary)
+            ForEach(todayDoses.indices, id: \.self) { index in
+                let dose = todayDoses[index]
+                let med = dose.medication
+                let state = medicationService.doseInteractionState(
+                    for: med,
+                    slotMinutes: dose.slotMinutes,
+                    at: now,
+                    isCarryover: dose.isCarryoverFromYesterday
+                )
+                let isTakenToday = (state == .taken)
+                let itemId = "completed_\(med.id)_\(dose.id)"
+                CaregiverSwipeableContainer(
+                    itemId: itemId,
+                    swipedItemId: $swipedItemId,
+                    onEdit: {
+                        editingMedication = med
+                    },
+                    onDelete: {
+                        medicationToDelete = med
+                        showingCaregiverDeleteAlert = true
                     }
-
-                    Spacer()
-
-                    Text("تم أخذها")
-                        .font(.system(size: 12, weight: .bold))
-                        .foregroundStyle(Color.dawaiTaken)
-                        .padding(.horizontal, 9)
-                        .padding(.vertical, 4)
-                        .background(Color.dawaiTakenBadgeBackground, in: Capsule())
-
-                    HStack(spacing: 6) {
+                ) {
+                    HStack(spacing: 12) {
                         Button {
-                            medicationToDelete = med
-                            showingCaregiverDeleteAlert = true
+                            previewingMedication = med
                         } label: {
-                            Image(systemName: "trash")
-                                .font(.system(size: 13, weight: .semibold))
-                                .foregroundStyle(Color.red)
-                                .frame(width: 30, height: 30)
-                                .background(Color.red.opacity(0.08), in: Circle())
+                            HStack(spacing: 12) {
+                                medicationRowThumbnail(imageData: med.imageData, isTaken: isTakenToday)
+
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text(med.name)
+                                        .dawaiFont(size: 17, weight: .semibold)
+                                        .foregroundStyle(.primary)
+
+                                    Text("\(med.dosage) • \(dose.timeString)")
+                                        .dawaiFont(size: 13, weight: .medium)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                            .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
-                        .accessibilityLabel("حذف دواء \(med.name)")
 
-                        Button {
-                            editingMedication = med
-                        } label: {
-                            Image(systemName: "pencil")
-                                .font(.system(size: 13, weight: .semibold))
-                                .foregroundStyle(.secondary)
-                                .frame(width: 30, height: 30)
-                                .background(Color.black.opacity(0.04), in: Circle())
+                        Spacer()
+
+                        if state == .missed {
+                            HStack(spacing: 4) {
+                                Image(systemName: "xmark.circle.fill")
+                                    .dawaiFont(size: 11, weight: .bold)
+                                Text("فائتة")
+                                    .dawaiFont(size: 12, weight: .bold)
+                            }
+                            .foregroundStyle(Color.red)
+                            .padding(.horizontal, 9)
+                            .padding(.vertical, 4)
+                            .background(Color.red.opacity(0.10), in: Capsule())
+                        } else {
+                            Text("تم أخذها")
+                                .dawaiFont(size: 12, weight: .bold)
+                                .foregroundStyle(Color.dawaiTaken)
+                                .padding(.horizontal, 9)
+                                .padding(.vertical, 4)
+                                .background(Color.dawaiTakenBadgeBackground, in: Capsule())
                         }
-                        .buttonStyle(.plain)
-                        .accessibilityLabel("تعديل دواء \(med.name)")
                     }
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 12)
                 }
-                .padding(.horizontal, 16)
-                .padding(.vertical, 12)
 
-                if index < patientMedications.count - 1 {
+                if index < todayDoses.count - 1 {
                     Divider()
                         .padding(.leading, 50)
                 }
             }
         }
-        .background(Color(uiColor: .secondarySystemGroupedBackground))
-        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .background(
+            ZStack {
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    .fill(.ultraThinMaterial)
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    .fill(
+                        Color(uiColor: UIColor { trait in
+                            trait.userInterfaceStyle == .dark
+                                ? UIColor.secondarySystemGroupedBackground.withAlphaComponent(0.75)
+                                : UIColor.white.withAlphaComponent(0.85)
+                        })
+                    )
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    .fill(
+                        Color(uiColor: UIColor { trait in
+                            trait.userInterfaceStyle == .dark
+                                ? UIColor.clear
+                                : UIColor(Color.dawaiPrimary).withAlphaComponent(0.025)
+                        })
+                    )
+            }
+        )
         .overlay(
             RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .stroke(Color.black.opacity(0.06), lineWidth: 0.8)
+                .stroke(Color.dawaiGlassBorder, lineWidth: 1)
         )
     }
 
-    // MARK: - Active Medication Single Card (When Doses Remain)
+    // MARK: - Active Dose Card (Per-Slot Support)
     @ViewBuilder
-    private func activeMedicationCard(_ activeMedication: MedicationItem) -> some View {
-        VStack(spacing: 16) {
-            HStack(alignment: .top, spacing: 14) {
+    private func activeDoseCard(_ dose: ScheduledDose) -> some View {
+        let activeMedication = dose.medication
+        let now = medicationService.lastEvaluatedAt
+        let interactionState = medicationService.doseInteractionState(
+            for: activeMedication,
+            slotMinutes: dose.slotMinutes,
+            at: now,
+            isCarryover: dose.isCarryoverFromYesterday
+        )
+        let isTakenSlot = (interactionState == .taken)
+        let itemId = "active_\(dose.id)"
+
+        CaregiverSwipeableContainer(
+            itemId: itemId,
+            swipedItemId: $swipedItemId,
+            onEdit: {
+                editingMedication = activeMedication
+            },
+            onDelete: {
+                medicationToDelete = activeMedication
+                showingCaregiverDeleteAlert = true
+            }
+        ) {
+            VStack(spacing: 16) {
+                HStack(alignment: .top, spacing: 14) {
+                    Button {
+                        previewingMedication = activeMedication
+                    } label: {
+                        HStack(alignment: .top, spacing: 14) {
+                            medicationHeroThumbnail(imageData: activeMedication.imageData, isTaken: isTakenSlot)
+
+                            VStack(alignment: .leading, spacing: 4) {
+                                HStack(spacing: 8) {
+                                    Text(activeMedication.name)
+                                        .dawaiFont(size: 22, weight: .bold)
+                                        .foregroundStyle(.primary)
+
+                                    if isTakenSlot {
+                                        HStack(spacing: 4) {
+                                            Image(systemName: "checkmark")
+                                                .dawaiFont(size: 11, weight: .bold)
+                                            Text("تم أخذها")
+                                                .dawaiFont(size: 12, weight: .bold)
+                                        }
+                                        .foregroundStyle(Color.dawaiTaken)
+                                        .padding(.horizontal, 8)
+                                        .padding(.vertical, 3)
+                                        .background(Color.dawaiTakenBadgeBackground, in: Capsule())
+                                    }
+                                }
+
+                                Text(activeMedication.dosage)
+                                    .dawaiFont(size: 15, weight: .medium)
+                                    .foregroundStyle(.secondary)
+
+                                Text(dose.timeString)
+                                    .dawaiFont(size: 14, weight: .semibold)
+                                    .foregroundStyle(
+                                        isTakenSlot
+                                            ? Color.dawaiTaken
+                                            : (interactionState == .overdueLate ? Color.dawaiWarning : Color.dawaiPrimary)
+                                    )
+                            }
+                        }
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+
+                    Spacer()
+                }
+                .padding(.horizontal, 16)
+                .padding(.top, 16)
+                .padding(.bottom, isTakenSlot ? 16 : 0)
+
+                // Dose Status Banner for Caregiver (Read-only status: "تم أخذها", overdue, or "بانتظار أخذ الجرعة")
+                if isTakenSlot {
+                    HStack(spacing: 8) {
+                        Image(systemName: "checkmark.circle.fill")
+                            .dawaiFont(size: 16, weight: .bold)
+                        Text("تم أخذها")
+                            .dawaiFont(size: 16, weight: .bold)
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 12)
+                    .background(Color.dawaiTakenBadgeBackground)
+                    .foregroundStyle(Color.dawaiTaken)
+                    .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                    .padding(.horizontal, 16)
+                    .padding(.bottom, 16)
+                } else if interactionState == .overdueLate {
+                    let mins = medicationService.overdueMinutes(
+                        for: activeMedication,
+                        slotMinutes: dose.slotMinutes,
+                        at: now,
+                        isCarryover: dose.isCarryoverFromYesterday
+                    ) ?? DoseWindowConfig.lateThresholdMinutes
+                    HStack(spacing: 8) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .dawaiFont(size: 16, weight: .bold)
+                        Text("متأخرة منذ \(mins) دقيقة")
+                            .dawaiFont(size: 16, weight: .bold)
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 12)
+                    .background(Color.dawaiWarningBadgeBackground)
+                    .foregroundStyle(Color.dawaiWarning)
+                    .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                    .padding(.horizontal, 16)
+                    .padding(.bottom, 16)
+                } else {
+                    HStack(spacing: 8) {
+                        Image(systemName: "clock.fill")
+                            .dawaiFont(size: 16, weight: .bold)
+                        Text("بانتظار أخذ الجرعة")
+                            .dawaiFont(size: 16, weight: .bold)
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 12)
+                    .background(Color.dawaiPrimary.opacity(0.10))
+                    .foregroundStyle(Color.dawaiPrimary)
+                    .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                    .padding(.horizontal, 16)
+                    .padding(.bottom, 16)
+                }
+            }
+            .background(
+                ZStack {
+                    RoundedRectangle(cornerRadius: 22, style: .continuous)
+                        .fill(.ultraThinMaterial)
+                    if isTakenSlot {
+                        RoundedRectangle(cornerRadius: 22, style: .continuous)
+                            .fill(Color.dawaiTakenBackground)
+                    } else if interactionState == .overdueLate {
+                        RoundedRectangle(cornerRadius: 22, style: .continuous)
+                            .fill(Color.dawaiWarningBackground.opacity(0.92))
+                        RoundedRectangle(cornerRadius: 22, style: .continuous)
+                            .fill(Color.dawaiWarning.opacity(0.08))
+                    } else {
+                        RoundedRectangle(cornerRadius: 22, style: .continuous)
+                            .fill(Color.dawaiGlassFill)
+                        RoundedRectangle(cornerRadius: 22, style: .continuous)
+                            .fill(Color.dawaiGlassTint)
+                    }
+                }
+            )
+            .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 22, style: .continuous)
+                    .stroke(
+                        isTakenSlot
+                            ? Color.dawaiTakenBorder
+                            : (interactionState == .overdueLate ? Color.dawaiWarning.opacity(0.45) : Color.dawaiGlassBorder),
+                        lineWidth: (isTakenSlot || interactionState == .overdueLate) ? 1.5 : 1
+                    )
+            )
+        }
+    }
+
+    // MARK: - Medication Image Thumbnail Helpers
+    @ViewBuilder
+    private func medicationHeroThumbnail(imageData: Data?, isTaken: Bool) -> some View {
+        ZStack(alignment: .bottomLeading) {
+            if let data = imageData, let uiImage = UIImage(data: data) {
+                Image(uiImage: uiImage)
+                    .resizable()
+                    .scaledToFill()
+                    .frame(width: 68, height: 68)
+                    .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 16, style: .continuous)
+                            .stroke(isTaken ? Color.dawaiTaken : Color.dawaiGlassBorder, lineWidth: isTaken ? 2 : 1)
+                    )
+            } else {
                 ZStack {
                     RoundedRectangle(cornerRadius: 16, style: .continuous)
-                        .fill(activeMedication.isTaken ? Color.dawaiTakenBadgeBackground : Color.dawaiPrimary.opacity(0.12))
+                        .fill(isTaken ? Color.dawaiTakenBadgeBackground : Color.dawaiPrimary.opacity(0.12))
                         .frame(width: 68, height: 68)
 
-                    Image(systemName: activeMedication.isTaken ? "checkmark.circle.fill" : "pill.fill")
-                        .font(.system(size: 32))
-                        .foregroundStyle(activeMedication.isTaken ? Color.dawaiTaken : Color.dawaiPrimary)
-                        .rotationEffect(activeMedication.isTaken ? .degrees(0) : .degrees(-45))
-                }
-
-                VStack(alignment: .leading, spacing: 4) {
-                    HStack(spacing: 8) {
-                        Text(activeMedication.name)
-                            .font(.system(size: 22, weight: .bold))
-                            .foregroundStyle(.primary)
-
-                        if activeMedication.isTaken {
-                            HStack(spacing: 4) {
-                                Image(systemName: "checkmark")
-                                    .font(.system(size: 11, weight: .bold))
-                                Text("تم أخذها")
-                                    .font(.system(size: 12, weight: .bold))
-                            }
-                            .foregroundStyle(Color.dawaiTaken)
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 3)
-                            .background(Color.dawaiTakenBadgeBackground, in: Capsule())
-                        }
-                    }
-
-                    Text(activeMedication.dosage)
-                        .font(.system(size: 15, weight: .medium))
-                        .foregroundStyle(.secondary)
-
-                    Text(activeMedication.timeString)
-                        .font(.system(size: 14, weight: .semibold))
-                        .foregroundStyle(activeMedication.isTaken ? Color.dawaiTaken : Color.dawaiPrimary)
-                }
-
-                Spacer()
-
-                HStack(spacing: 8) {
-                    Button {
-                        medicationToDelete = activeMedication
-                        showingCaregiverDeleteAlert = true
-                    } label: {
-                        Image(systemName: "trash")
-                            .font(.system(size: 13, weight: .semibold))
-                            .foregroundStyle(Color.red)
-                            .frame(width: 32, height: 32)
-                            .background(Color.red.opacity(0.08), in: Circle())
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel("حذف الدواء للمستفيد")
-
-                    Button {
-                        editingMedication = activeMedication
-                    } label: {
-                        Image(systemName: "pencil")
-                            .font(.system(size: 14, weight: .semibold))
-                            .foregroundStyle(.secondary)
-                            .frame(width: 32, height: 32)
-                            .background(.ultraThinMaterial, in: Circle())
-                            .overlay(
-                                Circle().stroke(Color.black.opacity(0.08), lineWidth: 0.8)
-                            )
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel("تعديل الدواء")
+                    Image(systemName: isTaken ? "checkmark.circle.fill" : "pill.fill")
+                        .dawaiFont(size: 32)
+                        .foregroundStyle(isTaken ? Color.dawaiTaken : Color.dawaiPrimary)
+                        .rotationEffect(isTaken ? .degrees(0) : .degrees(-45))
                 }
             }
-            .padding(.horizontal, 16)
-            .padding(.top, 16)
-            .padding(.bottom, activeMedication.isTaken ? 16 : 0)
 
-            // Dose Status Banner for Caregiver (Read-only status: "تم أخذها" or "بانتظار أخذ الجرعة")
-            HStack(spacing: 8) {
-                Image(systemName: activeMedication.isTaken ? "checkmark.circle.fill" : "clock.fill")
-                    .font(.system(size: 16, weight: .bold))
-                Text(activeMedication.isTaken ? "تم أخذها" : "بانتظار أخذ الجرعة")
-                    .font(.system(size: 16, weight: .bold))
+            if isTaken && imageData != nil {
+                Image(systemName: "checkmark.circle.fill")
+                    .dawaiFont(size: 18, weight: .bold)
+                    .foregroundStyle(.white, Color.dawaiTaken)
+                    .offset(x: -4, y: 4)
             }
-            .frame(maxWidth: .infinity)
-            .padding(.vertical, 12)
-            .background(
-                activeMedication.isTaken
-                    ? Color.dawaiTakenBadgeBackground
-                    : Color.dawaiPrimary.opacity(0.10)
-            )
-            .foregroundStyle(activeMedication.isTaken ? Color.dawaiTaken : Color.dawaiPrimary)
-            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-            .padding(.horizontal, 16)
-            .padding(.bottom, 16)
         }
-        .background(
-            activeMedication.isTaken
-                ? Color.dawaiTakenBackground
-                : Color.clear
-        )
-        .background(.ultraThinMaterial)
-        .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 22, style: .continuous)
-                .stroke(
-                    activeMedication.isTaken ? Color.dawaiTakenBorder : Color.dawaiGlassBorder,
-                    lineWidth: activeMedication.isTaken ? 1.5 : 1
-                )
-        )
+    }
+
+    @ViewBuilder
+    private func medicationRowThumbnail(imageData: Data?, isTaken: Bool) -> some View {
+        ZStack(alignment: .bottomLeading) {
+            if let data = imageData, let uiImage = UIImage(data: data) {
+                Image(uiImage: uiImage)
+                    .resizable()
+                    .scaledToFill()
+                    .frame(width: 42, height: 42)
+                    .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            .stroke(isTaken ? Color.dawaiTaken : Color.dawaiGlassBorder, lineWidth: 1)
+                    )
+            } else {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .fill(isTaken ? Color.dawaiTakenBadgeBackground : Color.dawaiPrimary.opacity(0.10))
+                        .frame(width: 42, height: 42)
+
+                    Image(systemName: isTaken ? "checkmark.circle.fill" : "pill.fill")
+                        .dawaiFont(size: 18, weight: .semibold)
+                        .foregroundStyle(isTaken ? Color.dawaiTaken : Color.dawaiPrimary)
+                        .rotationEffect(isTaken ? .degrees(0) : .degrees(-45))
+                }
+            }
+
+            if isTaken && imageData != nil {
+                Image(systemName: "checkmark.circle.fill")
+                    .dawaiFont(size: 14, weight: .bold)
+                    .foregroundStyle(.white, Color.dawaiTaken)
+                    .offset(x: -3, y: 3)
+            }
+        }
     }
 
     // MARK: - Empty Medications Fallback Card
@@ -637,20 +823,64 @@ public struct CaregiverPatientDetailView: View {
     private var emptyMedicationsCard: some View {
         VStack(spacing: 12) {
             Image(systemName: "pill.fill")
-                .font(.system(size: 32))
+                .dawaiFont(size: 32)
                 .foregroundStyle(Color.dawaiPrimary)
 
             Text("لا توجد أدوية مسجلة")
-                .font(.system(size: 17, weight: .bold))
+                .dawaiFont(size: 17, weight: .bold)
                 .foregroundStyle(.primary)
 
             Text("اضغط على (+) في الأعلى لإضافة دواء جديد للمستفيد.")
-                .font(.system(size: 14))
+                .dawaiFont(size: 14)
                 .foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity)
         .padding(24)
-        .background(.ultraThinMaterial)
+        .background(
+            ZStack {
+                RoundedRectangle(cornerRadius: 22, style: .continuous)
+                    .fill(.ultraThinMaterial)
+                RoundedRectangle(cornerRadius: 22, style: .continuous)
+                    .fill(Color.dawaiGlassFill)
+                RoundedRectangle(cornerRadius: 22, style: .continuous)
+                    .fill(Color.dawaiGlassTint)
+            }
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 22, style: .continuous)
+                .stroke(Color.dawaiGlassBorder, lineWidth: 1)
+        )
+    }
+
+    @ViewBuilder
+    private var noMedicationsTodayCard: some View {
+        VStack(spacing: 12) {
+            Image(systemName: "calendar.badge.checkmark")
+                .dawaiFont(size: 32)
+                .foregroundStyle(Color.dawaiPrimary)
+
+            Text("لا توجد أدوية مجدولة لليوم")
+                .dawaiFont(size: 17, weight: .bold)
+                .foregroundStyle(.primary)
+
+            Text("جميع أدوية المستفيد المسجلة مجدولة في أيام أخرى. اضغط على (+) لإضافة دواء أو لتعديل المواعيد.")
+                .dawaiFont(size: 14)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(24)
+        .background(
+            ZStack {
+                RoundedRectangle(cornerRadius: 22, style: .continuous)
+                    .fill(.ultraThinMaterial)
+                RoundedRectangle(cornerRadius: 22, style: .continuous)
+                    .fill(Color.dawaiGlassFill)
+                RoundedRectangle(cornerRadius: 22, style: .continuous)
+                    .fill(Color.dawaiGlassTint)
+            }
+        )
         .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 22, style: .continuous)
@@ -667,84 +897,130 @@ public struct CaregiverPatientDetailView: View {
         if schedule.remainingDoses > 0 && !schedule.upcomingDoses.isEmpty {
             VStack(alignment: .leading, spacing: 10) {
                 Text("جدول اليوم")
-                    .font(.system(size: 20, weight: .bold))
+                    .dawaiFont(size: 20, weight: .bold)
                     .foregroundStyle(.primary)
 
                 VStack(spacing: 0) {
                     ForEach(schedule.upcomingDoses.indices, id: \.self) { index in
                         let dose = schedule.upcomingDoses[index]
-                        HStack(spacing: 12) {
-                            VStack(alignment: .leading, spacing: 3) {
-                                Text(dose.name)
-                                    .font(.system(size: 17, weight: .semibold))
-                                    .foregroundStyle(dose.isTaken ? .secondary : .primary)
-
-                                Text(dose.dosage)
-                                    .font(.system(size: 13, weight: .medium))
-                                    .foregroundStyle(.secondary)
-                            }
-
-                            Spacer()
-
-                            if dose.isTaken {
-                                HStack(spacing: 5) {
-                                    Image(systemName: "checkmark.circle.fill")
-                                        .font(.system(size: 13, weight: .bold))
-                                    Text("تم أخذها")
-                                        .font(.system(size: 12, weight: .bold))
-                                }
-                                .foregroundStyle(Color.dawaiTaken)
-                                .padding(.horizontal, 9)
-                                .padding(.vertical, 4)
-                                .background(Color.dawaiTakenBadgeBackground, in: Capsule())
-                            } else {
-                                HStack(spacing: 5) {
-                                    Image(systemName: "clock")
-                                        .font(.system(size: 12, weight: .semibold))
-                                    Text(dose.timeString)
-                                        .font(.system(size: 13, weight: .semibold))
-                                }
-                                .foregroundStyle(Color.primary.opacity(0.75))
-                                .padding(.horizontal, 9)
-                                .padding(.vertical, 4)
-                                .background(Color.black.opacity(0.04), in: Capsule())
-                            }
-
-                            HStack(spacing: 6) {
-                                Button {
-                                    if let med = patientMedications.first(where: { $0.id == dose.id }) {
-                                        medicationToDelete = med
-                                        showingCaregiverDeleteAlert = true
-                                    }
-                                } label: {
-                                    Image(systemName: "trash")
-                                        .font(.system(size: 13, weight: .semibold))
-                                        .foregroundStyle(Color.red)
-                                        .frame(width: 30, height: 30)
-                                        .background(Color.red.opacity(0.08), in: Circle())
-                                }
-                                .buttonStyle(.plain)
-                                .accessibilityLabel("حذف دواء \(dose.name)")
-
-                                Button {
-                                    if let med = patientMedications.first(where: { $0.id == dose.id }) {
-                                        editingMedication = med
-                                    } else {
-                                        editingMedication = MedicationItem(patientId: beneficiaryPatientId, name: dose.name, dosage: dose.dosage, timeString: dose.timeString)
-                                    }
-                                } label: {
-                                    Image(systemName: "pencil")
-                                        .font(.system(size: 13, weight: .semibold))
-                                        .foregroundStyle(.secondary)
-                                        .frame(width: 30, height: 30)
-                                        .background(Color.black.opacity(0.04), in: Circle())
-                                }
-                                .buttonStyle(.plain)
-                                .accessibilityLabel("تعديل دواء \(dose.name)")
-                            }
+                        let fullMed = patientMedications.first(where: { $0.id == dose.medicationId })
+                        let resolvedSlot = dose.slotMinutes ?? fullMed.map { medicationService.scheduledMinutes(for: $0) }
+                        let matchingScheduledDose = schedule.todayDoses.first {
+                            $0.medication.id == dose.medicationId && $0.slotMinutes == resolvedSlot
                         }
-                        .padding(.vertical, 12)
-                        .padding(.horizontal, 16)
+                        let doseState: MedicationService.DoseInteractionState? = fullMed.map { med in
+                            medicationService.doseInteractionState(
+                                for: med,
+                                slotMinutes: resolvedSlot ?? medicationService.scheduledMinutes(for: med),
+                                at: medicationService.lastEvaluatedAt,
+                                isCarryover: matchingScheduledDose?.isCarryoverFromYesterday ?? false
+                            )
+                        }
+                        let itemId = "upcoming_\(dose.medicationId)_\(dose.timeString)"
+                        CaregiverSwipeableContainer(
+                            itemId: itemId,
+                            swipedItemId: $swipedItemId,
+                            onEdit: {
+                                if let med = patientMedications.first(where: { $0.id == dose.medicationId }) {
+                                    editingMedication = med
+                                } else {
+                                    editingMedication = MedicationItem(
+                                        id: dose.medicationId,
+                                        patientId: beneficiaryPatientId,
+                                        name: dose.name,
+                                        dosage: dose.dosage,
+                                        timeString: dose.timeString,
+                                        imageData: dose.imageData
+                                    )
+                                }
+                            },
+                            onDelete: {
+                                if let med = patientMedications.first(where: { $0.id == dose.medicationId }) {
+                                    medicationToDelete = med
+                                    showingCaregiverDeleteAlert = true
+                                }
+                            }
+                        ) {
+                            HStack(spacing: 12) {
+                                Button {
+                                    previewingMedication = fullMed ?? MedicationItem(
+                                        id: dose.medicationId,
+                                        patientId: beneficiaryPatientId,
+                                        name: dose.name,
+                                        dosage: dose.dosage,
+                                        timeString: dose.timeString,
+                                        imageData: dose.imageData,
+                                        isTaken: dose.isTaken
+                                    )
+                                } label: {
+                                    HStack(spacing: 12) {
+                                        medicationRowThumbnail(imageData: dose.imageData ?? fullMed?.imageData, isTaken: dose.isTaken)
+
+                                        VStack(alignment: .leading, spacing: 3) {
+                                            Text(dose.name)
+                                                .dawaiFont(size: 17, weight: .semibold)
+                                                .foregroundStyle(dose.isTaken ? .secondary : .primary)
+
+                                            Text(dose.dosage)
+                                                .dawaiFont(size: 13, weight: .medium)
+                                                .foregroundStyle(.secondary)
+                                        }
+                                    }
+                                    .contentShape(Rectangle())
+                                }
+                                .buttonStyle(.plain)
+
+                                Spacer()
+
+                                if dose.isTaken {
+                                    HStack(spacing: 5) {
+                                        Image(systemName: "checkmark.circle.fill")
+                                            .dawaiFont(size: 13, weight: .bold)
+                                        Text("تم أخذها")
+                                            .dawaiFont(size: 12, weight: .bold)
+                                    }
+                                    .foregroundStyle(Color.dawaiTaken)
+                                    .padding(.horizontal, 9)
+                                    .padding(.vertical, 4)
+                                    .background(Color.dawaiTakenBadgeBackground, in: Capsule())
+                                } else if doseState == .overdueLate {
+                                    HStack(spacing: 5) {
+                                        Image(systemName: "exclamationmark.triangle.fill")
+                                            .dawaiFont(size: 11, weight: .bold)
+                                        Text("متأخرة • \(dose.timeString)")
+                                            .dawaiFont(size: 12, weight: .bold)
+                                    }
+                                    .foregroundStyle(Color.dawaiWarning)
+                                    .padding(.horizontal, 9)
+                                    .padding(.vertical, 4)
+                                    .background(Color.dawaiWarningBadgeBackground, in: Capsule())
+                                } else if doseState == .missed {
+                                    HStack(spacing: 5) {
+                                        Image(systemName: "xmark.circle.fill")
+                                            .dawaiFont(size: 11, weight: .bold)
+                                        Text("فائتة")
+                                            .dawaiFont(size: 12, weight: .bold)
+                                    }
+                                    .foregroundStyle(Color.red)
+                                    .padding(.horizontal, 9)
+                                    .padding(.vertical, 4)
+                                    .background(Color.red.opacity(0.10), in: Capsule())
+                                } else {
+                                    HStack(spacing: 5) {
+                                        Image(systemName: "clock")
+                                            .dawaiFont(size: 12, weight: .semibold)
+                                        Text(dose.timeString)
+                                            .dawaiFont(size: 13, weight: .semibold)
+                                    }
+                                    .foregroundStyle(Color.primary.opacity(0.75))
+                                    .padding(.horizontal, 9)
+                                    .padding(.vertical, 4)
+                                    .background(Color.black.opacity(0.04), in: Capsule())
+                                }
+                            }
+                            .padding(.vertical, 12)
+                            .padding(.horizontal, 16)
+                        }
 
                         if index < schedule.upcomingDoses.count - 1 {
                             Divider()
@@ -752,14 +1028,284 @@ public struct CaregiverPatientDetailView: View {
                         }
                     }
                 }
-                .background(Color(uiColor: .secondarySystemGroupedBackground))
-                .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                .background(
+                    ZStack {
+                        RoundedRectangle(cornerRadius: 16, style: .continuous)
+                            .fill(.ultraThinMaterial)
+                        RoundedRectangle(cornerRadius: 16, style: .continuous)
+                            .fill(
+                                Color(uiColor: UIColor { trait in
+                                    trait.userInterfaceStyle == .dark
+                                        ? UIColor.secondarySystemGroupedBackground.withAlphaComponent(0.75)
+                                        : UIColor.white.withAlphaComponent(0.85)
+                                })
+                            )
+                        RoundedRectangle(cornerRadius: 16, style: .continuous)
+                            .fill(
+                                Color(uiColor: UIColor { trait in
+                                    trait.userInterfaceStyle == .dark
+                                        ? UIColor.clear
+                                        : UIColor(Color.dawaiPrimary).withAlphaComponent(0.025)
+                                })
+                            )
+                    }
+                )
                 .overlay(
                     RoundedRectangle(cornerRadius: 16, style: .continuous)
-                        .stroke(Color.black.opacity(0.06), lineWidth: 0.8)
+                        .stroke(Color.dawaiGlassBorder, lineWidth: 1)
                 )
             }
         }
+    }
+
+    // MARK: - 6. Full Medication Photo & Details Preview Sheet
+    @ViewBuilder
+    private func medicationPreviewSheet(for med: MedicationItem) -> some View {
+        let liveMed = currentPatientMedications.first(where: { $0.id == med.id }) ?? med
+        NavigationStack {
+            ScrollView {
+                VStack(spacing: 20) {
+                    if let data = liveMed.imageData, let uiImage = UIImage(data: data) {
+                        Image(uiImage: uiImage)
+                            .resizable()
+                            .scaledToFit()
+                            .frame(maxWidth: .infinity, maxHeight: 320)
+                            .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 24, style: .continuous)
+                                    .stroke(Color.dawaiGlassBorder, lineWidth: 1.5)
+                            )
+                            .shadow(color: Color.black.opacity(0.08), radius: 12, x: 0, y: 6)
+                    } else {
+                        ZStack {
+                            RoundedRectangle(cornerRadius: 24, style: .continuous)
+                                .fill(Color.dawaiPrimary.opacity(0.12))
+                                .frame(width: 140, height: 140)
+
+                            Image(systemName: "pill.fill")
+                                .dawaiFont(size: 56)
+                                .foregroundStyle(Color.dawaiPrimary)
+                                .rotationEffect(.degrees(-45))
+                        }
+                        .padding(.top, 12)
+                    }
+
+                    VStack(spacing: 8) {
+                        Text(liveMed.name)
+                            .dawaiFont(size: 28, weight: .bold, design: .rounded)
+                            .foregroundStyle(.primary)
+                            .multilineTextAlignment(.center)
+
+                        HStack(spacing: 10) {
+                            HStack(spacing: 5) {
+                                Image(systemName: "pills.fill")
+                                    .dawaiFont(size: 13)
+                                Text(liveMed.dosage.westernNumerals)
+                                    .dawaiFont(size: 15, weight: .semibold)
+                            }
+                            .foregroundStyle(Color.dawaiPrimary)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 6)
+                            .background(Color.dawaiPrimary.opacity(0.12), in: Capsule())
+
+                            HStack(spacing: 5) {
+                                Image(systemName: "clock.fill")
+                                    .dawaiFont(size: 13)
+                                Text(liveMed.timeString.westernNumerals)
+                                    .dawaiFont(size: 15, weight: .semibold)
+                            }
+                            .foregroundStyle(.secondary)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 6)
+                            .background(Color(uiColor: .tertiarySystemGroupedBackground), in: Capsule())
+                        }
+                    }
+
+                    if let instructions = liveMed.instructions,
+                       !instructions.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        VStack(alignment: .leading, spacing: 6) {
+                            Label("تعليمات الاستخدام", systemImage: "info.circle.fill")
+                                .dawaiFont(size: 14, weight: .bold)
+                                .foregroundStyle(Color.dawaiPrimary)
+
+                            Text(instructions)
+                                .dawaiFont(size: 15, weight: .medium)
+                                .foregroundStyle(.primary)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        .padding(16)
+                        .background(
+                            ZStack {
+                                RoundedRectangle(cornerRadius: 18, style: .continuous)
+                                    .fill(.ultraThinMaterial)
+                                RoundedRectangle(cornerRadius: 18, style: .continuous)
+                                    .fill(Color.dawaiGlassFill)
+                                RoundedRectangle(cornerRadius: 18, style: .continuous)
+                                    .fill(Color.dawaiGlassTint)
+                            }
+                        )
+                        .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                                .stroke(Color.dawaiGlassBorder, lineWidth: 1)
+                        )
+                    }
+                }
+                .padding(20)
+            }
+            .background(Color.dawaiBackground.ignoresSafeArea())
+            .navigationTitle("تفاصيل الدواء")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button("إغلاق") {
+                        previewingMedication = nil
+                    }
+                    .dawaiFont(size: 16, weight: .semibold)
+                    .foregroundStyle(Color.dawaiPrimary)
+                }
+
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button {
+                        let medToEdit = liveMed
+                        previewingMedication = nil
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                            editingMedication = medToEdit
+                        }
+                    } label: {
+                        Image(systemName: "pencil")
+                            .dawaiFont(size: 16, weight: .bold)
+                            .foregroundStyle(Color.dawaiPrimary)
+                    }
+                    .accessibilityLabel("تعديل الدواء")
+                }
+            }
+        }
+        .environment(\.layoutDirection, .rightToLeft)
+        .environment(\.locale, Locale.dawaiArabic)
+    }
+}
+
+// MARK: - Caregiver Swipeable Container (Custom Drag Gesture for ScrollView)
+private struct CaregiverSwipeableContainer<Content: View>: View {
+    let itemId: String
+    @Binding var swipedItemId: String?
+    let onEdit: () -> Void
+    let onDelete: () -> Void
+    @ViewBuilder let content: () -> Content
+
+    @State private var dragOffset: CGFloat = 0
+    private let actionButtonsWidth: CGFloat = 160 // 80 for Edit, 80 for Delete
+
+    private var isOpen: Bool {
+        swipedItemId == itemId
+    }
+
+    private var currentOffset: CGFloat {
+        if isOpen {
+            return -actionButtonsWidth + dragOffset
+        } else {
+            return min(0, dragOffset)
+        }
+    }
+
+    var body: some View {
+        ZStack(alignment: .trailing) {
+            // Action Buttons behind the row
+            HStack(spacing: 0) {
+                Spacer()
+
+                // 1. Delete Button (Red)
+                Button {
+                    withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+                        swipedItemId = nil
+                        dragOffset = 0
+                    }
+                    onDelete()
+                } label: {
+                    VStack(spacing: 4) {
+                        Image(systemName: "trash")
+                            .dawaiFont(size: 20, weight: .bold)
+                        Text("حذف")
+                            .dawaiFont(size: 14, weight: .bold)
+                    }
+                    .foregroundStyle(.white)
+                    .frame(width: 80)
+                    .frame(maxHeight: .infinity)
+                    .background(Color.red)
+                }
+                .buttonStyle(.plain)
+
+                // 2. Edit Button (Primary Color)
+                Button {
+                    withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+                        swipedItemId = nil
+                        dragOffset = 0
+                    }
+                    onEdit()
+                } label: {
+                    VStack(spacing: 4) {
+                        Image(systemName: "pencil")
+                            .dawaiFont(size: 20, weight: .bold)
+                        Text("تعديل")
+                            .dawaiFont(size: 14, weight: .bold)
+                    }
+                    .foregroundStyle(.white)
+                    .frame(width: 80)
+                    .frame(maxHeight: .infinity)
+                    .background(Color.dawaiPrimary)
+                }
+                .buttonStyle(.plain)
+            }
+            .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+
+            // Main Row Content sliding horizontally
+            content()
+                .offset(x: currentOffset)
+                .contentShape(Rectangle())
+                .highPriorityGesture(
+                    DragGesture(minimumDistance: 20, coordinateSpace: .local)
+                        .onChanged { value in
+                            // RTL horizontal drag detection
+                            let translation = value.translation.width
+                            if abs(translation) > abs(value.translation.height) {
+                                if isOpen {
+                                    // Can slide back right towards 0
+                                    let candidate = translation
+                                    if candidate > 0 {
+                                        dragOffset = min(actionButtonsWidth, candidate)
+                                    } else {
+                                        dragOffset = candidate * 0.2 // resistance
+                                    }
+                                } else {
+                                    // Can slide left (negative) to reveal buttons
+                                    if translation < 0 {
+                                        dragOffset = max(-actionButtonsWidth - 20, translation)
+                                    } else {
+                                        dragOffset = 0
+                                    }
+                                }
+                            }
+                        }
+                        .onEnded { value in
+                            let translation = value.translation.width
+                            let velocity = value.predictedEndTranslation.width
+                            withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
+                                if isOpen {
+                                    if translation > 40 || velocity > 80 {
+                                        swipedItemId = nil
+                                    }
+                                } else {
+                                    if translation < -50 || velocity < -100 {
+                                        swipedItemId = itemId
+                                    }
+                                }
+                                dragOffset = 0
+                            }
+                        }
+                )
+        }
+        .clipped()
     }
 }
 

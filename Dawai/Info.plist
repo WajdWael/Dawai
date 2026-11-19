@@ -2,6 +2,10 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<key>CFBundleLocalizations</key>
+	<array>
+		<string>ar</string>
+	</array>
 	<key>CFBundleURLTypes</key>
 	<array>
 		<dict>
@@ -14,6 +18,19 @@
 				<string>dawai</string>
 			</array>
 		</dict>
+	</array>
+	<key>NSAlarmKitUsageDescription</key>
+	<string>يحتاج تطبيق دواي إلى إذن المنبّه لتشغيل تنبيه صوتي واضح بملء الشاشة عند حلول موعد جرعة الدواء حتى لو كان الجهاز على الوضع الصامت.</string>
+	<key>ITSAppUsesNonExemptEncryption</key>
+	<false/>
+	<key>NSSupportsLiveActivities</key>
+	<true/>
+	<key>NSSupportsLiveActivitiesFrequentUpdates</key>
+	<true/>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>remote-notification</string>
+		<string>bluetooth-peripheral</string>
 	</array>
 </dict>
 </plist>

@@ -30,10 +30,63 @@ public final class RelationshipService: ObservableObject {
         loadPersistedState()
     }
 
+    // MARK: - Patient <-> Caregivers Queries (Up to 3 Caregivers per Patient)
+    public static let maxCaregiversPerPatient = 3
+
+    /// Returns all active caregiver relationships for `patientId`.
+    public func activeCaregivers(forPatient patientId: String) -> [ActiveRelationship] {
+        activeRelationships.filter { $0.patientId == patientId && $0.isActive }
+    }
+
+    /// Returns the first active caregiver relationship for `patientId`, if any (for backwards compatibility).
+    public func activeCaregiver(forPatient patientId: String) -> ActiveRelationship? {
+        activeCaregivers(forPatient: patientId).first
+    }
+
+    /// True when `patientId` has at least one active caregiver.
+    public func hasActiveCaregiver(forPatient patientId: String) -> Bool {
+        !activeCaregivers(forPatient: patientId).isEmpty
+    }
+
+    /// True when `patientId` has reached the maximum allowed caregivers limit (3).
+    public func hasReachedCaregiverLimit(forPatient patientId: String) -> Bool {
+        activeCaregivers(forPatient: patientId).count >= Self.maxCaregiversPerPatient
+    }
+
+    /// Invitations initiated by `user` that have not expired.
+    public func outgoingInvitations(for user: UserIdentity, status: InvitationStatus? = nil) -> [ConnectionInvitation] {
+        let all = deduplicate(outgoingInvitations + incomingInvitations)
+        return all.filter { inv in
+            guard inv.initiatorId == user.id, !inv.isExpired else { return false }
+            if let status {
+                return inv.status == status
+            }
+            return true
+        }
+    }
+
+    /// Pending, unexpired invitations sent by a user of the opposite role that `user` can accept or reject.
+    public func incomingInvitations(for user: UserIdentity) -> [ConnectionInvitation] {
+        if user.role == .patient && hasReachedCaregiverLimit(forPatient: user.id) {
+            return []
+        }
+        let all = deduplicate(outgoingInvitations + incomingInvitations)
+        return all.filter { inv in
+            inv.initiatorId != user.id &&
+            inv.initiatorRole != user.role &&
+            inv.status == .pending &&
+            !inv.isExpired &&
+            !(inv.initiatorRole == .patient && hasReachedCaregiverLimit(forPatient: inv.initiatorId))
+        }
+    }
+
     // MARK: - S#2: Create a Secure Invitation
     public func createInvitation(initiator: UserIdentity) -> ConnectionInvitation {
         // Remove previous pending or expired invitations from this user before creating a new one
         outgoingInvitations.removeAll {
+            $0.initiatorId == initiator.id && ($0.status == .pending || $0.isExpired)
+        }
+        incomingInvitations.removeAll {
             $0.initiatorId == initiator.id && ($0.status == .pending || $0.isExpired)
         }
 
@@ -50,11 +103,148 @@ public final class RelationshipService: ObservableObject {
         return invitation
     }
 
+    // MARK: - URL & Payload Import (Cross-Device Self-Contained Links)
+    /// Extracts a token (and imports any embedded invitation or sync payload) from a URL or pasted text.
+    @discardableResult
+    public func extractAndImportToken(from rawInput: String) -> String {
+        let trimmed = rawInput.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // 1. Check if rawInput contains an https:// or dawai:// URL (either standalone or inside shareable text)
+        if let urlRange = trimmed.range(of: #"(?:https?://|dawai://)[^\s]+"#, options: .regularExpression),
+           let url = URL(string: String(trimmed[urlRange])) {
+            if let token = handleIncomingURL(url) {
+                return token
+            }
+        }
+
+        // 2. Check if rawInput is directly a URL with query items
+        if let components = URLComponents(string: trimmed) {
+            if let payload = components.queryItems?.first(where: { $0.name == "payload" })?.value {
+                if let inv = ConnectionInvitation.decodeFromPayload(payload) {
+                    importDecodedInvitation(inv)
+                    return inv.token
+                }
+                if let bundle = PortablePatientSyncBundle.decodeFromPayload(payload) {
+                    importSyncBundle(bundle)
+                    return ""
+                }
+            }
+            if let token = components.queryItems?.first(where: { $0.name == "token" })?.value {
+                return token.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            }
+        }
+
+        // 3. Check if rawInput contains a Base64URL payload token (e.g. "eyJ..." either standalone or at the end of a pasted message)
+        if let b64Range = trimmed.range(of: #"eyJ[A-Za-z0-9_-]{30,}"#, options: .regularExpression) {
+            let candidate = String(trimmed[b64Range])
+            if let inv = ConnectionInvitation.decodeFromPayload(candidate) {
+                importDecodedInvitation(inv)
+                return inv.token
+            }
+        }
+
+        if trimmed.count > 40, let inv = ConnectionInvitation.decodeFromPayload(trimmed) {
+            importDecodedInvitation(inv)
+            return inv.token
+        }
+
+        // 4. Otherwise extract the last alphanumeric token (e.g. if user pasted "رمز الدعوة: abc123...")
+        if let tokenMatch = trimmed.range(of: #"[a-fA-F0-9]{8,32}$"#, options: .regularExpression) {
+            return String(trimmed[tokenMatch]).lowercased()
+        }
+
+        return trimmed.replacingOccurrences(of: "-", with: "").lowercased()
+    }
+
+    /// True when `url` is shaped like an invitation link (`dawai://invite...` or `https://.../invite/...`), valid or not.
+    public func isInviteLink(_ url: URL) -> Bool {
+        guard let scheme = url.scheme?.lowercased(),
+              scheme == "dawai" || scheme == "https" || scheme == "http" else {
+            return false
+        }
+        let host = url.host?.lowercased() ?? ""
+        let path = url.path.lowercased()
+        return host == "invite" || path.contains("invite")
+    }
+
+    /// Handles `dawai://invite?...`, `https://.../invite/?...`, and `dawai://sync?...` URLs. Returns the invitation token if it is an invite link.
+    @discardableResult
+    public func handleIncomingURL(_ url: URL) -> String? {
+        guard let scheme = url.scheme?.lowercased(),
+              scheme == "dawai" || scheme == "https" || scheme == "http",
+              let components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
+            return nil
+        }
+
+        let host = url.host?.lowercased() ?? ""
+        let path = url.path.lowercased()
+        let payload = components.queryItems?.first(where: { $0.name == "payload" })?.value
+        let token = components.queryItems?.first(where: { $0.name == "token" })?.value
+
+        if (host == "sync" || path.contains("sync")), let payload, let bundle = PortablePatientSyncBundle.decodeFromPayload(payload) {
+            importSyncBundle(bundle)
+            return nil
+        }
+
+        if let payload, let decodedInvite = ConnectionInvitation.decodeFromPayload(payload) {
+            importDecodedInvitation(decodedInvite)
+            return decodedInvite.token
+        }
+
+        return token
+    }
+
+    private func importDecodedInvitation(_ invitation: ConnectionInvitation) {
+        let tokenKey = invitation.token.lowercased()
+        if !outgoingInvitations.contains(where: { $0.id == invitation.id || $0.token.lowercased() == tokenKey }) &&
+           !incomingInvitations.contains(where: { $0.id == invitation.id || $0.token.lowercased() == tokenKey }) {
+            incomingInvitations.append(invitation)
+            persistState()
+        } else {
+            updateStoredInvitation(invitation)
+            persistState()
+        }
+    }
+
+    public func createSyncBundle(forPatient patientId: String, patientName: String) -> PortablePatientSyncBundle {
+        let rel = activeCaregiver(forPatient: patientId)
+        let meds = MedicationService.shared.medicationList(forPatient: patientId)
+        let requests = MedicationService.shared.pendingDeletionRequests.filter { $0.patientId == patientId }
+        let records = AdherenceService.shared.records(forPatient: patientId)
+        return PortablePatientSyncBundle(
+            patientId: patientId,
+            patientDisplayName: patientName,
+            relationship: rel,
+            medications: meds,
+            deletionRequests: requests,
+            doseRecords: records
+        )
+    }
+
+    public func importSyncBundle(_ bundle: PortablePatientSyncBundle) {
+        if let rel = bundle.relationship, rel.isActive {
+            activeRelationships.removeAll { $0.patientId == bundle.patientId }
+            activeRelationships.append(rel)
+            outgoingInvitations.removeAll { $0.initiatorId == bundle.patientId || $0.recipientId == bundle.patientId }
+            incomingInvitations.removeAll { $0.initiatorId == bundle.patientId || $0.recipientId == bundle.patientId }
+            persistState()
+        }
+        MedicationService.shared.importSyncedPatientData(
+            patientId: bundle.patientId,
+            medications: bundle.medications,
+            deletionRequests: bundle.deletionRequests
+        )
+        AdherenceService.shared.mergeImportedRecords(bundle.doseRecords, forPatient: bundle.patientId)
+        showToast("تمت مزامنة بيانات وأدوية \(bundle.patientDisplayName) بنجاح!")
+    }
+
     // MARK: - S#4: Validate Invitation (Link Opened)
     @discardableResult
     public func validateInvitation(token: String, recipient: UserIdentity) throws -> ConnectionInvitation {
+        let resolvedToken = extractAndImportToken(from: token)
+
         // Look up token in outgoing/shared invitations
-        guard let invitation = findInvitation(by: token) else {
+        guard let invitation = findInvitation(by: resolvedToken) else {
             throw InvitationError.tokenNotFound
         }
 
@@ -76,19 +266,27 @@ public final class RelationshipService: ObservableObject {
             )
         }
 
-        // Check if relationship already active
-        let alreadyActive = activeRelationships.contains { rel in
-            (rel.patientId == recipient.id && rel.caregiverId == invitation.initiatorId) ||
-            (rel.caregiverId == recipient.id && rel.patientId == invitation.initiatorId)
+        // Determine patient & caregiver in this pair
+        let patientId = invitation.initiatorRole == .patient ? invitation.initiatorId : recipient.id
+        let caregiverId = invitation.initiatorRole == .caregiver ? invitation.initiatorId : recipient.id
+
+        // Check if relationship already active with the same caregiver
+        let alreadyActiveWithSameCaregiver = activeRelationships.contains { rel in
+            rel.isActive && rel.patientId == patientId && rel.caregiverId == caregiverId
         }
-        if alreadyActive {
+        if alreadyActiveWithSameCaregiver {
             throw InvitationError.relationshipAlreadyExists
+        }
+
+        // Enforce max 3 Caregivers per Patient rule:
+        if hasReachedCaregiverLimit(forPatient: patientId) {
+            throw InvitationError.patientReachedCaregiverLimit
         }
 
         return invitation
     }
 
-    // MARK: - S#5: Recipient Reviews and Accepts Invitation
+    // MARK: - S#5: Recipient Reviews and Accepts Invitation (Immediate Two-Way Activation)
     @discardableResult
     public func acceptInvitation(token: String, recipient: UserIdentity) throws -> ConnectionInvitation {
         var invitation = try validateInvitation(token: token, recipient: recipient)
@@ -97,17 +295,62 @@ public final class RelationshipService: ObservableObject {
             throw InvitationError.invitationAlreadyProcessed
         }
 
-        invitation.status = .accepted
+        invitation.status = .confirmed
         invitation.recipientId = recipient.id
         invitation.recipientDisplayName = recipient.displayName
         invitation.recipientRole = recipient.role
         invitation.recipientKeyFingerprint = recipient.keyFingerprint
 
-        updateStoredInvitation(invitation)
-        
-        // S#5: Notify initiator that recipient accepted
-        showToast("قام \(recipient.displayName) بقبول دعوتك! يرجى تأكيد الاتصال.")
+        let (patientId, patientName, caregiverId, caregiverName): (String, String, String, String)
+        if invitation.initiatorRole == .patient {
+            patientId = invitation.initiatorId
+            patientName = invitation.initiatorDisplayName
+            caregiverId = recipient.id
+            caregiverName = recipient.displayName
+        } else {
+            patientId = recipient.id
+            patientName = recipient.displayName
+            caregiverId = invitation.initiatorId
+            caregiverName = invitation.initiatorDisplayName
+        }
+
+        let relationship = ActiveRelationship(
+            invitationId: invitation.id,
+            patientId: patientId,
+            patientDisplayName: patientName,
+            caregiverId: caregiverId,
+            caregiverDisplayName: caregiverName,
+            establishedAt: Date(),
+            isActive: true
+        )
+
+        // Remove confirmed invitation and any other pending invitations for this patient/caregiver pair
+        let tokenKey = invitation.token.lowercased()
+        outgoingInvitations.removeAll {
+            $0.id == invitation.id ||
+            $0.token.lowercased() == tokenKey ||
+            $0.initiatorId == patientId ||
+            $0.recipientId == patientId ||
+            $0.initiatorId == caregiverId ||
+            $0.recipientId == caregiverId
+        }
+        incomingInvitations.removeAll {
+            $0.id == invitation.id ||
+            $0.token.lowercased() == tokenKey ||
+            $0.initiatorId == patientId ||
+            $0.recipientId == patientId ||
+            $0.initiatorId == caregiverId ||
+            $0.recipientId == caregiverId
+        }
+
+        // Ensure patient has only this single active caregiver
+        activeRelationships.removeAll { $0.patientId == patientId }
+        activeRelationships.append(relationship)
+
+        showToast("تم ربط الحسابين وتفعيل الاتصال بنجاح بين \(patientName) و \(caregiverName)!")
         persistState()
+        CloudKitSyncManager.shared.publishRelationship(relationship)
+        MedicationService.shared.loadPersistedMedications()
 
         return invitation
     }
@@ -115,7 +358,8 @@ public final class RelationshipService: ObservableObject {
     // MARK: - Recipient Rejects Invitation
     /// Only a pending invitation that has not expired can be rejected.
     public func rejectInvitation(token: String, recipient: UserIdentity) throws {
-        guard var invitation = findInvitation(by: token) else {
+        let resolvedToken = extractAndImportToken(from: token)
+        guard var invitation = findInvitation(by: resolvedToken) else {
             throw InvitationError.tokenNotFound
         }
 
@@ -168,6 +412,7 @@ public final class RelationshipService: ObservableObject {
 
         // The former caregiver can no longer act on this patient's pending deletion requests
         for rel in ended {
+            CloudKitSyncManager.shared.publishRelationshipEnded(rel)
             MedicationService.shared.relationshipEnded(patientId: rel.patientId, caregiverId: rel.caregiverId)
         }
     }
@@ -198,10 +443,6 @@ public final class RelationshipService: ObservableObject {
             throw InvitationError.invitationNotAcceptedYet
         }
 
-        // Mark as confirmed (S#6)
-        invitation.status = .confirmed
-        outgoingInvitations[index] = invitation
-
         // S#7: Create Active Patient-Caregiver relationship
         let (patientId, patientName, caregiverId, caregiverName): (String, String, String, String)
         if initiator.role == .patient {
@@ -216,6 +457,14 @@ public final class RelationshipService: ObservableObject {
             caregiverName = initiator.displayName
         }
 
+        if hasReachedCaregiverLimit(forPatient: patientId) {
+            throw InvitationError.patientReachedCaregiverLimit
+        }
+
+        // Mark as confirmed (S#6)
+        invitation.status = .confirmed
+        outgoingInvitations[index] = invitation
+
         let relationship = ActiveRelationship(
             invitationId: invitation.id,
             patientId: patientId,
@@ -226,48 +475,112 @@ public final class RelationshipService: ObservableObject {
             isActive: true
         )
 
-        // Remove confirmed invitation and any duplicate tokens
+        // Remove confirmed invitation and any other invitations for this patient
         let tokenKey = invitation.token.lowercased()
-        outgoingInvitations.removeAll { $0.id == invitationId || $0.token.lowercased() == tokenKey }
-        incomingInvitations.removeAll { $0.id == invitationId || $0.token.lowercased() == tokenKey }
+        outgoingInvitations.removeAll {
+            $0.id == invitationId ||
+            $0.token.lowercased() == tokenKey ||
+            $0.initiatorId == patientId ||
+            $0.recipientId == patientId
+        }
+        incomingInvitations.removeAll {
+            $0.id == invitationId ||
+            $0.token.lowercased() == tokenKey ||
+            $0.initiatorId == patientId ||
+            $0.recipientId == patientId
+        }
 
-        activeRelationships.removeAll { $0.patientId == patientId && $0.caregiverId == caregiverId }
+        activeRelationships.removeAll { $0.patientId == patientId }
         activeRelationships.append(relationship)
 
         // S#8: Notify both users
         showToast("تم إنشاء الاتصال بنجاح وتفعيله بين \(patientName) و \(caregiverName)!")
         persistState()
+        CloudKitSyncManager.shared.publishRelationship(relationship)
+        MedicationService.shared.loadPersistedMedications()
 
         return relationship
     }
 
+    // MARK: - CloudKit Remote Sync Merge
+    /// Applies active and ended relationships pulled from CloudKit without re-publishing.
+    public func applyRemoteRelationships(active: [ActiveRelationship], endedIds: Set<UUID>) {
+        var changed = false
+
+        // 1. Remove any relationships ended remotely
+        if !endedIds.isEmpty {
+            let endedRelationships = activeRelationships.filter { endedIds.contains($0.id) }
+            if !endedRelationships.isEmpty {
+                activeRelationships.removeAll { endedIds.contains($0.id) }
+                changed = true
+                for rel in endedRelationships {
+                    MedicationService.shared.relationshipEnded(patientId: rel.patientId, caregiverId: rel.caregiverId)
+                }
+            }
+        }
+
+        // 2. Upsert active relationships from CloudKit and clear matching pending invitations
+        for rel in active where rel.isActive && !endedIds.contains(rel.id) {
+            // Remove any pending invitations associated with this link
+            outgoingInvitations.removeAll {
+                $0.id == rel.invitationId ||
+                $0.initiatorId == rel.patientId || $0.recipientId == rel.patientId ||
+                $0.initiatorId == rel.caregiverId || $0.recipientId == rel.caregiverId
+            }
+            incomingInvitations.removeAll {
+                $0.id == rel.invitationId ||
+                $0.initiatorId == rel.patientId || $0.recipientId == rel.patientId ||
+                $0.initiatorId == rel.caregiverId || $0.recipientId == rel.caregiverId
+            }
+
+            if let existingIdx = activeRelationships.firstIndex(where: { $0.id == rel.id }) {
+                if activeRelationships[existingIdx] != rel {
+                    activeRelationships[existingIdx] = rel
+                    changed = true
+                }
+            } else {
+                // Ensure no duplicate with same caregiver and enforce up to 3 caregivers per patient
+                activeRelationships.removeAll { $0.patientId == rel.patientId && $0.caregiverId == rel.caregiverId }
+                activeRelationships.append(rel)
+                changed = true
+            }
+        }
+
+        if changed {
+            persistState()
+            MedicationService.shared.refreshDerivedState()
+        }
+    }
+
     // MARK: - Developer / Testing Simulation Helper
-    /// Creates a simulated incoming invitation or marks an outgoing one as accepted for smooth demo testing
+    /// Simulates the opposite party accepting the invitation and uses the device's stored counterpart identity so role-switching matches seamlessly.
     public func simulateRecipientAcceptance(for invitationId: UUID, simulatedRecipientName: String = "سارة") {
         guard let index = outgoingInvitations.firstIndex(where: { $0.id == invitationId }) else { return }
         
         let oppositeRole: UserRole = outgoingInvitations[index].initiatorRole == .patient ? .caregiver : .patient
+        let counterpart = KeychainService.shared.loadOrCreateIdentity(forRole: oppositeRole, defaultName: simulatedRecipientName)
         outgoingInvitations[index].status = .accepted
-        outgoingInvitations[index].recipientId = "dawai_anon_sim_\(UUID().uuidString.prefix(6))"
-        outgoingInvitations[index].recipientDisplayName = simulatedRecipientName
+        outgoingInvitations[index].recipientId = counterpart.id
+        outgoingInvitations[index].recipientDisplayName = counterpart.displayName
         outgoingInvitations[index].recipientRole = oppositeRole
-        outgoingInvitations[index].recipientKeyFingerprint = "7a8b9c0d1e2f3a4b"
+        outgoingInvitations[index].recipientKeyFingerprint = counterpart.keyFingerprint
 
-        showToast("قام \(simulatedRecipientName) بقبول الدعوة! يمكنك الآن تأكيد الاتصال.")
+        showToast("قام \(counterpart.displayName) بقبول الدعوة! يمكنك الآن تأكيد الاتصال.")
         persistState()
     }
 
     public func simulateIncomingInvitation(fromName: String, fromRole: UserRole, currentRecipient: UserIdentity) -> ConnectionInvitation {
+        let counterpart = KeychainService.shared.loadOrCreateIdentity(forRole: fromRole, defaultName: fromName)
         let invitation = ConnectionInvitation(
-            initiatorId: "dawai_anon_sim_\(UUID().uuidString.prefix(6))",
-            initiatorDisplayName: fromName,
+            initiatorId: counterpart.id,
+            initiatorDisplayName: counterpart.displayName,
             initiatorRole: fromRole,
-            initiatorKeyFingerprint: "9f8e7d6c5b4a3a2b",
+            initiatorKeyFingerprint: counterpart.keyFingerprint,
             status: .pending
         )
         
         incomingInvitations.append(invitation)
-        showToast("وصلتك دعوة اتصال جديدة من \(fromName) (\(fromRole.titleArabic))")
+        showToast("وصلتك دعوة اتصال جديدة من \(counterpart.displayName) (\(fromRole.titleArabic))")
         persistState()
         return invitation
     }

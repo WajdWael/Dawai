@@ -14,6 +14,8 @@ public enum InvitationError: LocalizedError, Equatable {
     case incompatibleRoles(initiatorRole: UserRole, recipientRole: UserRole)
     case selfInvitation
     case relationshipAlreadyExists
+    case patientAlreadyHasCaregiver
+    case patientReachedCaregiverLimit
     case invitationNotAcceptedYet
     case invitationAlreadyProcessed
 
@@ -37,6 +39,9 @@ public enum InvitationError: LocalizedError, Equatable {
             
         case .relationshipAlreadyExists:
             return "توجد بالفعل علاقة ربط نشطة بينكما."
+
+        case .patientAlreadyHasCaregiver, .patientReachedCaregiverLimit:
+            return "وصل المستفيد إلى الحد الأقصى لمقدمي الرعاية (3 مقدمي رعاية كحد أقصى). يرجى إنهاء أحد الارتباطات الحالية قبل إضافة مقدم رعاية جديد."
             
         case .invitationNotAcceptedYet:
             return "لم يقم الطرف الآخر بقبول الدعوة بعد حتى تتمكن من تأكيدها."

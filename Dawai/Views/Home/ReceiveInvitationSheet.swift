@@ -29,7 +29,7 @@ public struct ReceiveInvitationSheet: View {
         NavigationStack {
             ScrollView {
                 VStack(spacing: 24) {
-                    // Header Icon & Text
+                    // Header Icon & Title
                     VStack(spacing: 12) {
                         ZStack {
                             Circle()
@@ -37,32 +37,56 @@ public struct ReceiveInvitationSheet: View {
                                 .frame(width: 72, height: 72)
 
                             Image(systemName: "envelope.open.fill")
-                                .font(.system(size: 32, weight: .bold))
+                                .dawaiFont(size: 32, weight: .bold)
                                 .foregroundStyle(Color.dawaiPrimary)
                         }
 
-                        Text("فحص وقبول دعوة الاتصال")
-                            .font(.system(size: 24, weight: .bold, design: .rounded))
-                            .foregroundStyle(.primary)
-
-                        Text("أدخل رمز الدعوة المرسل إليك أو تأكد من الرابط للمراجعة والقبول.")
-                            .font(.system(size: 15, weight: .medium))
-                            .foregroundStyle(.secondary)
-                            .multilineTextAlignment(.center)
-                            .padding(.horizontal, 16)
+                        if let invite = validatedInvitation {
+                            Text("\(invite.initiatorDisplayName) يدعوك للارتباط")
+                                .dawaiFont(size: 24, weight: .bold, design: .rounded)
+                                .foregroundStyle(.primary)
+                                .multilineTextAlignment(.center)
+                        } else {
+                            Text("دعوة ارتباط")
+                                .dawaiFont(size: 24, weight: .bold, design: .rounded)
+                                .foregroundStyle(.primary)
+                        }
                     }
                     .padding(.top, 16)
 
-                    // Token Input Field (if not already loaded)
+                    // Link Input Field (if not already loaded)
                     if validatedInvitation == nil {
                         VStack(alignment: .leading, spacing: 10) {
-                            Text("رمز الدعوة")
-                                .font(.system(size: 16, weight: .bold))
-                                .foregroundStyle(.primary)
+                            HStack {
+                                Text("رابط الدعوة")
+                                    .dawaiFont(size: 16, weight: .bold)
+                                    .foregroundStyle(.primary)
+
+                                Spacer()
+
+                                Button {
+                                    if let clip = UIPasteboard.general.string, !clip.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                        tokenInput = clip
+                                        validateToken()
+                                    }
+                                } label: {
+                                    HStack(spacing: 4) {
+                                        Image(systemName: "doc.on.clipboard")
+                                            .dawaiFont(size: 12, weight: .semibold)
+                                        Text("لصق وفحص")
+                                            .dawaiFont(size: 12, weight: .bold)
+                                    }
+                                    .foregroundStyle(Color.dawaiPrimary)
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 5)
+                                    .background(Color.dawaiPrimary.opacity(0.12), in: Capsule())
+                                }
+                                .buttonStyle(.plain)
+                            }
 
                             HStack {
-                                TextField("أدخل رمز الدعوة هنا", text: $tokenInput)
-                                    .font(.system(size: 16, weight: .medium, design: .monospaced))
+                                TextField("الصق رابط الدعوة هنا", text: $tokenInput)
+                                    .dawaiFont(size: 16, weight: .medium, design: .monospaced)
                                     .autocorrectionDisabled()
                                     .textInputAutocapitalization(.never)
                                     .multilineTextAlignment(.leading)
@@ -105,8 +129,8 @@ public struct ReceiveInvitationSheet: View {
                                     if isProcessing {
                                         ProgressView().tint(.white)
                                     }
-                                    Text("فحص الدعوة (UC-2 S#4)")
-                                        .font(.system(size: 17, weight: .bold))
+                                    Text("فحص الدعوة")
+                                        .dawaiFont(size: 17, weight: .bold)
                                 }
                                 .frame(maxWidth: .infinity)
                                 .padding(.vertical, 14)
@@ -135,47 +159,23 @@ public struct ReceiveInvitationSheet: View {
                     if let invitation = validatedInvitation {
                         VStack(alignment: .leading, spacing: 18) {
                             HStack {
-                                Text("تفاصيل الدعوة")
-                                    .font(.system(size: 18, weight: .bold))
-                                    .foregroundStyle(.primary)
-
-                                Spacer()
-
-                                Label("صالح تشفيرياً", systemImage: "checkmark.seal.fill")
-                                    .font(.system(size: 13, weight: .bold))
-                                    .foregroundStyle(Color.dawaiTaken)
-                            }
-
-                            Divider()
-
-                            HStack {
                                 Text("مرسل الدعوة")
-                                    .font(.system(size: 15, weight: .medium))
+                                    .dawaiFont(size: 15, weight: .medium)
                                     .foregroundStyle(.secondary)
                                 Spacer()
                                 Text(invitation.initiatorDisplayName)
-                                    .font(.system(size: 16, weight: .bold))
+                                    .dawaiFont(size: 16, weight: .bold)
                                     .foregroundStyle(.primary)
                             }
 
                             HStack {
                                 Text("دور المرسل")
-                                    .font(.system(size: 15, weight: .medium))
+                                    .dawaiFont(size: 15, weight: .medium)
                                     .foregroundStyle(.secondary)
                                 Spacer()
                                 Text(invitation.initiatorRole.titleArabic)
-                                    .font(.system(size: 15, weight: .bold))
+                                    .dawaiFont(size: 15, weight: .bold)
                                     .foregroundStyle(Color.dawaiPrimary)
-                            }
-
-                            HStack {
-                                Text("معرف المرسل المجهول")
-                                    .font(.system(size: 15, weight: .medium))
-                                    .foregroundStyle(.secondary)
-                                Spacer()
-                                Text(invitation.initiatorId)
-                                    .font(.system(size: 13, design: .monospaced))
-                                    .foregroundStyle(.secondary)
                             }
 
                             Divider()
@@ -187,8 +187,8 @@ public struct ReceiveInvitationSheet: View {
                                 } label: {
                                     HStack(spacing: 8) {
                                         Image(systemName: "checkmark.circle.fill")
-                                        Text("قبول الدعوة (S#5: Accept)")
-                                            .font(.system(size: 17, weight: .bold))
+                                        Text("قبول وتفعيل الارتباط")
+                                            .dawaiFont(size: 17, weight: .bold)
                                     }
                                     .frame(maxWidth: .infinity)
                                     .padding(.vertical, 14)
@@ -201,8 +201,8 @@ public struct ReceiveInvitationSheet: View {
                                 Button {
                                     rejectInvitation(invitation)
                                 } label: {
-                                    Text("رفض الدعوة (Reject)")
-                                        .font(.system(size: 16, weight: .bold))
+                                    Text("رفض الدعوة")
+                                        .dawaiFont(size: 16, weight: .bold)
                                         .frame(maxWidth: .infinity)
                                         .padding(.vertical, 12)
                                         .background(.ultraThinMaterial)
@@ -225,35 +225,6 @@ public struct ReceiveInvitationSheet: View {
                                 .stroke(Color.dawaiGlassBorder, lineWidth: 1)
                         )
                     }
-
-                    // Simulator Test Shortcuts (Debug & TestFlight only)
-                    if AppEnvironment.showsSimulatorTools {
-                        VStack(alignment: .leading, spacing: 10) {
-                            Text("وضع تجريبي")
-                                .font(.system(size: 14, weight: .bold))
-                                .foregroundStyle(.secondary)
-
-                            Button {
-                                let simulatedRole: UserRole = currentUser.role == .patient ? .caregiver : .patient
-                                let simulatedName = currentUser.role == .patient ? "سارة (مقدم رعاية)" : "عمر (مستفيد)"
-                                let simInvite = relationshipService.simulateIncomingInvitation(
-                                    fromName: simulatedName,
-                                    fromRole: simulatedRole,
-                                    currentRecipient: currentUser
-                                )
-                                tokenInput = simInvite.token
-                                validateToken()
-                            } label: {
-                                HStack {
-                                    Image(systemName: "wand.and.stars")
-                                    Text("توليد دعوة واردة متوافقة لتجربة القبول")
-                                        .font(.system(size: 14, weight: .semibold))
-                                }
-                                .foregroundStyle(Color.dawaiPrimary)
-                            }
-                        }
-                        .padding(.horizontal, 4)
-                    }
                 }
                 .padding(.horizontal, 20)
                 .padding(.bottom, 24)
@@ -269,16 +240,22 @@ public struct ReceiveInvitationSheet: View {
                     Button("إغلاق") {
                         dismiss()
                     }
-                    .font(.system(size: 16, weight: .semibold))
+                    .dawaiFont(size: 16, weight: .semibold)
                     .foregroundStyle(Color.dawaiPrimary)
                 }
             }
             .onAppear {
                 if !tokenInput.isEmpty {
                     validateToken()
+                } else if let clip = UIPasteboard.general.string,
+                          clip.contains("payload=") || clip.contains("dawai://") || clip.contains("Dawai/invite") || clip.contains("eyJ") {
+                    tokenInput = clip
+                    validateToken()
                 }
             }
         }
+        .environment(\.layoutDirection, .rightToLeft)
+        .environment(\.locale, Locale.dawaiArabic)
     }
 
     private func validateToken() {

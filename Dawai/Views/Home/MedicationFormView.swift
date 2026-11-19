@@ -71,6 +71,7 @@ public struct MedicationFormView: View {
     @State private var showingCameraView: Bool = false
     @State private var showingDeleteAlert: Bool = false
     @State private var isSaving: Bool = false
+    @State private var didInitializeForm: Bool = false
 
     public init(
         mode: MedicationFormMode = .add,
@@ -101,9 +102,9 @@ public struct MedicationFormView: View {
                     if let err = errorMessage {
                         HStack(spacing: 8) {
                             Image(systemName: "exclamationmark.triangle.fill")
-                                .font(.system(size: 14))
+                                .dawaiFont(size: 14)
                             Text(err)
-                                .font(.system(size: 13, weight: .semibold))
+                                .dawaiFont(size: 13, weight: .semibold)
                             Spacer()
                         }
                         .foregroundStyle(.white)
@@ -138,31 +139,31 @@ public struct MedicationFormView: View {
             .navigationTitle(currentHeaderTitle)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
+                ToolbarItem(placement: .topBarLeading) {
                     Button {
                         handleDismissOrBack()
                     } label: {
-                        if currentSubscreen == .main {
+                        if currentSubscreen == .main || currentSubscreen == .doseTime {
                             Text("إلغاء")
-                                .font(.system(size: 17, weight: .regular))
+                                .dawaiFont(size: 17, weight: .regular)
                         } else {
-                            HStack(spacing: 3) {
-                                Image(systemName: "chevron.backward")
-                                    .font(.system(size: 14, weight: .semibold))
-                                Text(currentSubscreen == .doseTime ? "إلغاء" : "رجوع")
-                                    .font(.system(size: 17, weight: .regular))
+                            HStack(spacing: 4) {
+                                Image(systemName: "chevron.right")
+                                    .dawaiFont(size: 14, weight: .semibold)
+                                Text("رجوع")
+                                    .dawaiFont(size: 17, weight: .regular)
                             }
                         }
                     }
                     .foregroundStyle(Color.dawaiPrimary)
                 }
 
-                ToolbarItem(placement: .confirmationAction) {
+                ToolbarItem(placement: .topBarTrailing) {
                     Button {
                         handleConfirmOrSave()
                     } label: {
                         Text(currentSubscreen == .main ? "حفظ" : "تم")
-                            .font(.system(size: 17, weight: .semibold))
+                            .dawaiFont(size: 17, weight: .semibold)
                     }
                     .foregroundStyle(Color.dawaiPrimary)
                     .disabled(isSaving)
@@ -210,22 +211,29 @@ public struct MedicationFormView: View {
                 }
             }
         }
+        .environment(\.layoutDirection, .rightToLeft)
+        .environment(\.locale, Locale.dawaiArabic)
     }
 
     // MARK: - Initializer for Edit Mode
     private func initializeFormValues() {
+        guard !didInitializeForm else { return }
+        didInitializeForm = true
+
         if case .edit(let item) = mode {
             self.name = item.name
             self.dosage = item.dosage
-            self.selectedTime = item.scheduledDate ?? Date()
+            self.selectedTime = dateFromItem(item)
             self.hasConfiguredTime = true
-            self.selectedDays = item.days.isEmpty ? ["كل يوم"] : item.days
+            self.selectedDays = item.selectedWeekdays.isEmpty
+                ? (item.days.isEmpty ? ["كل يوم"] : item.days)
+                : MedicationWeekday.displayDays(from: item.selectedWeekdays)
             
             let standardFrequencies = ["مرة يوميًا", "كل 4 ساعات", "كل 6 ساعات", "كل 8 ساعات", "كل 12 ساعة"]
             if standardFrequencies.contains(item.frequency) {
                 self.selectedFrequency = item.frequency
             } else {
-                self.selectedFrequency = "حسب أيام محددة\\أوقات محددة"
+                self.selectedFrequency = "تكرار مخصص"
                 self.customFrequencyText = item.frequency
             }
 
@@ -280,12 +288,12 @@ public struct MedicationFormView: View {
             VStack(spacing: 0) {
                 HStack {
                     Text("اسم الدواء")
-                        .font(.system(size: 17, weight: .regular))
+                        .dawaiFont(size: 17, weight: .regular)
                         .foregroundStyle(.primary)
                         .frame(width: 90, alignment: .leading)
 
                     TextField("مثال: ميتروفين", text: $name)
-                        .font(.system(size: 17))
+                        .dawaiFont(size: 17)
                 }
                 .padding(.horizontal, 16)
                 .frame(minHeight: 48)
@@ -294,12 +302,12 @@ public struct MedicationFormView: View {
 
                 HStack {
                     Text("الجرعة")
-                        .font(.system(size: 17, weight: .regular))
+                        .dawaiFont(size: 17, weight: .regular)
                         .foregroundStyle(.primary)
                         .frame(width: 90, alignment: .leading)
 
                     TextField("نصف حبة - حبتين، 10 مل", text: $dosage)
-                        .font(.system(size: 17))
+                        .dawaiFont(size: 17)
                 }
                 .padding(.horizontal, 16)
                 .frame(minHeight: 48)
@@ -316,29 +324,29 @@ public struct MedicationFormView: View {
                 } label: {
                     HStack {
                         Text("وقت الجرعة")
-                            .font(.system(size: 17, weight: .regular))
+                            .dawaiFont(size: 17, weight: .regular)
                             .foregroundStyle(.primary)
 
                         Spacer()
 
                         if hasConfiguredTime {
                             VStack(alignment: .trailing, spacing: 2) {
-                                Text(timeFormatter.string(from: selectedTime))
-                                    .font(.system(size: 17, weight: .semibold))
+                                Text(formatDoseTime(selectedTime))
+                                    .dawaiFont(size: 17, weight: .semibold)
                                     .foregroundStyle(Color.dawaiPrimary)
 
                                 Text("\(selectedFrequencySummary) • \(selectedDays.joined(separator: "، "))")
-                                    .font(.system(size: 12))
+                                    .dawaiFont(size: 12)
                                     .foregroundStyle(.secondary)
                             }
                         } else {
                             Text("اضف وقت الجرعة")
-                                .font(.system(size: 17, weight: .regular))
+                                .dawaiFont(size: 17, weight: .regular)
                                 .foregroundStyle(.secondary)
                         }
 
-                        Image(systemName: "chevron.forward")
-                            .font(.system(size: 14, weight: .semibold))
+                        Image(systemName: "chevron.left")
+                            .dawaiFont(size: 14, weight: .semibold)
                             .foregroundStyle(Color(uiColor: .tertiaryLabel))
                     }
                     .padding(.horizontal, 16)
@@ -353,12 +361,12 @@ public struct MedicationFormView: View {
             VStack(spacing: 0) {
                 HStack {
                     Text("تعليمات")
-                        .font(.system(size: 17, weight: .regular))
+                        .dawaiFont(size: 17, weight: .regular)
                         .foregroundStyle(.primary)
                         .frame(width: 90, alignment: .leading)
 
                     TextField("مثال: بعد الإفطار", text: $instructions)
-                        .font(.system(size: 17))
+                        .dawaiFont(size: 17)
                 }
                 .padding(.horizontal, 16)
                 .frame(minHeight: 48)
@@ -369,21 +377,44 @@ public struct MedicationFormView: View {
             // Section 4: Medication Image
             VStack(spacing: 0) {
                 if let data = imageData, let uiImage = UIImage(data: data) {
-                    ZStack(alignment: .topTrailing) {
-                        Image(uiImage: uiImage)
-                            .resizable()
-                            .scaledToFill()
-                            .frame(maxWidth: .infinity)
-                            .frame(height: 140)
-                            .clipped()
+                    VStack(spacing: 0) {
+                        ZStack(alignment: .topTrailing) {
+                            Image(uiImage: uiImage)
+                                .resizable()
+                                .scaledToFill()
+                                .frame(maxWidth: .infinity)
+                                .frame(height: 160)
+                                .clipped()
+
+                            Button {
+                                withAnimation { self.imageData = nil }
+                            } label: {
+                                Image(systemName: "xmark.circle.fill")
+                                    .dawaiFont(size: 24)
+                                    .foregroundStyle(.white, Color.black.opacity(0.65))
+                                    .padding(10)
+                            }
+                            .buttonStyle(.plain)
+                        }
+
+                        Divider()
 
                         Button {
-                            withAnimation { self.imageData = nil }
+                            showingCameraView = true
                         } label: {
-                            Image(systemName: "xmark.circle.fill")
-                                .font(.system(size: 22))
-                                .foregroundStyle(.white, Color.black.opacity(0.6))
-                                .padding(8)
+                            HStack(spacing: 8) {
+                                Image(systemName: "camera.rotate")
+                                    .dawaiFont(size: 15, weight: .semibold)
+                                Text("تغيير صورة الدواء")
+                                    .dawaiFont(size: 15, weight: .semibold)
+                                Spacer()
+                                Image(systemName: "chevron.left")
+                                    .dawaiFont(size: 14, weight: .semibold)
+                                    .foregroundStyle(Color(uiColor: .tertiaryLabel))
+                            }
+                            .foregroundStyle(Color.dawaiPrimary)
+                            .padding(.horizontal, 16)
+                            .frame(minHeight: 44)
                         }
                         .buttonStyle(.plain)
                     }
@@ -393,12 +424,15 @@ public struct MedicationFormView: View {
                     } label: {
                         HStack {
                             Image(systemName: "camera")
-                                .font(.system(size: 18))
+                                .dawaiFont(size: 18)
                                 .foregroundStyle(Color.dawaiPrimary)
                             Text("إضافة صورة الدواء")
-                                .font(.system(size: 17, weight: .regular))
+                                .dawaiFont(size: 17, weight: .regular)
                                 .foregroundStyle(Color.dawaiPrimary)
                             Spacer()
+                            Image(systemName: "chevron.left")
+                                .dawaiFont(size: 14, weight: .semibold)
+                                .foregroundStyle(Color(uiColor: .tertiaryLabel))
                         }
                         .padding(.horizontal, 16)
                         .frame(minHeight: 48)
@@ -417,7 +451,7 @@ public struct MedicationFormView: View {
                     HStack {
                         Spacer()
                         Text("حذف الدواء")
-                            .font(.system(size: 17, weight: .regular))
+                            .dawaiFont(size: 17, weight: .regular)
                             .foregroundStyle(Color.red)
                         Spacer()
                     }
@@ -433,10 +467,11 @@ public struct MedicationFormView: View {
     // MARK: - 3. Screen 2: Dose Time Content ("اضف وقت الجرعة" - Pure Apple Clock Alarm Style)
     private var doseTimeContent: some View {
         VStack(spacing: 24) {
-            // Apple Clock Bare Wheel Time Picker (Completely native, no card, no glass, no shadow)
+            // Apple Clock Bare Wheel Time Picker (Completely native, with explicit LTR wheel geometry so digits & am/pm scroll smoothly in Arabic RTL)
             DatePicker("", selection: $selectedTime, displayedComponents: .hourAndMinute)
                 .datePickerStyle(.wheel)
                 .labelsHidden()
+                .environment(\.layoutDirection, .leftToRight)
                 .frame(height: 216)
                 .frame(maxWidth: .infinity)
 
@@ -450,18 +485,18 @@ public struct MedicationFormView: View {
                 } label: {
                     HStack {
                         Text("الايام")
-                            .font(.system(size: 17, weight: .regular))
+                            .dawaiFont(size: 17, weight: .regular)
                             .foregroundStyle(.primary)
 
                         Spacer()
 
                         Text(selectedDays.joined(separator: "، "))
-                            .font(.system(size: 17, weight: .regular))
+                            .dawaiFont(size: 17, weight: .regular)
                             .foregroundStyle(.secondary)
                             .lineLimit(1)
 
-                        Image(systemName: "chevron.forward")
-                            .font(.system(size: 14, weight: .semibold))
+                        Image(systemName: "chevron.left")
+                            .dawaiFont(size: 14, weight: .semibold)
                             .foregroundStyle(Color(uiColor: .tertiaryLabel))
                     }
                     .padding(.horizontal, 16)
@@ -480,18 +515,18 @@ public struct MedicationFormView: View {
                 } label: {
                     HStack {
                         Text("التكرار خلال اليوم")
-                            .font(.system(size: 17, weight: .regular))
+                            .dawaiFont(size: 17, weight: .regular)
                             .foregroundStyle(.primary)
 
                         Spacer()
 
                         Text(selectedFrequencySummary)
-                            .font(.system(size: 17, weight: .regular))
+                            .dawaiFont(size: 17, weight: .regular)
                             .foregroundStyle(.secondary)
                             .lineLimit(1)
 
-                        Image(systemName: "chevron.forward")
-                            .font(.system(size: 14, weight: .semibold))
+                        Image(systemName: "chevron.left")
+                            .dawaiFont(size: 14, weight: .semibold)
                             .foregroundStyle(Color(uiColor: .tertiaryLabel))
                     }
                     .padding(.horizontal, 16)
@@ -510,18 +545,18 @@ public struct MedicationFormView: View {
                 } label: {
                     HStack {
                         Text("المدة")
-                            .font(.system(size: 17, weight: .regular))
+                            .dawaiFont(size: 17, weight: .regular)
                             .foregroundStyle(.primary)
 
                         Spacer()
 
                         Text(selectedDurationSummary)
-                            .font(.system(size: 17, weight: .regular))
+                            .dawaiFont(size: 17, weight: .regular)
                             .foregroundStyle(.secondary)
                             .lineLimit(1)
 
-                        Image(systemName: "chevron.forward")
-                            .font(.system(size: 14, weight: .semibold))
+                        Image(systemName: "chevron.left")
+                            .dawaiFont(size: 14, weight: .semibold)
                             .foregroundStyle(Color(uiColor: .tertiaryLabel))
                     }
                     .padding(.horizontal, 16)
@@ -577,12 +612,12 @@ public struct MedicationFormView: View {
 
                     HStack(spacing: 12) {
                         Text("المدة")
-                            .font(.system(size: 17, weight: .regular))
+                            .dawaiFont(size: 17, weight: .regular)
                             .foregroundStyle(.secondary)
 
                         TextField("مثال: 10", text: $customDurationValue)
                             .keyboardType(.numberPad)
-                            .font(.system(size: 17))
+                            .dawaiFont(size: 17)
 
                         Spacer()
 
@@ -668,7 +703,7 @@ public struct MedicationFormView: View {
     ]
 
     private var isCustomFrequencySelected: Bool {
-        selectedFrequency == "حسب أيام محددة\\أوقات محددة"
+        selectedFrequency == "تكرار مخصص"
     }
 
     private var frequencyContent: some View {
@@ -694,8 +729,8 @@ public struct MedicationFormView: View {
             // The last option: iOS Dropdown Menu for custom frequency
             VStack(spacing: 0) {
                 HStack {
-                    Text("حسب أيام محددة\\أوقات محددة")
-                        .font(.system(size: 17, weight: .regular))
+                    Text("تكرار مخصص")
+                        .dawaiFont(size: 17, weight: .regular)
                         .foregroundStyle(.primary)
 
                     Spacer()
@@ -728,35 +763,20 @@ public struct MedicationFormView: View {
                                 HStack { Text("شهرياً"); if customFrequencyText == "شهرياً" { Image(systemName: "checkmark") } }
                             }
                         }
-
-                        Section("حسب الحاجة والمواعيد") {
-                            Button { selectCustomFrequencyPreset("عند اللزوم / الحاجة") } label: {
-                                HStack { Text("عند اللزوم / الحاجة"); if customFrequencyText == "عند اللزوم / الحاجة" { Image(systemName: "checkmark") } }
-                            }
-                            Button { selectCustomFrequencyPreset("قبل النوم") } label: {
-                                HStack { Text("قبل النوم"); if customFrequencyText == "قبل النوم" { Image(systemName: "checkmark") } }
-                            }
-                            Button { selectCustomFrequencyPreset("مع الوجبات") } label: {
-                                HStack { Text("مع الوجبات"); if customFrequencyText == "مع الوجبات" { Image(systemName: "checkmark") } }
-                            }
-                            Button { selectCustomFrequencyPreset("على الريق") } label: {
-                                HStack { Text("على الريق"); if customFrequencyText == "على الريق" { Image(systemName: "checkmark") } }
-                            }
-                        }
                     } label: {
                         HStack(spacing: 4) {
                             Text(customFrequencyMenuTitle)
-                                .font(.system(size: 16))
+                                .dawaiFont(size: 16)
                                 .foregroundStyle(.secondary)
                             Image(systemName: "chevron.up.chevron.down")
-                                .font(.system(size: 12))
+                                .dawaiFont(size: 12)
                                 .foregroundStyle(Color(uiColor: .tertiaryLabel))
                         }
                     }
 
                     if isCustomFrequencySelected {
                         Image(systemName: "checkmark")
-                            .font(.system(size: 15, weight: .semibold))
+                            .dawaiFont(size: 15, weight: .semibold)
                             .foregroundStyle(Color.dawaiPrimary)
                     }
                 }
@@ -765,7 +785,7 @@ public struct MedicationFormView: View {
                 .contentShape(Rectangle())
                 .onTapGesture {
                     withAnimation(.easeInOut(duration: 0.2)) {
-                        selectedFrequency = "حسب أيام محددة\\أوقات محددة"
+                        selectedFrequency = "تكرار مخصص"
                     }
                 }
 
@@ -775,14 +795,14 @@ public struct MedicationFormView: View {
 
                     HStack {
                         TextField("مثال: 3 مرات يومياً، بعد الأكل", text: $customFrequencyText)
-                            .font(.system(size: 17))
+                            .dawaiFont(size: 17)
 
                         if !customFrequencyText.isEmpty {
                             Button {
                                 customFrequencyText = ""
                             } label: {
                                 Image(systemName: "xmark.circle.fill")
-                                    .font(.system(size: 16))
+                                    .dawaiFont(size: 16)
                                     .foregroundStyle(Color(uiColor: .tertiaryLabel))
                             }
                             .buttonStyle(.plain)
@@ -799,7 +819,7 @@ public struct MedicationFormView: View {
 
     private func selectCustomFrequencyPreset(_ preset: String) {
         withAnimation(.easeInOut(duration: 0.2)) {
-            self.selectedFrequency = "حسب أيام محددة\\أوقات محددة"
+            self.selectedFrequency = "تكرار مخصص"
             self.customFrequencyText = preset
         }
     }
@@ -813,9 +833,9 @@ public struct MedicationFormView: View {
     }
 
     private var selectedFrequencySummary: String {
-        if selectedFrequency == "حسب أيام محددة\\أوقات محددة" {
+        if selectedFrequency == "تكرار مخصص" {
             let trimmed = customFrequencyText.trimmingCharacters(in: .whitespacesAndNewlines)
-            return trimmed.isEmpty ? "حسب أيام محددة\\أوقات محددة" : trimmed
+            return trimmed.isEmpty ? "تكرار مخصص" : trimmed
         }
         return selectedFrequency
     }
@@ -824,14 +844,14 @@ public struct MedicationFormView: View {
         Button(action: action) {
             HStack {
                 Text(title)
-                    .font(.system(size: 17, weight: .regular))
+                    .dawaiFont(size: 17, weight: .regular)
                     .foregroundStyle(.primary)
 
                 Spacer()
 
                 if isSelected {
                     Image(systemName: "checkmark")
-                        .font(.system(size: 15, weight: .semibold))
+                        .dawaiFont(size: 15, weight: .semibold)
                         .foregroundStyle(Color.dawaiPrimary)
                 }
             }
@@ -848,7 +868,7 @@ public struct MedicationFormView: View {
 
         Task { @MainActor in
             do {
-                let timeStr = timeFormatter.string(from: selectedTime)
+                let timeStr = formatDoseTime(selectedTime)
                 let durationFinal = selectedDurationSummary
                 let freqFinal = selectedFrequencySummary
 
@@ -856,6 +876,7 @@ public struct MedicationFormView: View {
                 case .add:
                     // A caregiver adds to the linked patient's schedule; a patient adds to their own.
                     // MedicationService re-checks and enforces this owner.
+                    let structuredWeekdays = MedicationWeekday.parseWeekdayNumbers(from: selectedDays)
                     let newMedication = MedicationItem(
                         patientId: currentUser.role == .caregiver ? (targetPatient?.patientId ?? "") : currentUser.id,
                         name: name,
@@ -863,6 +884,7 @@ public struct MedicationFormView: View {
                         timeString: timeStr,
                         scheduledDate: selectedTime,
                         days: selectedDays,
+                        selectedWeekdays: structuredWeekdays,
                         frequency: freqFinal,
                         duration: durationFinal,
                         instructions: instructions.isEmpty ? nil : instructions,
@@ -877,12 +899,14 @@ public struct MedicationFormView: View {
                     )
 
                 case .edit(let existing):
+                    let structuredWeekdays = MedicationWeekday.parseWeekdayNumbers(from: selectedDays)
                     var updated = existing
                     updated.name = name
                     updated.dosage = dosage
                     updated.timeString = timeStr
                     updated.scheduledDate = selectedTime
                     updated.days = selectedDays
+                    updated.selectedWeekdays = structuredWeekdays
                     updated.frequency = freqFinal
                     updated.duration = durationFinal
                     updated.instructions = instructions.isEmpty ? nil : instructions
@@ -911,10 +935,25 @@ public struct MedicationFormView: View {
         }
     }
 
-    private var timeFormatter: DateFormatter {
-        let formatter = DateFormatter()
-        formatter.locale = Locale.dawaiArabic
-        formatter.dateFormat = "hh:mm a"
-        return formatter
+    private func formatDoseTime(_ date: Date) -> String {
+        let calendar = Calendar.current
+        let comps = calendar.dateComponents([.hour, .minute], from: date)
+        let totalMinutes = (comps.hour ?? 0) * 60 + (comps.minute ?? 0)
+        return medicationService.formattedTimeString(forSlotMinutes: totalMinutes)
+    }
+
+    private func dateFromItem(_ item: MedicationItem) -> Date {
+        if let scheduledDate = item.scheduledDate {
+            return scheduledDate
+        }
+        // Extract hour & minute from item.timeString (e.g. "07:36 م" / "11:30 ص")
+        let totalMinutes = medicationService.scheduledMinutes(for: item)
+        let hour = totalMinutes / 60
+        let minute = totalMinutes % 60
+        var comps = Calendar.current.dateComponents([.year, .month, .day], from: Date())
+        comps.hour = hour
+        comps.minute = minute
+        comps.second = 0
+        return Calendar.current.date(from: comps) ?? Date()
     }
 }

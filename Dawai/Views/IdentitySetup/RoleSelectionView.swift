@@ -26,7 +26,7 @@ public struct RoleSelectionView: View {
                 // Header Title: كيف رح تستخدم التطبيق؟
                 // In RTL, .leading aligns to the RIGHT side of the screen.
                 Text("كيف رح تستخدم التطبيق؟")
-                    .font(.system(size: 32, weight: .bold))
+                    .dawaiFont(size: 32, weight: .bold)
                     .foregroundStyle(.primary)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.horizontal, 24)
@@ -100,19 +100,19 @@ private struct ArabicRoleCard: View {
             HStack(spacing: 16) {
                 // 1. Icon appears on the RIGHT (leading edge in RTL)
                 Image(systemName: systemImage)
-                    .font(.system(size: 28, weight: .semibold))
+                    .dawaiFont(size: 28, weight: .semibold)
                     .foregroundStyle(Color.dawaiPrimary)
                     .frame(width: 36, height: 36)
 
                 // 2. Arabic Text appears next to the icon (leading-aligned in RTL)
                 VStack(alignment: .leading, spacing: 4) {
                     Text(title)
-                        .font(.system(size: 20, weight: .bold))
+                        .dawaiFont(size: 20, weight: .bold)
                         .foregroundStyle(Color.dawaiPrimary)
 
                     if let subtitle = subtitle {
                         Text(subtitle)
-                            .font(.system(size: 15, weight: .medium))
+                            .dawaiFont(size: 15, weight: .medium)
                             .foregroundStyle(Color(uiColor: .secondaryLabel))
                     }
                 }

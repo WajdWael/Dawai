@@ -17,8 +17,8 @@ import Combine
 
 /// Single source of truth for dose confirmation windows and retroactive missed-dose evaluation.
 public enum DoseWindowConfig {
-    /// Minutes before the scheduled time when the "اخذت الدواء" button activates.
-    public static let preWindowMinutes: Int = 15
+    /// Minutes before the scheduled time when the "اخذت الدواء" button activates (0 means it activates exactly at dose time).
+    public static let preWindowMinutes: Int = 0
     /// Minutes after the scheduled time before a dose is considered late (triggers UC-5 alert).
     public static let lateThresholdMinutes: Int = 30
     /// Minutes after the scheduled time when an unconfirmed dose transitions from late to missed ("فائتة").
@@ -131,33 +131,21 @@ public final class DemoModeService: ObservableObject {
     @Published public private(set) var isActive: Bool
 
     private init() {
-        #if DEBUG
         isActive = UserDefaults.standard.bool(forKey: storageKey)
-        #else
-        isActive = false
-        #endif
     }
 
     /// Demo beneficiaries shown to a caregiver while demo mode is on.
     public var beneficiaries: [BeneficiarySummary] {
-        #if DEBUG
         guard isActive else { return [] }
         return HomeMockData.beneficiaries.filter { !$0.isInvitation }
-        #else
-        return []
-        #endif
     }
 
     /// True if `idOrName` belongs to a demo beneficiary and demo mode is on.
     public func isDemoPatient(_ idOrName: String) -> Bool {
-        #if DEBUG
         guard isActive else { return false }
         return HomeMockData.beneficiaries.contains {
             $0.patientId == idOrName || $0.id.uuidString == idOrName || $0.name == idOrName
         }
-        #else
-        return false
-        #endif
     }
 
     /// Forgets the demo flag (used when all local data is wiped).
@@ -166,7 +154,6 @@ public final class DemoModeService: ObservableObject {
         isActive = false
     }
 
-    #if DEBUG
     /// Loads sample medications and dose history, and turns demo mode on.
     @MainActor
     public func enable() {
@@ -184,6 +171,5 @@ public final class DemoModeService: ObservableObject {
         UserDefaults.standard.set(false, forKey: storageKey)
         isActive = false
     }
-    #endif
 }
 

@@ -9,6 +9,20 @@
 
 import SwiftUI
 
+private enum HomeModalSheet: Identifiable {
+    case invite(String)
+    case doseConfirmation(UUID)
+
+    var id: String {
+        switch self {
+        case .invite(let token):
+            return "invite_\(token)"
+        case .doseConfirmation(let medId):
+            return "dose_\(medId.uuidString)"
+        }
+    }
+}
+
 public struct HomeView: View {
     let identity: UserIdentity
     @EnvironmentObject private var appState: AppState
@@ -16,6 +30,27 @@ public struct HomeView: View {
 
     public init(identity: UserIdentity) {
         self.identity = identity
+    }
+
+    private var activeModalSheet: Binding<HomeModalSheet?> {
+        Binding(
+            get: {
+                if let token = appState.pendingInviteToken {
+                    return .invite(token)
+                }
+                if let medId = appState.pendingDoseConfirmationMedicationId {
+                    return .doseConfirmation(medId)
+                }
+                return nil
+            },
+            set: { newValue in
+                if newValue == nil {
+                    appState.pendingInviteToken = nil
+                    appState.pendingDoseConfirmationMedicationId = nil
+                    appState.pendingDoseConfirmationSlotMinutes = nil
+                }
+            }
+        )
     }
 
     public var body: some View {
@@ -27,37 +62,42 @@ public struct HomeView: View {
             }
         }
         .preferredColorScheme(themeService.colorScheme)
+        .environment(\.dawaiFontScale, themeService.fontScale)
+        .environment(\.dynamicTypeSize, themeService.dynamicTypeSize)
         .environment(\.layoutDirection, .rightToLeft)
         .environment(\.locale, Locale.dawaiArabic)
         .onAppear {
             themeService.applyThemeToApp()
+            CloudKitSyncManager.shared.startPeriodicSync()
+            Task {
+                await MedicationService.shared.requestNotificationPermissionIfNeeded()
+                if identity.role == .patient {
+                    _ = await MedicationAlarmService.shared.requestAuthorizationIfNeeded()
+                }
+            }
         }
-        .sheet(isPresented: Binding(
-            get: { appState.pendingInviteToken != nil },
-            set: { if !$0 { appState.pendingInviteToken = nil } }
-        )) {
-            if let token = appState.pendingInviteToken {
+        .sheet(item: activeModalSheet) { sheet in
+            switch sheet {
+            case .invite(let token):
                 ReceiveInvitationSheet(currentUser: identity, prefilledToken: token)
                     .preferredColorScheme(themeService.colorScheme)
-            }
-        }
-        .sheet(isPresented: Binding(
-            get: { appState.pendingDoseConfirmationMedicationId != nil },
-            set: { if !$0 { appState.pendingDoseConfirmationMedicationId = nil } }
-        )) {
-            if let medId = appState.pendingDoseConfirmationMedicationId,
-               let med = MedicationService.shared.medications.first(where: { $0.id == medId }) {
-                DoseConfirmationSheet(medication: med, currentUser: identity) {
-                    appState.pendingDoseConfirmationMedicationId = nil
-                } onDismiss: {
-                    appState.pendingDoseConfirmationMedicationId = nil
+            case .doseConfirmation(let medId):
+                if let med = MedicationService.shared.medications.first(where: { $0.id == medId })
+                    ?? MedicationService.shared.allMedications.first(where: { $0.id == medId }) {
+                    DoseConfirmationSheet(
+                        medication: med,
+                        slotMinutes: appState.pendingDoseConfirmationSlotMinutes,
+                        currentUser: identity
+                    ) {
+                        appState.pendingDoseConfirmationMedicationId = nil
+                        appState.pendingDoseConfirmationSlotMinutes = nil
+                    } onDismiss: {
+                        appState.pendingDoseConfirmationMedicationId = nil
+                        appState.pendingDoseConfirmationSlotMinutes = nil
+                    }
+                    .preferredColorScheme(themeService.colorScheme)
                 }
-                .preferredColorScheme(themeService.colorScheme)
             }
-        }
-        .sheet(item: $appState.pendingCaregiverBeneficiaryToOpen) { beneficiary in
-            CaregiverPatientDetailView(beneficiary: beneficiary)
-                .preferredColorScheme(themeService.colorScheme)
         }
     }
 }

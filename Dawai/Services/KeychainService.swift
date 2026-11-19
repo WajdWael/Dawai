@@ -17,6 +17,8 @@ public final class KeychainService {
     private let serviceIdentifier = "com.dawai.app.identity"
     private let privateKeyAccount = "anonymous_private_key"
     private let identityDataAccount = "anonymous_user_identity"
+    private let patientIdentityAccount = "anonymous_user_identity_patient"
+    private let caregiverIdentityAccount = "anonymous_user_identity_caregiver"
     
     // In-memory fallback for SwiftUI Previews & headless test environments
     private var inMemoryStore: [String: Data] = [:]
@@ -116,10 +118,52 @@ public final class KeychainService {
         load(forAccount: privateKeyAccount)
     }
 
-    /// Securely stores the UserIdentity JSON.
+    /// Securely stores the UserIdentity JSON (and remembers it for its specific role so switching roles preserves both identities).
+    @discardableResult
     public func saveUserIdentity(_ identity: UserIdentity) -> Bool {
         guard let encoded = try? JSONEncoder().encode(identity) else { return false }
+        let roleAccount = identity.role == .patient ? patientIdentityAccount : caregiverIdentityAccount
+        _ = save(data: encoded, forAccount: roleAccount)
         return save(data: encoded, forAccount: identityDataAccount)
+    }
+
+    /// Saves a role-specific identity without changing the currently active identity.
+    @discardableResult
+    public func saveRoleIdentity(_ identity: UserIdentity) -> Bool {
+        guard let encoded = try? JSONEncoder().encode(identity) else { return false }
+        let roleAccount = identity.role == .patient ? patientIdentityAccount : caregiverIdentityAccount
+        return save(data: encoded, forAccount: roleAccount)
+    }
+
+    /// Retrieves the stored UserIdentity for a specific role, if one was previously created on this device.
+    public func loadUserIdentity(forRole role: UserRole) -> UserIdentity? {
+        let roleAccount = role == .patient ? patientIdentityAccount : caregiverIdentityAccount
+        if let data = load(forAccount: roleAccount),
+           let decoded = try? JSONDecoder().decode(UserIdentity.self, from: data) {
+            return decoded
+        }
+        if let active = loadUserIdentity(), active.role == role {
+            return active
+        }
+        return nil
+    }
+
+    /// Loads an existing identity for `role`, or creates and persists a deterministic one so Patient & Caregiver accounts match across role switches.
+    public func loadOrCreateIdentity(forRole role: UserRole, defaultName: String? = nil) -> UserIdentity {
+        if let existing = loadUserIdentity(forRole: role) {
+            return existing
+        }
+        let cleanName = (defaultName ?? (role == .patient ? "المستفيد" : "مقدم الرعاية"))
+            .replacingOccurrences(of: "(مقدم رعاية)", with: "")
+            .replacingOccurrences(of: "(مستفيد)", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let created = UserIdentity(
+            role: role,
+            displayName: cleanName.isEmpty ? (role == .patient ? "المستفيد" : "مقدم الرعاية") : cleanName,
+            keyFingerprint: UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased().prefix(16).description
+        )
+        saveRoleIdentity(created)
+        return created
     }
 
     /// Retrieves the stored UserIdentity.
@@ -132,5 +176,7 @@ public final class KeychainService {
     public func clearAllCredentials() {
         delete(forAccount: privateKeyAccount)
         delete(forAccount: identityDataAccount)
+        delete(forAccount: patientIdentityAccount)
+        delete(forAccount: caregiverIdentityAccount)
     }
 }

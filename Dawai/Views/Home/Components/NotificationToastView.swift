@@ -26,12 +26,12 @@ public struct NotificationToastView: View {
                     .frame(width: 32, height: 32)
 
                 Image(systemName: "bell.badge.fill")
-                    .font(.system(size: 15))
+                    .dawaiFont(size: 15)
                     .foregroundStyle(.white)
             }
 
             Text(message)
-                .font(.system(size: 14, weight: .bold))
+                .dawaiFont(size: 14, weight: .bold)
                 .foregroundStyle(.primary)
                 .multilineTextAlignment(.leading)
                 .lineLimit(2)
@@ -42,7 +42,7 @@ public struct NotificationToastView: View {
                 onDismiss()
             } label: {
                 Image(systemName: "xmark")
-                    .font(.system(size: 13, weight: .bold))
+                    .dawaiFont(size: 13, weight: .bold)
                     .foregroundStyle(.secondary)
                     .frame(width: 28, height: 28)
                     .background(Color.black.opacity(0.04), in: Circle())

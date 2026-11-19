@@ -10,6 +10,7 @@
 import Foundation
 import Combine
 import SwiftUI
+import UIKit
 import UserNotifications
 
 @MainActor
@@ -22,16 +23,21 @@ public final class MedicationService: ObservableObject {
     @Published public private(set) var allMedications: [MedicationItem] = []
     /// Medications owned by the patient using this device (`currentPatientId`).
     @Published public private(set) var medications: [MedicationItem] = []
-    /// Patient whose schedule drives `medications`, `todayMedications`, `activeMedication`, `upcomingDoses` and `remainingDoses`.
+    /// Patient whose schedule drives `medications`, `todayMedications`, `activeMedications`, `activeMedication`, `upcomingDoses` and `remainingDoses`.
     @Published public private(set) var currentPatientId: String = MedicationItem.fallbackPatientId
+    @Published public var activeDoses: [ScheduledDose] = []
+    @Published public var activeMedications: [MedicationItem] = []
     @Published public var activeMedication: MedicationItem?
     @Published public var upcomingDoses: [UpcomingDose] = []
     /// Untaken doses scheduled for today. Always derived from the real schedule in `refreshDerivedState()`.
     @Published public var remainingDoses: Int = 0
 
     // MARK: - Use-Case 12 (UC-12): Today's Medications & Auto-Sorting State
+    @Published public private(set) var todayDoses: [ScheduledDose] = []
     @Published public private(set) var todayMedications: [MedicationItem] = []
+    @Published public private(set) var lastEvaluatedAt: Date = AppClock.shared.now
     private var timeProgressionTimer: AnyCancellable?
+    private var dayChangeCancellables = Set<AnyCancellable>()
 
     // MARK: - Use-Case 11 (UC-11): Collaborative Medication Deletion State
     @Published public private(set) var pendingDeletionRequests: [MedicationDeletionRequest] = []
@@ -42,17 +48,65 @@ public final class MedicationService: ObservableObject {
 
     /// Persistence for medications and deletion requests (UserDefaults today, replaceable later).
     private let store: any MedicationStore
+    private let adherenceService: AdherenceService
+    private let relationshipService: RelationshipService
+    private let schedulesSystemNotifications: Bool
     private let maxImageSizeBytes = 5 * 1024 * 1024 // 5 MB (UC-3 S#4)
+
+    // MARK: - Image Compression Helper
+    public static func compressAndNormalizeImage(_ image: UIImage, maxDimension: CGFloat = 900) -> (image: UIImage, data: Data)? {
+        let originalSize = image.size
+        guard originalSize.width > 0, originalSize.height > 0 else { return nil }
+
+        let maxSide = max(originalSize.width, originalSize.height)
+        let scaleFactor = maxSide > maxDimension ? (maxDimension / maxSide) : 1.0
+        let targetSize = CGSize(
+            width: round(originalSize.width * scaleFactor),
+            height: round(originalSize.height * scaleFactor)
+        )
+
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1.0
+        format.opaque = true
+        let renderer = UIGraphicsImageRenderer(size: targetSize, format: format)
+        let resizedImage = renderer.image { _ in
+            image.draw(in: CGRect(origin: .zero, size: targetSize))
+        }
+
+        var quality: CGFloat = 0.78
+        var jpegData = resizedImage.jpegData(compressionQuality: quality)
+        while let current = jpegData, current.count > 900_000, quality > 0.3 {
+            quality -= 0.15
+            jpegData = resizedImage.jpegData(compressionQuality: quality)
+        }
+
+        guard let finalData = jpegData else { return nil }
+        return (resizedImage, finalData)
+    }
 
     public static let doseReminderCategoryIdentifier = "DAWAI_DOSE_REMINDER_CATEGORY"
     public static let confirmDoseActionIdentifier = "DAWAI_CONFIRM_DOSE_ACTION"
 
-    public init(store: any MedicationStore = UserDefaultsMedicationStore()) {
+    public init(
+        store: any MedicationStore = UserDefaultsMedicationStore(),
+        adherenceService: AdherenceService? = nil,
+        relationshipService: RelationshipService? = nil,
+        enableTimersAndObservers: Bool = true,
+        schedulesSystemNotifications: Bool = true
+    ) {
         self.store = store
-        registerNotificationCategories()
+        self.adherenceService = adherenceService ?? .shared
+        self.relationshipService = relationshipService ?? .shared
+        self.schedulesSystemNotifications = schedulesSystemNotifications
+        if enableTimersAndObservers {
+            registerNotificationCategories()
+        }
         loadPersistedMedications()
         loadPersistedDeletionRequests()
-        setupTimeProgressionTimer()
+        if enableTimersAndObservers {
+            setupTimeProgressionTimer()
+            setupDayChangeObservers()
+        }
     }
 
     private func registerNotificationCategories() {
@@ -72,11 +126,21 @@ public final class MedicationService: ObservableObject {
 
     // MARK: - UC-12 S#3: Time Progresses (Auto-updates schedule as time passes)
     private func setupTimeProgressionTimer() {
-        timeProgressionTimer = Timer.publish(every: 60, on: .main, in: .common)
+        timeProgressionTimer = Timer.publish(every: 15, on: .main, in: .common)
             .autoconnect()
             .sink { [weak self] _ in
                 self?.refreshDerivedState()
             }
+    }
+
+    private func setupDayChangeObservers() {
+        NotificationCenter.default.publisher(for: .NSCalendarDayChanged)
+            .merge(with: NotificationCenter.default.publisher(for: UIApplication.significantTimeChangeNotification))
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                self?.refreshDerivedState()
+            }
+            .store(in: &dayChangeCancellables)
     }
 
     // MARK: - Persistence & Initial State
@@ -100,7 +164,7 @@ public final class MedicationService: ObservableObject {
     private func reassignLegacyCaregiverMedications(identity: UserIdentity?) {
         guard let identity, identity.role == .caregiver else { return }
         let linkedPatientIds = Set(
-            RelationshipService.shared.activeRelationships
+            relationshipService.activeRelationships
                 .filter { $0.caregiverId == identity.id && $0.isActive }
                 .map(\.patientId)
         )
@@ -121,11 +185,261 @@ public final class MedicationService: ObservableObject {
         allMedications.filter { $0.patientId == patientId }
     }
 
+    /// Imports/synchronizes a patient's medications and deletion requests from a cross-device sync payload.
+    public func importSyncedPatientData(
+        patientId: String,
+        medications importedMeds: [MedicationItem],
+        deletionRequests importedRequests: [MedicationDeletionRequest]
+    ) {
+        allMedications.removeAll { $0.patientId == patientId }
+        let normalizedMeds = importedMeds.map { item -> MedicationItem in
+            var m = item
+            m.patientId = patientId
+            m.timeString = m.timeString.westernNumerals
+            m.dosage = m.dosage.westernNumerals
+            return m
+        }
+        allMedications.append(contentsOf: normalizedMeds)
+
+        pendingDeletionRequests.removeAll { $0.patientId == patientId }
+        pendingDeletionRequests.append(contentsOf: importedRequests.filter { $0.patientId == patientId })
+
+        persistMedications()
+        persistDeletionRequests()
+        refreshDerivedState()
+    }
+
+    /// Tracks which patients have completed at least one CloudKit pull in this session so initial backfill doesn't spam notifications.
+    private var syncedPatientsInSession = Set<String>()
+
+    /// Merges remote CloudKit state for `patientId` without re-publishing, syncs local iOS reminders on the patient's device,
+    /// and delivers real local notifications + toasts for cross-device updates (adds, edits, deletions, deletion requests, dose confirmations).
+    public func applyRemotePatientState(
+        patientId: String,
+        medications remoteMedications: [MedicationItem],
+        deletedMedicationIds: Set<UUID>,
+        deletionRequests remoteRequests: [MedicationDeletionRequest],
+        deletedRequestIds: Set<UUID>
+    ) {
+        let now = AppClock.shared.now
+        let calendar = Calendar.current
+        let currentIdentity = KeychainService.shared.loadUserIdentity()
+        let isLocalPatientDevice = currentIdentity?.id == patientId
+        let isLinkedCaregiverDevice = currentIdentity?.role == .caregiver
+            && relationshipService.activeRelationships.contains {
+                $0.caregiverId == currentIdentity?.id && $0.patientId == patientId && $0.isActive
+            }
+        let patientName = relationshipService.activeRelationships
+            .first(where: { $0.patientId == patientId })?.patientDisplayName ?? "المستفيد"
+        let hasCompletedInitialSync = syncedPatientsInSession.contains(patientId)
+
+        var medsChanged = false
+        var requestsChanged = false
+        var medsToSchedule: [MedicationItem] = []
+        var alertsToDeliver: [(title: String, body: String)] = []
+
+        // 1. Apply remote deletions
+        if !deletedMedicationIds.isEmpty {
+            let toRemove = allMedications.filter { $0.patientId == patientId && deletedMedicationIds.contains($0.id) }
+            if !toRemove.isEmpty {
+                for removed in toRemove {
+                    cancelReminder(id: removed.id)
+                    if hasCompletedInitialSync {
+                        if isLocalPatientDevice {
+                            alertsToDeliver.append((
+                                title: "تم حذف دواء من جدولك",
+                                body: "تم حذف دواء «\(removed.name)» وإلغاء تذكيراته."
+                            ))
+                        } else if isLinkedCaregiverDevice {
+                            alertsToDeliver.append((
+                                title: "حذف دواء • \(patientName)",
+                                body: "تم حذف دواء «\(removed.name)» من جدول \(patientName)."
+                            ))
+                        }
+                    }
+                }
+                allMedications.removeAll { $0.patientId == patientId && deletedMedicationIds.contains($0.id) }
+                medsChanged = true
+            }
+        }
+
+        // 2. Upsert remote medications (preserving same-day local confirmations)
+        for remote in remoteMedications where !deletedMedicationIds.contains(remote.id) {
+            var incoming = remote
+            incoming.patientId = patientId
+            incoming.timeString = incoming.timeString.westernNumerals
+            incoming.dosage = incoming.dosage.westernNumerals
+
+            if let idx = allMedications.firstIndex(where: { $0.id == incoming.id }) {
+                let existing = allMedications[idx]
+                let previousTodaySlotCount = existing.takenSlotsToday.values.filter {
+                    calendar.isDate($0, inSameDayAs: now)
+                }.count
+
+                // Merge same-day slot confirmations so neither side loses a freshly confirmed slot
+                for (slot, localTakenAt) in existing.takenSlotsToday where calendar.isDate(localTakenAt, inSameDayAs: now) {
+                    if incoming.takenSlotsToday[slot] == nil {
+                        incoming.takenSlotsToday[slot] = localTakenAt
+                    }
+                }
+                let slots = dailyDoseTimesMinutes(for: incoming)
+                if !incoming.takenSlotsToday.isEmpty {
+                    let todaySlots = incoming.takenSlotsToday.filter { calendar.isDate($0.value, inSameDayAs: now) }
+                    if !todaySlots.isEmpty {
+                        incoming.takenAt = todaySlots.values.max()
+                        incoming.isTaken = !slots.isEmpty && slots.allSatisfy { todaySlots[$0] != nil }
+                    }
+                }
+
+                if existing != incoming {
+                    let scheduleChanged =
+                        existing.timeString != incoming.timeString ||
+                        existing.frequency != incoming.frequency ||
+                        existing.days != incoming.days ||
+                        existing.selectedWeekdays != incoming.selectedWeekdays ||
+                        existing.name != incoming.name ||
+                        existing.dosage != incoming.dosage ||
+                        existing.instructions != incoming.instructions
+                    let newTodaySlotCount = incoming.takenSlotsToday.values.filter {
+                        calendar.isDate($0, inSameDayAs: now)
+                    }.count
+                    let doseNewlyConfirmed = newTodaySlotCount > previousTodaySlotCount || (!existing.isTaken && incoming.isTaken)
+
+                    allMedications[idx] = incoming
+                    medsChanged = true
+                    if isLocalPatientDevice && scheduleChanged {
+                        medsToSchedule.append(incoming)
+                    }
+
+                    if hasCompletedInitialSync {
+                        if isLinkedCaregiverDevice && scheduleChanged {
+                            alertsToDeliver.append((
+                                title: "تحديث دواء • \(patientName)",
+                                body: "قام \(patientName) بتعديل دواء «\(incoming.name)» (\(incoming.dosage) • \(incoming.timeString))."
+                            ))
+                        } else if isLinkedCaregiverDevice && doseNewlyConfirmed {
+                            alertsToDeliver.append((
+                                title: "تأكيد جرعة • \(patientName)",
+                                body: "أكد \(patientName) أخذ جرعة «\(incoming.name)» ✅"
+                            ))
+                        } else if isLocalPatientDevice && scheduleChanged {
+                            alertsToDeliver.append((
+                                title: "تم تحديث دواء في جدولك",
+                                body: "تم تعديل دواء «\(incoming.name)» (\(incoming.dosage) • \(incoming.timeString))."
+                            ))
+                        }
+                    }
+                }
+            } else {
+                allMedications.insert(incoming, at: 0)
+                medsChanged = true
+                if isLocalPatientDevice {
+                    medsToSchedule.append(incoming)
+                }
+                if hasCompletedInitialSync {
+                    if isLocalPatientDevice {
+                        alertsToDeliver.append((
+                            title: "دواء جديد في جدولك",
+                            body: "تمت إضافة دواء «\(incoming.name)» (\(incoming.dosage) • \(incoming.timeString)) وجدولة تنبيهاته."
+                        ))
+                    } else if isLinkedCaregiverDevice {
+                        alertsToDeliver.append((
+                            title: "إضافة دواء جديد • \(patientName)",
+                            body: "أضاف \(patientName) دواء «\(incoming.name)» (\(incoming.dosage) • \(incoming.timeString))."
+                        ))
+                    }
+                }
+            }
+        }
+
+        // 3. Apply remote deletion request removals & upserts
+        let beforeReqCount = pendingDeletionRequests.count
+        pendingDeletionRequests.removeAll { req in
+            req.patientId == patientId &&
+            (deletedRequestIds.contains(req.id) || deletedMedicationIds.contains(req.medicationId))
+        }
+        if pendingDeletionRequests.count != beforeReqCount {
+            requestsChanged = true
+        }
+
+        for remoteReq in remoteRequests
+        where remoteReq.patientId == patientId &&
+              !deletedRequestIds.contains(remoteReq.id) &&
+              !deletedMedicationIds.contains(remoteReq.medicationId) {
+            if let idx = pendingDeletionRequests.firstIndex(where: { $0.id == remoteReq.id }) {
+                if pendingDeletionRequests[idx] != remoteReq {
+                    pendingDeletionRequests[idx] = remoteReq
+                    requestsChanged = true
+                }
+            } else {
+                pendingDeletionRequests.append(remoteReq)
+                requestsChanged = true
+                if isLinkedCaregiverDevice {
+                    alertsToDeliver.append((
+                        title: "طلب حذف دواء من \(remoteReq.patientDisplayName)",
+                        body: "يطلب حذف دواء «\(remoteReq.medicationName)» (\(remoteReq.timeString)). افتح التطبيق للموافقة أو الرفض."
+                    ))
+                }
+            }
+        }
+
+        syncedPatientsInSession.insert(patientId)
+
+        if medsChanged {
+            persistMedications()
+        }
+        if requestsChanged {
+            persistDeletionRequests()
+        }
+        if medsChanged || requestsChanged {
+            refreshDerivedState(at: now)
+        }
+
+        if schedulesSystemNotifications && !medsToSchedule.isEmpty {
+            for med in medsToSchedule {
+                Task { _ = await self.scheduleReminder(for: med) }
+            }
+        }
+
+        if !alertsToDeliver.isEmpty {
+            if let latest = alertsToDeliver.last {
+                showToast("🔔 \(latest.title): \(latest.body)")
+            }
+            if schedulesSystemNotifications {
+                for alert in alertsToDeliver {
+                    deliverImmediateSyncNotification(title: alert.title, body: alert.body)
+                }
+            }
+        }
+    }
+
+    private func deliverImmediateSyncNotification(title: String, body: String) {
+        let enabled = UserDefaults.standard.object(forKey: "dawai_notifications_enabled") as? Bool ?? true
+        guard enabled else { return }
+
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        content.sound = .default
+
+        let trigger = UNTimeIntervalNotificationTrigger(timeInterval: 0.5, repeats: false)
+        let request = UNNotificationRequest(
+            identifier: "dawai_sync_alert_\(UUID().uuidString)",
+            content: content,
+            trigger: trigger
+        )
+        UNUserNotificationCenter.current().add(request)
+    }
+
     // MARK: - Reset (wipes all medication data on this device)
     public func resetAllData() {
-        let center = UNUserNotificationCenter.current()
-        center.removeAllPendingNotificationRequests()
-        center.removeAllDeliveredNotifications()
+        if schedulesSystemNotifications {
+            let center = UNUserNotificationCenter.current()
+            center.removeAllPendingNotificationRequests()
+            center.removeAllDeliveredNotifications()
+            MedicationAlarmService.shared.cancelAllAlarms()
+            DoseLiveActivityManager.shared.endAllActivities()
+        }
 
         allMedications = []
         pendingDeletionRequests = []
@@ -136,8 +450,7 @@ public final class MedicationService: ObservableObject {
         refreshDerivedState()
     }
 
-    #if DEBUG
-    // MARK: - Demo data (Debug builds only, loaded on request from Settings)
+    // MARK: - Demo data (Loaded on request from Settings for testing)
     public func loadDemoData() {
         // A patient owns the demo medications; on a caregiver's device they belong to the demo beneficiaries.
         let identity = KeychainService.shared.loadUserIdentity()
@@ -152,7 +465,6 @@ public final class MedicationService: ObservableObject {
         persistMedications()
         refreshDerivedState()
     }
-    #endif
 
     private func persistMedications() {
         store.saveMedications(allMedications)
@@ -180,80 +492,184 @@ public final class MedicationService: ObservableObject {
         case missed
     }
 
-    /// Computes the exact scheduled `Date` for `item` on the calendar day of `dayDate`.
-    public func scheduledDateTime(for item: MedicationItem, on dayDate: Date) -> Date {
+    /// Computes the exact scheduled `Date` for a dose slot (or primary dose time) of `item` on the calendar day of `dayDate`.
+    public func scheduledDateTime(for item: MedicationItem, on dayDate: Date, slotMinutes: Int? = nil) -> Date {
         let calendar = Calendar.current
-        let mins = scheduledMinutes(for: item)
+        let mins = slotMinutes ?? scheduledMinutes(for: item)
         return calendar.date(bySettingHour: mins / 60, minute: mins % 60, second: 0, of: dayDate) ?? dayDate
     }
 
-    /// Returns true when yesterday's scheduled dose was not yet recorded and its confirmation window extends past midnight into `date`.
-    private func hasActiveCarryoverFromYesterday(_ item: MedicationItem, at date: Date) -> Bool {
+    private func effectiveScheduleStart(for item: MedicationItem) -> Date {
+        max(item.createdAt, item.scheduleUpdatedAt)
+    }
+
+    /// True when the specific dose slot (`slotMinutes`) has already been taken on `date`.
+    public func isSlotTakenToday(_ item: MedicationItem, slotMinutes: Int, on date: Date) -> Bool {
+        let calendar = Calendar.current
+        if let slotTakenAt = item.takenSlotsToday[slotMinutes],
+           calendar.isDate(slotTakenAt, inSameDayAs: date) {
+            return true
+        }
+        if item.takenSlotsToday.isEmpty && slotMinutes == scheduledMinutes(for: item),
+           item.isTaken,
+           let takenAt = item.takenAt,
+           calendar.isDate(takenAt, inSameDayAs: date) {
+            return true
+        }
+        return adherenceService.hasTakenRecord(for: item.id, on: date, slotMinutes: slotMinutes)
+    }
+
+    private func hasActiveCarryoverFromYesterday(_ item: MedicationItem, slotMinutes: Int, at date: Date) -> Bool {
         let calendar = Calendar.current
         guard let yesterday = calendar.date(byAdding: .day, value: -1, to: date),
               isScheduledForToday(item, on: yesterday) else {
             return false
         }
-        let yesterdaySched = scheduledDateTime(for: item, on: yesterday)
-        let createdMinuteStart = calendar.date(bySetting: .second, value: 0, of: item.createdAt) ?? item.createdAt
-        if calendar.isDate(yesterday, inSameDayAs: item.createdAt) && yesterdaySched < createdMinuteStart {
+        let yesterdaySched = scheduledDateTime(for: item, on: yesterday, slotMinutes: slotMinutes)
+        let scheduleStart = effectiveScheduleStart(for: item)
+        let anchorMinuteStart = calendar.date(bySetting: .second, value: 0, of: scheduleStart) ?? scheduleStart
+        if yesterdaySched < anchorMinuteStart {
             return false
         }
-        guard !AdherenceService.shared.hasRecord(for: item.id, on: yesterday) else {
+        guard !adherenceService.hasRecord(for: item.id, on: yesterday, slotMinutes: slotMinutes) else {
             return false
         }
         let diffYesterdayMin = Int(floor(date.timeIntervalSince(yesterdaySched) / 60.0))
         return diffYesterdayMin >= -DoseWindowConfig.preWindowMinutes && diffYesterdayMin < DoseWindowConfig.missedCutoffMinutes
     }
 
-    /// Returns the active occurrence `Date` (yesterday carryover if still open past midnight, otherwise today's scheduled `Date`).
-    private func activeOccurrenceDate(for item: MedicationItem, at date: Date) -> Date {
-        if hasActiveCarryoverFromYesterday(item, at: date),
-           let yesterday = Calendar.current.date(byAdding: .day, value: -1, to: date) {
-            return scheduledDateTime(for: item, on: yesterday)
+    /// Returns true when yesterday's scheduled dose (for any slot) was not yet recorded and its confirmation window extends past midnight into `date`.
+    private func hasActiveCarryoverFromYesterday(_ item: MedicationItem, at date: Date) -> Bool {
+        dailyDoseTimesMinutes(for: item).contains { slotMin in
+            hasActiveCarryoverFromYesterday(item, slotMinutes: slotMin, at: date)
         }
-        return scheduledDateTime(for: item, on: date)
     }
 
-    /// Evaluates the current interaction state of a scheduled medication for today (including midnight carryover from yesterday)
-    public func doseInteractionState(for item: MedicationItem, at date: Date? = nil) -> DoseInteractionState {
+    /// Returns the active occurrence `Date` (yesterday carryover if still open past midnight, otherwise today's scheduled `Date`).
+    private func activeOccurrenceDate(for item: MedicationItem, at date: Date) -> Date {
+        let slots = dailyDoseTimesMinutes(for: item)
+        if let carryoverSlot = slots.first(where: { hasActiveCarryoverFromYesterday(item, slotMinutes: $0, at: date) }),
+           let yesterday = Calendar.current.date(byAdding: .day, value: -1, to: date) {
+            return scheduledDateTime(for: item, on: yesterday, slotMinutes: carryoverSlot)
+        }
+        let primary = slots.first ?? scheduledMinutes(for: item)
+        return scheduledDateTime(for: item, on: date, slotMinutes: primary)
+    }
+
+    /// Evaluates the interaction state for a single scheduled dose slot (either today or yesterday midnight carryover).
+    public func doseInteractionState(
+        for item: MedicationItem,
+        slotMinutes: Int,
+        at date: Date? = nil,
+        isCarryover: Bool = false
+    ) -> DoseInteractionState {
         let effectiveDate = date ?? AppClock.shared.now
         let calendar = Calendar.current
 
-        if item.isTaken {
-            if let takenAt = item.takenAt {
-                if calendar.isDate(takenAt, inSameDayAs: effectiveDate) {
-                    return .taken
-                }
-            } else {
+        if isCarryover {
+            guard let yesterday = calendar.date(byAdding: .day, value: -1, to: effectiveDate) else {
+                return .missed
+            }
+            if adherenceService.hasTakenRecord(for: item.id, on: yesterday, slotMinutes: slotMinutes) {
                 return .taken
+            }
+            let yesterdaySched = scheduledDateTime(for: item, on: yesterday, slotMinutes: slotMinutes)
+            let diffMin = Int(floor(effectiveDate.timeIntervalSince(yesterdaySched) / 60.0))
+            if diffMin < -DoseWindowConfig.preWindowMinutes {
+                return .upcomingBeforeWindow
+            } else if diffMin < DoseWindowConfig.lateThresholdMinutes {
+                return .dueOnTime
+            } else if diffMin < DoseWindowConfig.missedCutoffMinutes {
+                return .overdueLate
+            } else {
+                return .missed
             }
         }
 
-        // Check if yesterday's dose crossed midnight and is still within the active confirmation window
-        if hasActiveCarryoverFromYesterday(item, at: effectiveDate),
-           let yesterday = calendar.date(byAdding: .day, value: -1, to: effectiveDate) {
-            let yesterdaySched = scheduledDateTime(for: item, on: yesterday)
-            let diffYesterdayMin = Int(floor(effectiveDate.timeIntervalSince(yesterdaySched) / 60.0))
-            return diffYesterdayMin <= DoseWindowConfig.lateThresholdMinutes ? .dueOnTime : .overdueLate
+        if isSlotTakenToday(item, slotMinutes: slotMinutes, on: effectiveDate) {
+            return .taken
         }
 
         guard isScheduledForToday(item, on: effectiveDate) else {
             return .upcomingBeforeWindow
         }
 
-        let todaySched = scheduledDateTime(for: item, on: effectiveDate)
-        let diffMin = Int(floor(effectiveDate.timeIntervalSince(todaySched) / 60.0))
+        let todaySched = scheduledDateTime(for: item, on: effectiveDate, slotMinutes: slotMinutes)
+        let scheduleStart = effectiveScheduleStart(for: item)
+        let scheduleStartMinute = calendar.date(bySetting: .second, value: 0, of: scheduleStart) ?? scheduleStart
+        if calendar.isDate(scheduleStart, inSameDayAs: effectiveDate) && todaySched < scheduleStartMinute {
+            return .upcomingBeforeWindow
+        }
 
+        let diffMin = Int(floor(effectiveDate.timeIntervalSince(todaySched) / 60.0))
         if diffMin < -DoseWindowConfig.preWindowMinutes {
             return .upcomingBeforeWindow
-        } else if diffMin <= DoseWindowConfig.lateThresholdMinutes {
+        } else if diffMin < DoseWindowConfig.lateThresholdMinutes {
             return .dueOnTime
         } else if diffMin < DoseWindowConfig.missedCutoffMinutes {
             return .overdueLate
         } else {
             return .missed
         }
+    }
+
+    /// Evaluates the overall interaction state of a medication across its daily slots (and yesterday carryover).
+    public func doseInteractionState(for item: MedicationItem, at date: Date? = nil) -> DoseInteractionState {
+        let effectiveDate = date ?? AppClock.shared.now
+        let slots = dailyDoseTimesMinutes(for: item)
+
+        var slotStates: [DoseInteractionState] = []
+        for slotMin in slots {
+            if hasActiveCarryoverFromYesterday(item, slotMinutes: slotMin, at: effectiveDate) {
+                slotStates.append(doseInteractionState(for: item, slotMinutes: slotMin, at: effectiveDate, isCarryover: true))
+            }
+            if isScheduledForToday(item, on: effectiveDate) {
+                slotStates.append(doseInteractionState(for: item, slotMinutes: slotMin, at: effectiveDate, isCarryover: false))
+            }
+        }
+
+        if slotStates.isEmpty {
+            return .upcomingBeforeWindow
+        }
+        if slotStates.contains(.overdueLate) { return .overdueLate }
+        if slotStates.contains(.dueOnTime) { return .dueOnTime }
+        if slotStates.contains(.upcomingBeforeWindow) { return .upcomingBeforeWindow }
+        if slotStates.allSatisfy({ $0 == .taken }) { return .taken }
+        return .missed
+    }
+
+    /// Returns the number of minutes elapsed past the scheduled time when `item` (or specific slot) is currently `.overdueLate`, or `nil` otherwise.
+    public func overdueMinutes(
+        for item: MedicationItem,
+        slotMinutes: Int? = nil,
+        at date: Date? = nil,
+        isCarryover: Bool = false
+    ) -> Int? {
+        let effectiveDate = date ?? AppClock.shared.now
+        if let slotMinutes {
+            guard doseInteractionState(for: item, slotMinutes: slotMinutes, at: effectiveDate, isCarryover: isCarryover) == .overdueLate else {
+                return nil
+            }
+            let dayRef = isCarryover
+                ? (Calendar.current.date(byAdding: .day, value: -1, to: effectiveDate) ?? effectiveDate)
+                : effectiveDate
+            let occurrence = scheduledDateTime(for: item, on: dayRef, slotMinutes: slotMinutes)
+            let elapsed = Int(floor(effectiveDate.timeIntervalSince(occurrence) / 60.0))
+            return max(elapsed, DoseWindowConfig.lateThresholdMinutes)
+        }
+
+        let slots = dailyDoseTimesMinutes(for: item)
+        for slotMin in slots {
+            if hasActiveCarryoverFromYesterday(item, slotMinutes: slotMin, at: effectiveDate),
+               let mins = overdueMinutes(for: item, slotMinutes: slotMin, at: effectiveDate, isCarryover: true) {
+                return mins
+            }
+            if isScheduledForToday(item, on: effectiveDate),
+               let mins = overdueMinutes(for: item, slotMinutes: slotMin, at: effectiveDate, isCarryover: false) {
+                return mins
+            }
+        }
+        return nil
     }
 
     /// Reconciles taken flags from previous days, handles doses crossing midnight without losing their state,
@@ -263,29 +679,68 @@ public final class MedicationService: ObservableObject {
         let calendar = Calendar.current
         let todayStart = calendar.startOfDay(for: now)
 
-        // 1. Preserve previous-day `isTaken` state in AdherenceService BEFORE resetting `isTaken` for the new day
+        // 1. Preserve previous-day taken slots/flags in AdherenceService BEFORE resetting for the new day
         var didResetStaleDay = false
         var resetMedications: [MedicationItem] = []
         for idx in allMedications.indices {
-            if allMedications[idx].isTaken,
-               let takenAt = allMedications[idx].takenAt,
-               !calendar.isDate(takenAt, inSameDayAs: now) {
-                AdherenceService.shared.recordDoseTaken(
-                    medication: allMedications[idx],
-                    patientId: allMedications[idx].patientId,
-                    takenAt: takenAt,
-                    scheduledDay: takenAt
-                )
-                allMedications[idx].isTaken = false
-                allMedications[idx].takenAt = nil
+            var itemChanged = false
+
+            // Clear stale slot-level confirmations from previous days
+            let staleSlots = allMedications[idx].takenSlotsToday.filter { !calendar.isDate($0.value, inSameDayAs: now) }
+            for (slotMin, slotTakenAt) in staleSlots {
+                if slotTakenAt <= now {
+                    adherenceService.recordDoseTaken(
+                        medication: allMedications[idx],
+                        patientId: allMedications[idx].patientId,
+                        takenAt: slotTakenAt,
+                        scheduledDay: slotTakenAt,
+                        slotMinutes: slotMin
+                    )
+                }
+                allMedications[idx].takenSlotsToday.removeValue(forKey: slotMin)
+                itemChanged = true
+            }
+
+            // Handle legacy items where `isTaken` was persisted without `takenSlotsToday`
+            if allMedications[idx].isTaken && allMedications[idx].takenSlotsToday.isEmpty {
+                let primarySlot = scheduledMinutes(for: allMedications[idx])
+                if let takenAt = allMedications[idx].takenAt {
+                    if !calendar.isDate(takenAt, inSameDayAs: now) {
+                        if takenAt <= now {
+                            adherenceService.recordDoseTaken(
+                                medication: allMedications[idx],
+                                patientId: allMedications[idx].patientId,
+                                takenAt: takenAt,
+                                scheduledDay: takenAt,
+                                slotMinutes: primarySlot
+                            )
+                        }
+                        allMedications[idx].isTaken = false
+                        allMedications[idx].takenAt = nil
+                        itemChanged = true
+                    }
+                } else if !adherenceService.hasTakenRecord(for: allMedications[idx].id, on: now, slotMinutes: primarySlot) {
+                    allMedications[idx].isTaken = false
+                    allMedications[idx].takenAt = nil
+                    itemChanged = true
+                }
+            }
+
+            if itemChanged {
+                let slots = dailyDoseTimesMinutes(for: allMedications[idx])
+                allMedications[idx].isTaken = !slots.isEmpty && slots.allSatisfy {
+                    isSlotTakenToday(allMedications[idx], slotMinutes: $0, on: now)
+                }
+                if allMedications[idx].takenSlotsToday.isEmpty && !allMedications[idx].isTaken {
+                    allMedications[idx].takenAt = nil
+                }
                 didResetStaleDay = true
                 resetMedications.append(allMedications[idx])
             }
         }
         if didResetStaleDay {
             persistMedications()
-            // Confirming yesterday's dose removed the repeating missed-dose alert (`cancelMissedDoseAlert`).
-            // The dose is open again today, so the alert must be scheduled again.
+            // Re-arm missed-dose alerts for the new day.
             let toReschedule = resetMedications
             Task {
                 for med in toReschedule {
@@ -294,26 +749,31 @@ public final class MedicationService: ObservableObject {
             }
         }
 
-        // 2. Retroactive backfill for past days (only when the confirmation window has fully expired)
+        // 2. Retroactive backfill for past days across every scheduled daily slot
         for med in allMedications {
-            let createdDay = calendar.startOfDay(for: med.createdAt)
-            let earliestLookback = calendar.date(byAdding: .day, value: -DoseWindowConfig.retroactiveLookbackDays, to: todayStart) ?? createdDay
-            var day = max(createdDay, earliestLookback)
-            let createdMinuteStart = calendar.date(bySetting: .second, value: 0, of: med.createdAt) ?? med.createdAt
+            let scheduleStart = effectiveScheduleStart(for: med)
+            let anchorDay = calendar.startOfDay(for: scheduleStart)
+            let earliestLookback = calendar.date(byAdding: .day, value: -DoseWindowConfig.retroactiveLookbackDays, to: todayStart) ?? anchorDay
+            var day = max(anchorDay, earliestLookback)
+            let anchorMinuteStart = calendar.date(bySetting: .second, value: 0, of: scheduleStart) ?? scheduleStart
+            let slots = dailyDoseTimesMinutes(for: med)
 
             while day < todayStart {
                 if isScheduledForToday(med, on: day) {
-                    let schedDate = scheduledDateTime(for: med, on: day)
-                    let isBeforeCreation = calendar.isDate(day, inSameDayAs: med.createdAt) && schedDate < createdMinuteStart
-                    if !isBeforeCreation {
-                        let elapsedMinutes = Int(floor(now.timeIntervalSince(schedDate) / 60.0))
-                        // If a midnight-crossing dose (e.g. 23:00 checked at 00:30) is still within 120m, keep it open rather than marking missed
-                        if elapsedMinutes >= DoseWindowConfig.missedCutoffMinutes && !AdherenceService.shared.hasRecord(for: med.id, on: day) {
-                            AdherenceService.shared.recordDoseMissedIfNeeded(
-                                medication: med,
-                                patientId: med.patientId,
-                                on: day
-                            )
+                    for slotMin in slots {
+                        let schedDate = scheduledDateTime(for: med, on: day, slotMinutes: slotMin)
+                        let isBeforeScheduleStart = calendar.isDate(day, inSameDayAs: scheduleStart) && schedDate < anchorMinuteStart
+                        if !isBeforeScheduleStart {
+                            let elapsedMinutes = Int(floor(now.timeIntervalSince(schedDate) / 60.0))
+                            // If a midnight-crossing dose (e.g. 23:00 checked at 00:30) is still within 120m, keep it open rather than marking missed
+                            if elapsedMinutes >= DoseWindowConfig.missedCutoffMinutes && !adherenceService.hasRecord(for: med.id, on: day, slotMinutes: slotMin) {
+                                adherenceService.recordDoseMissedIfNeeded(
+                                    medication: med,
+                                    patientId: med.patientId,
+                                    on: day,
+                                    slotMinutes: slotMin
+                                )
+                            }
                         }
                     }
                 }
@@ -324,97 +784,204 @@ public final class MedicationService: ObservableObject {
     }
 
     // MARK: - Per-Patient Day Schedule
-    /// Today's schedule for one patient, derived only from that patient's medications.
+    /// Today's schedule for one patient, derived only from that patient's medications and daily dose slots.
     public struct PatientDaySchedule: Equatable {
         public let patientId: String
+        /// All dose occurrences scheduled today (plus open yesterday carryovers), sorted chronologically.
+        public let todayDoses: [ScheduledDose]
+        /// All currently active/highlighted dose occurrences shown under "ادويتي".
+        public let activeDoses: [ScheduledDose]
+        /// Dose occurrences currently overdue (>=30m late) or missed today.
+        public let missedDoses: [ScheduledDose]
         /// Medications scheduled today (or still open from yesterday past midnight), sorted chronologically.
         public let todayMedications: [MedicationItem]
-        public let activeMedication: MedicationItem?
+        public let activeMedications: [MedicationItem]
+        public var activeMedication: MedicationItem? { activeMedications.first }
         public let upcomingDoses: [UpcomingDose]
-        /// Untaken doses that can still be confirmed today (excludes taken and missed doses).
+        /// Untaken dose occurrences that can still be confirmed today (excludes taken and missed doses).
         public let remainingDoses: Int
-        /// Today's doses still unconfirmed past `DoseWindowConfig.lateThresholdMinutes`.
+        /// Today's medications having an unconfirmed dose past `DoseWindowConfig.lateThresholdMinutes`.
         public let missedMedications: [MedicationItem]
 
-        public var hasMissedDoses: Bool { !missedMedications.isEmpty }
+        public var hasMissedDoses: Bool { !missedDoses.isEmpty }
+    }
+
+    private func uniqueMedicationsPreservingOrder(from doses: [ScheduledDose]) -> [MedicationItem] {
+        var seen = Set<UUID>()
+        var result: [MedicationItem] = []
+        for dose in doses where seen.insert(dose.medication.id).inserted {
+            result.append(dose.medication)
+        }
+        return result
     }
 
     /// UC-12 S#1, S#2, S#3: computes `patientId`'s schedule for the day containing `date`. Has no side effects.
     public func daySchedule(forPatient patientId: String, at date: Date? = nil) -> PatientDaySchedule {
         let now = date ?? AppClock.shared.now
+        let calendar = Calendar.current
 
-        // 1. UC-12 S#1: Retrieve registered medications scheduled for today OR still active from yesterday past midnight
-        let todaysList = allMedications.filter {
-            $0.patientId == patientId &&
-            (isScheduledForToday($0, on: now) || hasActiveCarryoverFromYesterday($0, at: now))
+        // 1. Expand each patient medication into daily dose occurrences (plus any active carryover from yesterday)
+        let patientMeds = allMedications.filter { $0.patientId == patientId }
+        var allDoses: [ScheduledDose] = []
+
+        for med in patientMeds {
+            let slots = dailyDoseTimesMinutes(for: med)
+            let isScheduledToday = isScheduledForToday(med, on: now)
+            let scheduleStart = effectiveScheduleStart(for: med)
+            let isCreatedToday = calendar.isDate(scheduleStart, inSameDayAs: now)
+            let anchorMinuteStart = calendar.date(bySetting: .second, value: 0, of: scheduleStart) ?? scheduleStart
+            let hasFutureOrCurrentSlotOnCreationDay = isCreatedToday && slots.contains {
+                scheduledDateTime(for: med, on: now, slotMinutes: $0) >= anchorMinuteStart
+            }
+
+            for slotMin in slots {
+                if hasActiveCarryoverFromYesterday(med, slotMinutes: slotMin, at: now),
+                   let yesterday = calendar.date(byAdding: .day, value: -1, to: now) {
+                    let occ = scheduledDateTime(for: med, on: yesterday, slotMinutes: slotMin)
+                    allDoses.append(
+                        ScheduledDose(
+                            medication: med,
+                            slotMinutes: slotMin,
+                            occurrenceDate: occ,
+                            timeString: formattedTimeString(forSlotMinutes: slotMin),
+                            isCarryoverFromYesterday: true
+                        )
+                    )
+                }
+
+                if isScheduledToday {
+                    let occ = scheduledDateTime(for: med, on: now, slotMinutes: slotMin)
+                    // When multiple doses per day are scheduled and at least one slot is still ahead today,
+                    // omit slots earlier than creation time on the first day so they don't appear before upcoming doses.
+                    if isCreatedToday && slots.count > 1 && hasFutureOrCurrentSlotOnCreationDay && occ < anchorMinuteStart {
+                        continue
+                    }
+                    allDoses.append(
+                        ScheduledDose(
+                            medication: med,
+                            slotMinutes: slotMin,
+                            occurrenceDate: occ,
+                            timeString: formattedTimeString(forSlotMinutes: slotMin),
+                            isCarryoverFromYesterday: false
+                        )
+                    )
+                }
+            }
         }
 
-        // 2. UC-12 S#2: Automatically sort daily medications chronologically by active occurrence date
-        let sortedTodaysList = todaysList.sorted { a, b in
-            activeOccurrenceDate(for: a, at: now) < activeOccurrenceDate(for: b, at: now)
+        // 2. Sort daily dose occurrences chronologically
+        let sortedDoses = allDoses.sorted { a, b in
+            if a.occurrenceDate != b.occurrenceDate {
+                return a.occurrenceDate < b.occurrenceDate
+            }
+            return a.medication.name < b.medication.name
         }
 
-        // 3. UC-12 S#2: Prioritize confirmable or upcoming medications (excluding taken and missed doses)
-        let actionableUntaken = sortedTodaysList.filter { item in
-            let state = doseInteractionState(for: item, at: now)
+        let stateOf: (ScheduledDose) -> DoseInteractionState = { dose in
+            self.doseInteractionState(
+                for: dose.medication,
+                slotMinutes: dose.slotMinutes,
+                at: now,
+                isCarryover: dose.isCarryoverFromYesterday
+            )
+        }
+
+        // 3. Prioritize confirmable or upcoming dose occurrences (excluding taken and missed doses)
+        let actionableUntaken = sortedDoses.filter { dose in
+            let state = stateOf(dose)
             return state == .dueOnTime || state == .overdueLate || state == .upcomingBeforeWindow
         }
 
-        let active: MedicationItem?
+        let activeDoseList: [ScheduledDose]
         if !actionableUntaken.isEmpty {
-            let confirmableNow = actionableUntaken.filter { item in
-                let state = doseInteractionState(for: item, at: now)
+            let confirmableNow = actionableUntaken.filter { dose in
+                let state = stateOf(dose)
                 return state == .dueOnTime || state == .overdueLate
             }
-            let futureToday = actionableUntaken.filter { item in
-                doseInteractionState(for: item, at: now) == .upcomingBeforeWindow
+            let futureToday = actionableUntaken.filter { dose in
+                stateOf(dose) == .upcomingBeforeWindow
             }
 
             if !confirmableNow.isEmpty {
-                // Prioritize the confirmable dose (within -15m ..< +120m window) closest to `now`
-                active = confirmableNow.min(by: {
-                    abs(now.timeIntervalSince(activeOccurrenceDate(for: $0, at: now))) <
-                    abs(now.timeIntervalSince(activeOccurrenceDate(for: $1, at: now)))
-                }) ?? confirmableNow.first
+                // Include all currently confirmable doses: overdue first (chronologically), then due on time.
+                let overdueNow = confirmableNow.filter { stateOf($0) == .overdueLate }
+                let dueNow = confirmableNow.filter { stateOf($0) == .dueOnTime }
+                activeDoseList = overdueNow + dueNow
+            } else if let earliestDate = futureToday.first?.occurrenceDate {
+                // Include all upcoming doses sharing the exact earliest scheduled date/time.
+                activeDoseList = futureToday.filter { $0.occurrenceDate == earliestDate }
             } else {
-                // All remaining actionable doses are in the future today; pick the earliest upcoming one
-                active = futureToday.min(by: {
-                    activeOccurrenceDate(for: $0, at: now) < activeOccurrenceDate(for: $1, at: now)
-                }) ?? actionableUntaken.first
+                activeDoseList = Array(actionableUntaken.prefix(1))
             }
         } else {
-            // All doses for today are either taken or missed: show the most recent or first in schedule
-            active = sortedTodaysList.last ?? sortedTodaysList.first
+            if let fallback = sortedDoses.last ?? sortedDoses.first {
+                activeDoseList = [fallback]
+            } else {
+                activeDoseList = []
+            }
         }
 
-        // 4. Generate schedule doses for other medications (excluding the active highlighted card)
-        let upcoming = sortedTodaysList
-            .filter { $0.id != active?.id }
-            .map { item in
-                UpcomingDose(
-                    id: item.id,
-                    name: item.name,
-                    timeString: item.timeString.westernNumerals,
-                    dosage: item.dosage.westernNumerals,
-                    isTaken: item.isTaken
+        // 4. Generate schedule rows for other doses today (excluding active cards)
+        let activeDoseIds = Set(activeDoseList.map(\.id))
+        let upcoming = sortedDoses
+            .filter { !activeDoseIds.contains($0.id) }
+            .map { dose in
+                let slotsCount = dailyDoseTimesMinutes(for: dose.medication).count
+                let rowId = (slotsCount == 1 && !dose.isCarryoverFromYesterday) ? dose.medication.id : UUID()
+                return UpcomingDose(
+                    id: rowId,
+                    medicationId: dose.medication.id,
+                    slotMinutes: dose.slotMinutes,
+                    name: dose.medication.name,
+                    timeString: dose.timeString,
+                    dosage: dose.medication.dosage.westernNumerals,
+                    isTaken: stateOf(dose) == .taken,
+                    imageData: dose.medication.imageData
                 )
             }
 
+        let missedDoses = sortedDoses.filter { dose in
+            let s = stateOf(dose)
+            return s == .overdueLate || s == .missed
+        }
+
         return PatientDaySchedule(
             patientId: patientId,
-            todayMedications: sortedTodaysList,
-            activeMedication: active,
+            todayDoses: sortedDoses,
+            activeDoses: activeDoseList,
+            missedDoses: missedDoses,
+            todayMedications: uniqueMedicationsPreservingOrder(from: sortedDoses),
+            activeMedications: uniqueMedicationsPreservingOrder(from: activeDoseList),
             upcomingDoses: upcoming,
-            // 5. Count remaining actionable untaken doses for today (excludes taken and missed doses)
             remainingDoses: actionableUntaken.count,
-            missedMedications: sortedTodaysList.filter { isDoseMissed($0, at: now) }
+            missedMedications: uniqueMedicationsPreservingOrder(from: missedDoses)
         )
     }
 
-    // MARK: - UC-12 S#1, S#2, S#3: Automatically Sort & Prioritize by Scheduled Time
-    public func refreshDerivedState() {
-        let now = AppClock.shared.now
+    private func reconcileMissedDosesForToday(at now: Date) {
         let calendar = Calendar.current
+        for item in allMedications where isScheduledForToday(item, on: now) {
+            let scheduleStart = effectiveScheduleStart(for: item)
+            let startMinute = calendar.date(bySetting: .second, value: 0, of: scheduleStart) ?? scheduleStart
+            let slots = dailyDoseTimesMinutes(for: item)
+            for slotMin in slots {
+                let schedToday = scheduledDateTime(for: item, on: now, slotMinutes: slotMin)
+                let startsAtOrAfterAnchor = schedToday >= startMinute || !calendar.isDate(scheduleStart, inSameDayAs: now)
+                if startsAtOrAfterAnchor && doseInteractionState(for: item, slotMinutes: slotMin, at: now) == .missed {
+                    adherenceService.recordDoseMissedIfNeeded(
+                        medication: item,
+                        patientId: item.patientId,
+                        on: now,
+                        slotMinutes: slotMin
+                    )
+                }
+            }
+        }
+    }
+
+    // MARK: - UC-12 S#1, S#2, S#3: Automatically Sort & Prioritize by Scheduled Time
+    public func refreshDerivedState(at overrideNow: Date? = nil) {
+        let now = overrideNow ?? AppClock.shared.now
         let patientId = MedicationItem.currentIdentityPatientId
 
         // Reconcile day rollover, midnight carryover, and past unrecorded missed doses before evaluating today
@@ -422,30 +989,24 @@ public final class MedicationService: ObservableObject {
 
         // Automatically record any dose today that crossed the missed cutoff as `.missed` ("فائتة") in AdherenceService,
         // for every patient whose medications are stored on this device.
-        let createdTodayCutoffCheck = { (item: MedicationItem) -> Bool in
-            let createdMinuteStart = calendar.date(bySetting: .second, value: 0, of: item.createdAt) ?? item.createdAt
-            let schedToday = self.scheduledDateTime(for: item, on: now)
-            return schedToday >= createdMinuteStart || !calendar.isDate(item.createdAt, inSameDayAs: now)
-        }
-        for item in allMedications
-        where (isScheduledForToday(item, on: now) || hasActiveCarryoverFromYesterday(item, at: now))
-            && doseInteractionState(for: item, at: now) == .missed
-            && createdTodayCutoffCheck(item) {
-            AdherenceService.shared.recordDoseMissedIfNeeded(
-                medication: item,
-                patientId: item.patientId,
-                on: now
-            )
-        }
+        reconcileMissedDosesForToday(at: now)
 
         // Published state describes only the patient using this device
         let schedule = daySchedule(forPatient: patientId, at: now)
         self.currentPatientId = patientId
         self.medications = medicationList(forPatient: patientId)
+        self.todayDoses = schedule.todayDoses
+        self.activeDoses = schedule.activeDoses
         self.todayMedications = schedule.todayMedications
+        self.activeMedications = schedule.activeMedications
         self.activeMedication = schedule.activeMedication
         self.upcomingDoses = schedule.upcomingDoses
         self.remainingDoses = schedule.remainingDoses
+        self.lastEvaluatedAt = now
+
+        if schedulesSystemNotifications {
+            DoseLiveActivityManager.shared.sync(using: self, at: now)
+        }
     }
 
     // MARK: - Use-Case 5 (UC-5): Missed Dose Calculations (30-Minute Grace Period)
@@ -462,34 +1023,130 @@ public final class MedicationService: ObservableObject {
         return todayMedications.filter { isDoseMissed($0, at: now) }
     }
 
+    /// The current patient's medications scheduled for today that are currently late (`.overdueLate`) and still confirmable
+    public var overdueLateMedicationsToday: [MedicationItem] {
+        let now = AppClock.shared.now
+        return todayMedications.filter { doseInteractionState(for: $0, at: now) == .overdueLate }
+    }
+
     /// True when any of the current patient's medications has remained unconfirmed 30 minutes past its due time
     public var hasMissedDosesToday: Bool {
         !missedMedicationsToday.isEmpty
     }
 
     // MARK: - UC-12 Helper Functions (Schedule Day & Time Calculations)
+
+    /// Returns sorted Gregorian weekday numbers (1 = Sunday ... 7 = Saturday) when specific days are chosen,
+    /// or `nil` when the medication repeats every day.
+    /// Reads the structured `item.selectedWeekdays` first, falling back to parsing legacy `item.days` strings if needed.
+    public func scheduledWeekdays(for item: MedicationItem) -> [Int]? {
+        let structured = Set(item.selectedWeekdays.filter { (1...7).contains($0) })
+        if !structured.isEmpty {
+            return structured.count == 7 ? nil : structured.sorted()
+        }
+        let parsed = MedicationWeekday.parseWeekdayNumbers(from: item.days)
+        return parsed.isEmpty ? nil : parsed.sorted()
+    }
+
+    private func dayInterval(for frequency: String) -> Int? {
+        let clean = frequency.westernNumerals.trimmingCharacters(in: .whitespacesAndNewlines)
+        if clean.contains("يومين") { return 2 }
+        if clean.contains("3 أيام") || clean.contains("3 ايام") || clean.contains("ثلاثة أيام") || clean.contains("ثلاثة ايام") {
+            return 3
+        }
+        if clean.contains("أسبوع") || clean.contains("اسبوع") { return 7 }
+        return nil
+    }
+
+    private func parsedHourlyInterval(from frequency: String) -> Int? {
+        let clean = frequency.westernNumerals.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard clean.contains("ساعة") || clean.contains("ساعات") else { return nil }
+        let digits = clean.replacingOccurrences(of: "[^0-9]", with: "", options: .regularExpression)
+        if let hours = Int(digits), hours >= 1, hours < 24 {
+            return hours
+        }
+        return nil
+    }
+
+    private func parsedTimesPerDay(from frequency: String) -> Int? {
+        let clean = frequency.westernNumerals.trimmingCharacters(in: .whitespacesAndNewlines)
+        if clean.contains("مرتان") || clean.contains("مرتين") { return 2 }
+        if clean.contains("ثلاث مرات") { return 3 }
+        if clean.contains("أربع مرات") || clean.contains("اربع مرات") { return 4 }
+        if clean.contains("مرة يوم") || clean == "مرة واحدة" { return 1 }
+        if clean.contains("مرات") {
+            let digits = clean.replacingOccurrences(of: "[^0-9]", with: "", options: .regularExpression)
+            if let count = Int(digits), count >= 2, count <= 6 {
+                return count
+            }
+        }
+        return nil
+    }
+
+    /// Returns sorted unique scheduled times of day in minutes from midnight (0..<1440) derived from `item`'s start time and `frequency`.
+    public func dailyDoseTimesMinutes(for item: MedicationItem) -> [Int] {
+        let start = ((scheduledMinutes(for: item) % 1440) + 1440) % 1440
+
+        if let hours = parsedHourlyInterval(from: item.frequency) {
+            let step = hours * 60
+            var slots = Set<Int>()
+            if 24 % hours == 0 {
+                let count = 24 / hours
+                for k in 0..<count {
+                    slots.insert((start + k * step) % 1440)
+                }
+            } else {
+                var current = start
+                while current < 1440 && slots.count < 12 {
+                    slots.insert(current)
+                    current += step
+                }
+            }
+            return slots.sorted()
+        }
+
+        if let count = parsedTimesPerDay(from: item.frequency), count > 1 {
+            let step = 1440 / count
+            var slots = Set<Int>()
+            for k in 0..<count {
+                slots.insert((start + k * step) % 1440)
+            }
+            return slots.sorted()
+        }
+
+        return [start]
+    }
+
+    /// Formats a minute-of-day value (0..<1440) using Western digits and Arabic AM/PM ("08:00 ص" / "08:00 م").
+    public func formattedTimeString(forSlotMinutes minutes: Int) -> String {
+        let normalized = ((minutes % 1440) + 1440) % 1440
+        let hour24 = normalized / 60
+        let minute = normalized % 60
+        let period = hour24 >= 12 ? "م" : "ص"
+        var hour12 = hour24 % 12
+        if hour12 == 0 { hour12 = 12 }
+        return String(format: "%02d:%02d %@", locale: Locale(identifier: "en_US_POSIX"), hour12, minute, period).westernNumerals
+    }
+
     /// UC-12 S#1: Identifies medications scheduled for the current day
     public func isScheduledForToday(_ item: MedicationItem, on date: Date = Date()) -> Bool {
-        if item.days.isEmpty || item.days.contains("كل يوم") || item.days.contains("يومياً") || item.days.contains("دائم") {
-            return true
+        let calendar = Calendar.current
+        if let weekdays = scheduledWeekdays(for: item) {
+            let weekday = calendar.component(.weekday, from: date)
+            return weekdays.contains(weekday)
         }
-
-        let weekday = Calendar.current.component(.weekday, from: date)
-        // 1: Sunday, 2: Monday, 3: Tuesday, 4: Wednesday, 5: Thursday, 6: Friday, 7: Saturday
-        let weekdayKeywords: [Int: [String]] = [
-            1: ["الاحد", "الأحد"],
-            2: ["الاثنين", "الإثنين"],
-            3: ["الثلاثاء"],
-            4: ["الاربعاء", "الأربعاء"],
-            5: ["الخميس"],
-            6: ["الجمعه", "الجمعة"],
-            7: ["السبت"]
-        ]
-
-        guard let keywords = weekdayKeywords[weekday] else { return true }
-        return item.days.contains { day in
-            keywords.contains { keyword in day.contains(keyword) }
+        if let interval = dayInterval(for: item.frequency) {
+            let anchorDay = calendar.startOfDay(for: effectiveScheduleStart(for: item))
+            let targetDay = calendar.startOfDay(for: date)
+            let diff = calendar.dateComponents([.day], from: anchorDay, to: targetDay).day ?? 0
+            return diff >= 0 && diff % interval == 0
         }
+        if item.frequency.contains("شهري") {
+            let anchorDayNum = calendar.component(.day, from: effectiveScheduleStart(for: item))
+            let targetDayNum = calendar.component(.day, from: date)
+            return anchorDayNum == targetDayNum
+        }
+        return true
     }
 
     /// Converts scheduled time into minutes from midnight (0 ..< 1440) for precise chronological sorting
@@ -533,9 +1190,16 @@ public final class MedicationService: ObservableObject {
         // 1. Validation: Required fields (UC-3 Alternate Course S#1)
         try validateRequiredFields(name: cleanItem.name, dosage: cleanItem.dosage, timeString: cleanItem.timeString)
 
-        // 2. Validation: Image size (UC-3 Alternate Course S#4)
+        // 2. Validation & Normalization: Image size (UC-3 Alternate Course S#4)
         if let imgData = cleanItem.imageData {
-            try validateImageData(imgData)
+            if let uiImage = UIImage(data: imgData),
+               imgData.count > 900_000,
+               let compressed = Self.compressAndNormalizeImage(uiImage) {
+                cleanItem.imageData = compressed.data
+            }
+            if let finalData = cleanItem.imageData {
+                try validateImageData(finalData)
+            }
         }
 
         // 3. Authorization check for Caregiver (UC-3 Alternate Course S#8) and ownership:
@@ -565,6 +1229,7 @@ public final class MedicationService: ObservableObject {
         allMedications.insert(cleanItem, at: 0)
         persistMedications()
         refreshDerivedState()
+        CloudKitSyncManager.shared.publishMedication(cleanItem)
 
         // 6. Schedule Notification Reminder (UC-3 S#6 & Alternate Course S#9)
         let scheduled = await scheduleReminder(for: cleanItem)
@@ -575,10 +1240,10 @@ public final class MedicationService: ObservableObject {
         // 7. Success confirmation message (UC-3 S#8)
         if currentUser.role == .caregiver {
             showToast("تمت إضافة دواء \"\(cleanItem.name)\" بنجاح في جدول المستفيد!")
-        } else if !RelationshipService.shared.activeRelationships.isEmpty {
+        } else if !relationshipService.activeRelationships.isEmpty {
             showToast("تمت إضافة دواء \"\(cleanItem.name)\" بنجاح وجدولة التذكيرات!")
             // Instantly notify caregiver
-            RelationshipService.shared.showToast("🔔 قام \(currentUser.displayName) بإضافة دواء جديد: \"\(cleanItem.name)\" (\(cleanItem.timeString))")
+            relationshipService.showToast("🔔 قام \(currentUser.displayName) بإضافة دواء جديد: \"\(cleanItem.name)\" (\(cleanItem.timeString))")
         } else {
             showToast("تمت إضافة دواء \"\(cleanItem.name)\" بنجاح وجدولة التذكيرات!")
         }
@@ -598,7 +1263,14 @@ public final class MedicationService: ObservableObject {
         try validateRequiredFields(name: cleanItem.name, dosage: cleanItem.dosage, timeString: cleanItem.timeString)
 
         if let imgData = cleanItem.imageData {
-            try validateImageData(imgData)
+            if let uiImage = UIImage(data: imgData),
+               imgData.count > 900_000,
+               let compressed = Self.compressAndNormalizeImage(uiImage) {
+                cleanItem.imageData = compressed.data
+            }
+            if let finalData = cleanItem.imageData {
+                try validateImageData(finalData)
+            }
         }
 
         guard let index = allMedications.firstIndex(where: { $0.id == cleanItem.id }) else {
@@ -606,7 +1278,8 @@ public final class MedicationService: ObservableObject {
         }
 
         // Ownership never changes on edit; a caregiver must be linked to the medication's owner.
-        let ownerId = allMedications[index].patientId
+        let existingMed = allMedications[index]
+        let ownerId = existingMed.patientId
         cleanItem.patientId = ownerId
         if let user = currentUser, user.role == .caregiver {
             if let targetPatientId, targetPatientId != ownerId {
@@ -615,20 +1288,66 @@ public final class MedicationService: ObservableObject {
             try validateCaregiverPermission(caregiverId: user.id, targetPatientId: ownerId)
         }
 
+        let now = AppClock.shared.now
+        let calendar = Calendar.current
+        let timeChanged = existingMed.timeString != cleanItem.timeString
+        let frequencyChanged = existingMed.frequency != cleanItem.frequency
+        let scheduleChanged =
+            timeChanged ||
+            frequencyChanged ||
+            existingMed.days != cleanItem.days ||
+            existingMed.selectedWeekdays != cleanItem.selectedWeekdays
+
+        if scheduleChanged {
+            // 1. Reconcile past, midnight, and today missed doses using the OLD schedule first so unrecorded missed doses are not lost
+            reconcilePastAndMidnightDoses(at: now)
+            reconcileMissedDosesForToday(at: now)
+            if timeChanged || frequencyChanged || !isScheduledForToday(existingMed, on: now) {
+                cleanItem.scheduleUpdatedAt = now
+            } else {
+                cleanItem.scheduleUpdatedAt = existingMed.scheduleUpdatedAt
+            }
+        } else {
+            cleanItem.scheduleUpdatedAt = existingMed.scheduleUpdatedAt
+        }
+
+        // 2. Preserve slots already confirmed today when compatible with the updated schedule
+        let latestExistingMed = allMedications[index]
+        let newSlots = Set(dailyDoseTimesMinutes(for: cleanItem))
+        var preservedSlots: [Int: Date] = [:]
+        for (slotMin, takenAt) in latestExistingMed.takenSlotsToday
+        where newSlots.contains(slotMin) && calendar.isDate(takenAt, inSameDayAs: now) {
+            preservedSlots[slotMin] = takenAt
+        }
+        if preservedSlots.isEmpty && latestExistingMed.isTaken {
+            let primarySlot = scheduledMinutes(for: cleanItem)
+            if newSlots.contains(primarySlot) {
+                if let takenAt = latestExistingMed.takenAt, calendar.isDate(takenAt, inSameDayAs: now) {
+                    preservedSlots[primarySlot] = takenAt
+                } else if adherenceService.hasTakenRecord(for: latestExistingMed.id, on: now, slotMinutes: primarySlot) {
+                    preservedSlots[primarySlot] = now
+                }
+            }
+        }
+        cleanItem.takenSlotsToday = preservedSlots
+        cleanItem.takenAt = preservedSlots.values.max()
+        cleanItem.isTaken = !newSlots.isEmpty && newSlots.allSatisfy { preservedSlots[$0] != nil }
+
         allMedications[index] = cleanItem
         persistMedications()
         refreshDerivedState()
+        CloudKitSyncManager.shared.publishMedication(cleanItem)
 
         // Reschedule reminder
-        _ = await scheduleReminder(for: item)
+        _ = await scheduleReminder(for: cleanItem)
 
         if let user = currentUser {
             if user.role == .caregiver {
                 showToast("تم حفظ تعديلات دواء \"\(cleanItem.name)\" وتحديثها في جدول المستفيد.")
-            } else if !RelationshipService.shared.activeRelationships.isEmpty {
+            } else if !relationshipService.activeRelationships.isEmpty {
                 showToast("تم حفظ تعديلات دواء \"\(cleanItem.name)\" بنجاح وتحديث جدولك.")
                 // Instantly notify caregiver
-                RelationshipService.shared.showToast("🔔 قام \(user.displayName) بتعديل دواء \"\(cleanItem.name)\" (\(cleanItem.dosage) • \(cleanItem.timeString))")
+                relationshipService.showToast("🔔 قام \(user.displayName) بتعديل دواء \"\(cleanItem.name)\" (\(cleanItem.dosage) • \(cleanItem.timeString))")
             } else {
                 showToast("تم حفظ تعديلات دواء \"\(cleanItem.name)\" بنجاح.")
             }
@@ -640,14 +1359,22 @@ public final class MedicationService: ObservableObject {
     // MARK: - Use-Case 11 (UC-11): Delete Medication
     /// Direct permanent deletion (when no caregiver is connected or when requested directly)
     public func deleteMedicationDirectly(id: UUID) {
+        let now = AppClock.shared.now
+        reconcilePastAndMidnightDoses(at: now)
+        reconcileMissedDosesForToday(at: now)
         if let item = allMedications.first(where: { $0.id == id }) {
             // UC-11 S#5: Cancel future scheduled reminders
             cancelReminder(id: id)
             // UC-11 S#4: Remove medication from active medication list and update system database
+            let removedRequests = pendingDeletionRequests.filter { $0.medicationId == id }
             allMedications.removeAll(where: { $0.id == id })
             pendingDeletionRequests.removeAll(where: { $0.medicationId == id })
             persistMedications()
             persistDeletionRequests()
+            CloudKitSyncManager.shared.publishMedicationDeletion(medicationId: id, patientId: item.patientId)
+            for req in removedRequests {
+                CloudKitSyncManager.shared.publishDeletionRequestRemoval(requestId: req.id, patientId: req.patientId)
+            }
             // UC-11 S#6: Refresh medication list and Home Page to reflect deletion
             refreshDerivedState()
             showToast("تم حذف دواء \"\(item.name)\" بنجاح.")
@@ -662,14 +1389,22 @@ public final class MedicationService: ObservableObject {
     /// UC-11: Caregiver deletes a medication directly
     /// Removes it permanently from the patient's schedule, cancels reminders, and updates views immediately.
     public func deleteMedicationByCaregiver(id: UUID, patientName: String? = nil) {
+        let now = AppClock.shared.now
+        reconcilePastAndMidnightDoses(at: now)
+        reconcileMissedDosesForToday(at: now)
         guard let item = allMedications.first(where: { $0.id == id }) else { return }
         // UC-11 S#5: Cancels the medication's future scheduled reminders
         cancelReminder(id: id)
         // UC-11 S#4: Removes the medication from active medication list
+        let removedRequests = pendingDeletionRequests.filter { $0.medicationId == id }
         allMedications.removeAll(where: { $0.id == id })
         pendingDeletionRequests.removeAll(where: { $0.medicationId == id })
         persistMedications()
         persistDeletionRequests()
+        CloudKitSyncManager.shared.publishMedicationDeletion(medicationId: id, patientId: item.patientId)
+        for req in removedRequests {
+            CloudKitSyncManager.shared.publishDeletionRequestRemoval(requestId: req.id, patientId: req.patientId)
+        }
         // UC-11 S#6: Refreshes medication list and Home Page
         refreshDerivedState()
 
@@ -705,25 +1440,29 @@ public final class MedicationService: ObservableObject {
             allMedications[index].isPendingDeletion = true
             persistMedications()
             refreshDerivedState()
+            CloudKitSyncManager.shared.publishMedication(allMedications[index])
         }
 
+        let activeRequest: MedicationDeletionRequest
         if let existingIndex = pendingDeletionRequests.firstIndex(where: { $0.medicationId == medicationId }) {
             // Already requested: make sure every currently linked caregiver can act on it
             pendingDeletionRequests[existingIndex].caregiverIds = caregiverIds
+            activeRequest = pendingDeletionRequests[existingIndex]
         } else {
-            pendingDeletionRequests.append(
-                MedicationDeletionRequest(
-                    medicationId: medicationId,
-                    medicationName: item.name,
-                    dosage: item.dosage,
-                    timeString: item.timeString,
-                    patientId: patient.id,
-                    patientDisplayName: patient.displayName,
-                    caregiverIds: caregiverIds
-                )
+            let newRequest = MedicationDeletionRequest(
+                medicationId: medicationId,
+                medicationName: item.name,
+                dosage: item.dosage,
+                timeString: item.timeString,
+                patientId: patient.id,
+                patientDisplayName: patient.displayName,
+                caregiverIds: caregiverIds
             )
+            pendingDeletionRequests.append(newRequest)
+            activeRequest = newRequest
         }
         persistDeletionRequests()
+        CloudKitSyncManager.shared.publishDeletionRequest(activeRequest)
 
         if caregiverIds.count > 1 {
             showToast("تم إرسال طلب حذف دواء \"\(item.name)\" إلى مقدمي الرعاية المرتبطين بك للموافقة.")
@@ -735,7 +1474,7 @@ public final class MedicationService: ObservableObject {
     /// True when `caregiverId` may approve or reject `request`: it was sent to them and they are still
     /// actively linked to the patient. Requests saved without recipients accept any linked caregiver.
     public func canRespond(to request: MedicationDeletionRequest, caregiverId: String) -> Bool {
-        let isLinked = RelationshipService.shared.activeRelationships.contains {
+        let isLinked = relationshipService.activeRelationships.contains {
             $0.caregiverId == caregiverId && $0.patientId == request.patientId && $0.isActive
         }
         guard isLinked else { return false }
@@ -749,9 +1488,20 @@ public final class MedicationService: ObservableObject {
 
     /// Called after a patient–caregiver link ends. That caregiver is removed from the patient's pending
     /// deletion requests; a request left with no linked caregiver is withdrawn and its medication stays scheduled.
+    /// If this device belongs to the caregiver whose link ended, wipe cached medications of this patient.
     public func relationshipEnded(patientId: String, caregiverId: String) {
+        let currentIdentity = KeychainService.shared.loadUserIdentity()
+        if currentIdentity?.role == .caregiver, currentIdentity?.id == caregiverId {
+            allMedications.removeAll { $0.patientId == patientId }
+            pendingDeletionRequests.removeAll { $0.patientId == patientId }
+            persistMedications()
+            persistDeletionRequests()
+            refreshDerivedState()
+            return
+        }
+
         let stillLinked = Set(
-            RelationshipService.shared.activeRelationships
+            relationshipService.activeRelationships
                 .filter { $0.patientId == patientId && $0.isActive }
                 .map(\.caregiverId)
         )
@@ -797,6 +1547,10 @@ public final class MedicationService: ObservableObject {
             return
         }
 
+        let now = AppClock.shared.now
+        reconcilePastAndMidnightDoses(at: now)
+        reconcileMissedDosesForToday(at: now)
+
         // 1. Cancel future reminders (UC-11 S#5)
         cancelReminder(id: request.medicationId)
 
@@ -810,6 +1564,8 @@ public final class MedicationService: ObservableObject {
         persistMedications()
         persistDeletionRequests()
         refreshDerivedState()
+        CloudKitSyncManager.shared.publishMedicationDeletion(medicationId: request.medicationId, patientId: request.patientId)
+        CloudKitSyncManager.shared.publishDeletionRequestRemoval(requestId: request.id, patientId: request.patientId)
 
         showToast("تمت الموافقة على حذف دواء \"\(request.medicationName)\" وحذفه نهائياً.")
     }
@@ -828,75 +1584,128 @@ public final class MedicationService: ObservableObject {
             allMedications[medIndex].isPendingDeletion = false
             persistMedications()
             refreshDerivedState()
+            CloudKitSyncManager.shared.publishMedication(allMedications[medIndex])
         }
 
         // 2. Remove request
         pendingDeletionRequests.remove(at: reqIndex)
         persistDeletionRequests()
+        CloudKitSyncManager.shared.publishDeletionRequestRemoval(requestId: request.id, patientId: request.patientId)
 
         showToast("تم رفض حذف دواء \"\(request.medicationName)\" والاحتفاظ به في جدول المستفيد.")
     }
 
     // MARK: - UC-6 Confirm Dose Taken
-    /// UC-6: Confirms dose taken, records timestamp, updates status and notifies caregivers.
-    /// Single unified entry point for all dose confirmations; ignores duplicate, early, or expired confirmations.
+    /// UC-6: Confirms a dose occurrence (specific `slotMinutes` or primary/active slot), records timestamp, updates status and notifies caregivers.
     @discardableResult
-    public func confirmDoseTaken(id: UUID, patient: UserIdentity) -> Bool {
-        guard let index = allMedications.firstIndex(where: { $0.id == id && $0.patientId == patient.id }) else { return false }
-        let now = AppClock.shared.now
+    public func confirmDoseTaken(
+        id: UUID,
+        slotMinutes: Int? = nil,
+        patient: UserIdentity,
+        at overrideNow: Date? = nil
+    ) -> Bool {
+        let now = overrideNow ?? AppClock.shared.now
+        reconcilePastAndMidnightDoses(at: now)
+        reconcileMissedDosesForToday(at: now)
 
-        // Guard against double-tap / already confirmed dose or out-of-window dose
-        let currentState = doseInteractionState(for: allMedications[index], at: now)
-        guard !allMedications[index].isTaken, (currentState == .dueOnTime || currentState == .overdueLate) else {
+        guard let index = allMedications.firstIndex(where: { $0.id == id && $0.patientId == patient.id }) else { return false }
+
+        let med = allMedications[index]
+        let slots = dailyDoseTimesMinutes(for: med)
+        let resolvedSlot: Int
+        let isCarryover: Bool
+
+        if let slotMinutes {
+            resolvedSlot = slotMinutes
+            isCarryover = hasActiveCarryoverFromYesterday(med, slotMinutes: slotMinutes, at: now)
+        } else if let carryoverOverdue = slots.first(where: {
+            hasActiveCarryoverFromYesterday(med, slotMinutes: $0, at: now) &&
+            doseInteractionState(for: med, slotMinutes: $0, at: now, isCarryover: true) == .overdueLate
+        }) {
+            resolvedSlot = carryoverOverdue
+            isCarryover = true
+        } else if let todayOverdue = slots.first(where: {
+            isScheduledForToday(med, on: now) &&
+            doseInteractionState(for: med, slotMinutes: $0, at: now, isCarryover: false) == .overdueLate
+        }) {
+            resolvedSlot = todayOverdue
+            isCarryover = false
+        } else if let carryoverDue = slots.first(where: {
+            hasActiveCarryoverFromYesterday(med, slotMinutes: $0, at: now) &&
+            doseInteractionState(for: med, slotMinutes: $0, at: now, isCarryover: true) == .dueOnTime
+        }) {
+            resolvedSlot = carryoverDue
+            isCarryover = true
+        } else if let todayDue = slots.first(where: {
+            isScheduledForToday(med, on: now) &&
+            doseInteractionState(for: med, slotMinutes: $0, at: now, isCarryover: false) == .dueOnTime
+        }) {
+            resolvedSlot = todayDue
+            isCarryover = false
+        } else {
+            resolvedSlot = slots.first ?? scheduledMinutes(for: med)
+            isCarryover = hasActiveCarryoverFromYesterday(med, slotMinutes: resolvedSlot, at: now)
+        }
+
+        // Guard against double-tap / already confirmed slot or out-of-window dose
+        let currentState = doseInteractionState(for: med, slotMinutes: resolvedSlot, at: now, isCarryover: isCarryover)
+        guard currentState == .dueOnTime || currentState == .overdueLate else {
             if currentState == .missed {
-                AdherenceService.shared.recordDoseMissedIfNeeded(
-                    medication: allMedications[index],
+                let missDay = isCarryover
+                    ? (Calendar.current.date(byAdding: .day, value: -1, to: now) ?? now)
+                    : now
+                adherenceService.recordDoseMissedIfNeeded(
+                    medication: med,
                     patientId: patient.id,
-                    on: now
+                    on: missDay,
+                    slotMinutes: resolvedSlot
                 )
-                showToast("انتهى وقت تأكيد جرعة «\(allMedications[index].name)» وتم تسجيلها كجرعة فائتة.")
+                showToast("انتهى وقت تأكيد جرعة «\(med.name)» وتم تسجيلها كجرعة فائتة.")
             }
             return false
         }
 
-        let medName = allMedications[index].name
-        let isCarryover = hasActiveCarryoverFromYesterday(allMedications[index], at: now)
+        let medName = med.name
         let yesterday = Calendar.current.date(byAdding: .day, value: -1, to: now)
 
         if isCarryover, let yesterday {
-            // Confirm yesterday's midnight-crossing occurrence without marking today's future dose as taken
-            AdherenceService.shared.recordDoseTaken(
+            // Confirm yesterday's midnight-crossing occurrence without marking today's future slot as taken
+            adherenceService.recordDoseTaken(
                 medication: allMedications[index],
                 patientId: patient.id,
                 takenAt: now,
-                scheduledDay: yesterday
+                scheduledDay: yesterday,
+                slotMinutes: resolvedSlot
             )
         } else {
-            allMedications[index].isTaken = true
+            allMedications[index].takenSlotsToday[resolvedSlot] = now
             allMedications[index].takenAt = now
+            allMedications[index].isTaken = !slots.isEmpty && slots.allSatisfy {
+                isSlotTakenToday(allMedications[index], slotMinutes: $0, on: now)
+            }
             persistMedications()
+            CloudKitSyncManager.shared.publishMedication(allMedications[index])
 
             // UC-7: Record in dose log for weekly adherence report
-            AdherenceService.shared.recordDoseTaken(
+            adherenceService.recordDoseTaken(
                 medication: allMedications[index],
                 patientId: patient.id,
                 takenAt: now,
-                scheduledDay: now
+                scheduledDay: now,
+                slotMinutes: resolvedSlot
             )
         }
 
         // Refresh derived schedule and remainingDoses count
-        refreshDerivedState()
+        refreshDerivedState(at: now)
 
-        // UC-5: Dose confirmed -> cancel caregiver missed dose alert
-        cancelMissedDoseAlert(id: id)
-        if isCarryover, let med = allMedications.first(where: { $0.id == id }) {
-            // Only yesterday's dose was confirmed; today's dose is still open and needs its alert.
-            Task { await self.scheduleMissedDoseAlert(for: med) }
+        // UC-5: Re-plan missed-dose alerts (skips confirmed slot(s) today while keeping remaining slots & future days armed)
+        if schedulesSystemNotifications, let updatedMed = allMedications.first(where: { $0.id == id }) {
+            Task { await self.scheduleMissedDoseAlert(for: updatedMed) }
         }
 
         // UC-6 S#6: Notify connected caregivers
-        RelationshipService.shared.notifyCaregiversDoseTaken(
+        relationshipService.notifyCaregiversDoseTaken(
             medicationName: medName,
             patientName: patient.displayName
         )
@@ -910,33 +1719,40 @@ public final class MedicationService: ObservableObject {
     }
 
     // MARK: - Notification Action Handling (Quick Actions & Notification Taps)
-    public func handleNotificationAction(medicationId: UUID, actionIdentifier: String, appState: AppState?) {
+    public func handleNotificationAction(
+        medicationId: UUID,
+        slotMinutes: Int? = nil,
+        actionIdentifier: String,
+        appState: AppState?
+    ) {
         refreshDerivedState()
         guard let med = allMedications.first(where: { $0.id == medicationId }) else { return }
 
         let now = AppClock.shared.now
-        let state = doseInteractionState(for: med, at: now)
+        let resolvedSlot = slotMinutes ?? dailyDoseTimesMinutes(for: med).first ?? scheduledMinutes(for: med)
+        let isCarryover = hasActiveCarryoverFromYesterday(med, slotMinutes: resolvedSlot, at: now)
+        let state = doseInteractionState(for: med, slotMinutes: resolvedSlot, at: now, isCarryover: isCarryover)
 
         if actionIdentifier == Self.confirmDoseActionIdentifier {
             switch state {
             case .dueOnTime, .overdueLate:
                 if let patient = appState?.currentIdentity ?? KeychainService.shared.loadUserIdentity() {
-                    _ = confirmDoseTaken(id: medicationId, patient: patient)
+                    _ = confirmDoseTaken(id: medicationId, slotMinutes: resolvedSlot, patient: patient)
                 }
             case .missed:
-                reconcilePastAndMidnightDoses(at: now)
+                refreshDerivedState()
                 showToast("انتهى وقت تأكيد جرعة «\(med.name)» وتم تسجيلها كجرعة فائتة.")
             case .upcomingBeforeWindow:
-                showToast("لم يحن موعد جرعة «\(med.name)» بعد (الموعد الساعة \(med.timeString.westernNumerals)).")
+                showToast("لم يحن موعد جرعة «\(med.name)» بعد (الموعد الساعة \(formattedTimeString(forSlotMinutes: resolvedSlot))).")
             case .taken:
                 showToast("تم تأكيد جرعة «\(med.name)» مسبقاً.")
             }
         } else {
             if state == .missed {
-                reconcilePastAndMidnightDoses(at: now)
+                refreshDerivedState()
                 showToast("انتهى وقت تأكيد جرعة «\(med.name)» وتم تسجيلها كجرعة فائتة.")
             }
-            appState?.openDoseConfirmation(for: medicationId)
+            appState?.openDoseConfirmation(for: medicationId, slotMinutes: slotMinutes)
         }
     }
 
@@ -977,7 +1793,7 @@ public final class MedicationService: ObservableObject {
         guard let targetPatientId else {
             throw MedicationError.unauthorizedCaregiver
         }
-        let activeRels = RelationshipService.shared.activeRelationships
+        let activeRels = relationshipService.activeRelationships
         let hasActiveConnection = activeRels.contains { rel in
             rel.caregiverId == caregiverId && rel.isActive && rel.patientId == targetPatientId
         }
@@ -988,13 +1804,387 @@ public final class MedicationService: ObservableObject {
     }
 
     // MARK: - UC-3 S#6 & S#9: Notification Scheduling
+    public struct PlannedNotification: Equatable {
+        public let identifier: String
+        public let hour: Int
+        public let minute: Int
+        public let weekday: Int?
+        public let year: Int?
+        public let month: Int?
+        public let day: Int?
+        public let repeats: Bool
+        public let slotMinutes: Int
+
+        public init(
+            identifier: String,
+            hour: Int,
+            minute: Int,
+            weekday: Int? = nil,
+            year: Int? = nil,
+            month: Int? = nil,
+            day: Int? = nil,
+            repeats: Bool,
+            slotMinutes: Int
+        ) {
+            self.identifier = identifier
+            self.hour = hour
+            self.minute = minute
+            self.weekday = weekday
+            self.year = year
+            self.month = month
+            self.day = day
+            self.repeats = repeats
+            self.slotMinutes = slotMinutes
+        }
+
+        fileprivate var dateComponents: DateComponents {
+            var comps = DateComponents()
+            comps.hour = hour
+            comps.minute = minute
+            if let weekday { comps.weekday = weekday }
+            if let year { comps.year = year }
+            if let month { comps.month = month }
+            if let day { comps.day = day }
+            return comps
+        }
+    }
+
+    /// Computes all dose reminder notification triggers for `item` across its daily frequency slots and selected weekdays/intervals.
+    public func plannedReminders(for item: MedicationItem, at date: Date? = nil) -> [PlannedNotification] {
+        let now = date ?? AppClock.shared.now
+        let calendar = Calendar.current
+        let slots = dailyDoseTimesMinutes(for: item)
+        let weekdays = scheduledWeekdays(for: item)
+        let interval = dayInterval(for: item.frequency)
+        let isMonthly = item.frequency.contains("شهري")
+        let anchorDate = effectiveScheduleStart(for: item)
+        let anchorWeekday = calendar.component(.weekday, from: anchorDate)
+        let anchorDayOfMonth = calendar.component(.day, from: anchorDate)
+
+        var plans: [PlannedNotification] = []
+        for slotMin in slots {
+            let hour = slotMin / 60
+            let minute = slotMin % 60
+            if let weekdays {
+                for weekday in weekdays {
+                    plans.append(
+                        PlannedNotification(
+                            identifier: "medication_reminder_\(item.id.uuidString)_s\(slotMin)_w\(weekday)",
+                            hour: hour,
+                            minute: minute,
+                            weekday: weekday,
+                            repeats: true,
+                            slotMinutes: slotMin
+                        )
+                    )
+                }
+            } else if interval == 7 {
+                plans.append(
+                    PlannedNotification(
+                        identifier: "medication_reminder_\(item.id.uuidString)_s\(slotMin)_w\(anchorWeekday)",
+                        hour: hour,
+                        minute: minute,
+                        weekday: anchorWeekday,
+                        repeats: true,
+                        slotMinutes: slotMin
+                    )
+                )
+            } else if let interval, interval > 1 {
+                // Multi-day interval (e.g. every 2 or 3 days): schedule concrete upcoming dates instead of daily repeating
+                var queued = 0
+                for dayOffset in 0...30 where queued < 7 {
+                    guard let candidateDay = calendar.date(byAdding: .day, value: dayOffset, to: now),
+                          isScheduledForToday(item, on: candidateDay) else {
+                        continue
+                    }
+                    let triggerDate = scheduledDateTime(for: item, on: candidateDay, slotMinutes: slotMin)
+                    guard triggerDate > now else { continue }
+                    let comps = calendar.dateComponents([.year, .month, .day, .hour, .minute], from: triggerDate)
+                    plans.append(
+                        PlannedNotification(
+                            identifier: "medication_reminder_\(item.id.uuidString)_s\(slotMin)_d\(queued)",
+                            hour: comps.hour ?? hour,
+                            minute: comps.minute ?? minute,
+                            year: comps.year,
+                            month: comps.month,
+                            day: comps.day,
+                            repeats: false,
+                            slotMinutes: slotMin
+                        )
+                    )
+                    queued += 1
+                }
+            } else if isMonthly {
+                plans.append(
+                    PlannedNotification(
+                        identifier: "medication_reminder_\(item.id.uuidString)_s\(slotMin)_m\(anchorDayOfMonth)",
+                        hour: hour,
+                        minute: minute,
+                        day: anchorDayOfMonth,
+                        repeats: true,
+                        slotMinutes: slotMin
+                    )
+                )
+            } else {
+                plans.append(
+                    PlannedNotification(
+                        identifier: "medication_reminder_\(item.id.uuidString)_s\(slotMin)",
+                        hour: hour,
+                        minute: minute,
+                        repeats: true,
+                        slotMinutes: slotMin
+                    )
+                )
+            }
+        }
+        return plans
+    }
+
+    /// Computes missed-dose alert notification triggers (+30m after each daily slot), preserving future alerts even when today's slot is confirmed.
+    public func plannedMissedDoseAlerts(
+        for item: MedicationItem,
+        at date: Date? = nil,
+        skippingToday: Bool? = nil
+    ) -> [PlannedNotification] {
+        let now = date ?? AppClock.shared.now
+        let calendar = Calendar.current
+        let slots = dailyDoseTimesMinutes(for: item)
+        let weekdays = scheduledWeekdays(for: item)
+        let interval = dayInterval(for: item.frequency)
+        let isMonthly = item.frequency.contains("شهري")
+        let anchorDate = effectiveScheduleStart(for: item)
+        let anchorWeekday = calendar.component(.weekday, from: anchorDate)
+        let anchorDayOfMonth = calendar.component(.day, from: anchorDate)
+
+        var plans: [PlannedNotification] = []
+        for slotMin in slots {
+            let totalAlertMinutes = slotMin + DoseWindowConfig.lateThresholdMinutes
+            let crossesMidnight = totalAlertMinutes >= 1440
+            let alertMinutes = totalAlertMinutes % 1440
+            let alertHour = alertMinutes / 60
+            let alertMinute = alertMinutes % 60
+
+            let todaySched = scheduledDateTime(for: item, on: now, slotMinutes: slotMin)
+            let todayAlertDate = todaySched.addingTimeInterval(TimeInterval(DoseWindowConfig.lateThresholdMinutes * 60))
+            let slotTakenToday = skippingToday ?? isSlotTakenToday(item, slotMinutes: slotMin, on: now)
+            let shouldSkipToday = slotTakenToday && isScheduledForToday(item, on: now) && now < todayAlertDate
+
+            if shouldSkipToday {
+                if let weekdays, weekdays.count > 1 {
+                    let todayWeekday = calendar.component(.weekday, from: now)
+                    for weekday in weekdays where weekday != todayWeekday {
+                        let alertWeekday = crossesMidnight ? ((weekday % 7) + 1) : weekday
+                        plans.append(
+                            PlannedNotification(
+                                identifier: "medication_missed_dose_\(item.id.uuidString)_s\(slotMin)_w\(alertWeekday)",
+                                hour: alertHour,
+                                minute: alertMinute,
+                                weekday: alertWeekday,
+                                repeats: true,
+                                slotMinutes: slotMin
+                            )
+                        )
+                    }
+                    if let nextSameWeekday = calendar.date(byAdding: .day, value: 7, to: now) {
+                        let nextAlertDate = scheduledDateTime(for: item, on: nextSameWeekday, slotMinutes: slotMin)
+                            .addingTimeInterval(TimeInterval(DoseWindowConfig.lateThresholdMinutes * 60))
+                        let comps = calendar.dateComponents([.year, .month, .day, .hour, .minute], from: nextAlertDate)
+                        plans.append(
+                            PlannedNotification(
+                                identifier: "medication_missed_dose_\(item.id.uuidString)_s\(slotMin)_next_0",
+                                hour: comps.hour ?? alertHour,
+                                minute: comps.minute ?? alertMinute,
+                                year: comps.year,
+                                month: comps.month,
+                                day: comps.day,
+                                repeats: false,
+                                slotMinutes: slotMin
+                            )
+                        )
+                    }
+                } else {
+                    var queuedCount = 0
+                    let searchHorizon = isMonthly ? 95 : 28
+                    for dayOffset in 1...searchHorizon where queuedCount < 3 {
+                        guard let candidateDay = calendar.date(byAdding: .day, value: dayOffset, to: now),
+                              isScheduledForToday(item, on: candidateDay) else {
+                            continue
+                        }
+                        let nextAlertDate = scheduledDateTime(for: item, on: candidateDay, slotMinutes: slotMin)
+                            .addingTimeInterval(TimeInterval(DoseWindowConfig.lateThresholdMinutes * 60))
+                        let comps = calendar.dateComponents([.year, .month, .day, .hour, .minute], from: nextAlertDate)
+                        plans.append(
+                            PlannedNotification(
+                                identifier: "medication_missed_dose_\(item.id.uuidString)_s\(slotMin)_next_\(queuedCount)",
+                                hour: comps.hour ?? alertHour,
+                                minute: comps.minute ?? alertMinute,
+                                year: comps.year,
+                                month: comps.month,
+                                day: comps.day,
+                                repeats: false,
+                                slotMinutes: slotMin
+                            )
+                        )
+                        queuedCount += 1
+                    }
+                }
+            } else if let weekdays {
+                for weekday in weekdays {
+                    let alertWeekday = crossesMidnight ? ((weekday % 7) + 1) : weekday
+                    plans.append(
+                        PlannedNotification(
+                            identifier: "medication_missed_dose_\(item.id.uuidString)_s\(slotMin)_w\(alertWeekday)",
+                            hour: alertHour,
+                            minute: alertMinute,
+                            weekday: alertWeekday,
+                            repeats: true,
+                            slotMinutes: slotMin
+                        )
+                    )
+                }
+            } else if interval == 7 {
+                let alertWeekday = crossesMidnight ? ((anchorWeekday % 7) + 1) : anchorWeekday
+                plans.append(
+                    PlannedNotification(
+                        identifier: "medication_missed_dose_\(item.id.uuidString)_s\(slotMin)_w\(alertWeekday)",
+                        hour: alertHour,
+                        minute: alertMinute,
+                        weekday: alertWeekday,
+                        repeats: true,
+                        slotMinutes: slotMin
+                    )
+                )
+            } else if let interval, interval > 1 {
+                var queuedCount = 0
+                for dayOffset in 0...30 where queuedCount < 7 {
+                    guard let candidateDay = calendar.date(byAdding: .day, value: dayOffset, to: now),
+                          isScheduledForToday(item, on: candidateDay) else {
+                        continue
+                    }
+                    let nextAlertDate = scheduledDateTime(for: item, on: candidateDay, slotMinutes: slotMin)
+                        .addingTimeInterval(TimeInterval(DoseWindowConfig.lateThresholdMinutes * 60))
+                    guard nextAlertDate > now else { continue }
+                    let comps = calendar.dateComponents([.year, .month, .day, .hour, .minute], from: nextAlertDate)
+                    plans.append(
+                        PlannedNotification(
+                            identifier: "medication_missed_dose_\(item.id.uuidString)_s\(slotMin)_next_\(queuedCount)",
+                            hour: comps.hour ?? alertHour,
+                            minute: comps.minute ?? alertMinute,
+                            year: comps.year,
+                            month: comps.month,
+                            day: comps.day,
+                            repeats: false,
+                            slotMinutes: slotMin
+                        )
+                    )
+                    queuedCount += 1
+                }
+            } else if isMonthly {
+                if !crossesMidnight {
+                    plans.append(
+                        PlannedNotification(
+                            identifier: "medication_missed_dose_\(item.id.uuidString)_s\(slotMin)_m\(anchorDayOfMonth)",
+                            hour: alertHour,
+                            minute: alertMinute,
+                            day: anchorDayOfMonth,
+                            repeats: true,
+                            slotMinutes: slotMin
+                        )
+                    )
+                } else {
+                    var queuedCount = 0
+                    for dayOffset in 0...95 where queuedCount < 3 {
+                        guard let candidateDay = calendar.date(byAdding: .day, value: dayOffset, to: now),
+                              isScheduledForToday(item, on: candidateDay) else {
+                            continue
+                        }
+                        let nextAlertDate = scheduledDateTime(for: item, on: candidateDay, slotMinutes: slotMin)
+                            .addingTimeInterval(TimeInterval(DoseWindowConfig.lateThresholdMinutes * 60))
+                        guard nextAlertDate > now else { continue }
+                        let comps = calendar.dateComponents([.year, .month, .day, .hour, .minute], from: nextAlertDate)
+                        plans.append(
+                            PlannedNotification(
+                                identifier: "medication_missed_dose_\(item.id.uuidString)_s\(slotMin)_next_\(queuedCount)",
+                                hour: comps.hour ?? alertHour,
+                                minute: comps.minute ?? alertMinute,
+                                year: comps.year,
+                                month: comps.month,
+                                day: comps.day,
+                                repeats: false,
+                                slotMinutes: slotMin
+                            )
+                        )
+                        queuedCount += 1
+                    }
+                }
+            } else {
+                plans.append(
+                    PlannedNotification(
+                        identifier: "medication_missed_dose_\(item.id.uuidString)_s\(slotMin)",
+                        hour: alertHour,
+                        minute: alertMinute,
+                        repeats: true,
+                        slotMinutes: slotMin
+                    )
+                )
+            }
+        }
+        return plans
+    }
+
+    private func knownNotificationIdentifiers(for id: UUID) -> [String] {
+        var ids = [
+            "medication_reminder_\(id.uuidString)",
+            "medication_missed_dose_\(id.uuidString)",
+            "medication_missed_dose_next_\(id.uuidString)"
+        ]
+        for w in 1...7 {
+            ids.append("medication_reminder_\(id.uuidString)_w\(w)")
+            ids.append("medication_missed_dose_\(id.uuidString)_w\(w)")
+        }
+        if let item = allMedications.first(where: { $0.id == id }) {
+            for slot in dailyDoseTimesMinutes(for: item) {
+                ids.append("medication_reminder_\(id.uuidString)_s\(slot)")
+                ids.append("medication_missed_dose_\(id.uuidString)_s\(slot)")
+                for w in 1...7 {
+                    ids.append("medication_reminder_\(id.uuidString)_s\(slot)_w\(w)")
+                    ids.append("medication_missed_dose_\(id.uuidString)_s\(slot)_w\(w)")
+                }
+                for k in 0..<3 {
+                    ids.append("medication_missed_dose_\(id.uuidString)_s\(slot)_next_\(k)")
+                }
+            }
+        }
+        return ids
+    }
+
+    private func removePendingRequests(matchingPrefixes prefixes: [String], center: UNUserNotificationCenter) async {
+        let pending = await center.pendingNotificationRequests()
+        let matching = pending.map(\.identifier).filter { identifier in
+            prefixes.contains { prefix in identifier.hasPrefix(prefix) }
+        }
+        if !matching.isEmpty {
+            center.removePendingNotificationRequests(withIdentifiers: matching)
+        }
+    }
+
     public func scheduleReminder(for item: MedicationItem) async -> Bool {
+        guard schedulesSystemNotifications else { return true }
         let enabled = UserDefaults.standard.object(forKey: "dawai_notifications_enabled") as? Bool ?? true
         guard enabled else {
             return true
         }
 
         let center = UNUserNotificationCenter.current()
+
+        // 1. On iOS 26+, schedule full-screen AlarmKit alarms (no snooze) on the patient's own device when enabled.
+        let isLocalPatientDevice = KeychainService.shared.loadUserIdentity()?.id == item.patientId
+        var usedAlarmKit = false
+        if isLocalPatientDevice {
+            usedAlarmKit = await MedicationAlarmService.shared.scheduleAlarms(for: item, using: self)
+        } else {
+            MedicationAlarmService.shared.cancelAlarms(forMedicationId: item.id)
+        }
 
         do {
             let settings = await center.notificationSettings()
@@ -1004,54 +2194,60 @@ public final class MedicationService: ObservableObject {
                 isAuthorized = try await center.requestAuthorization(options: [.alert, .sound, .badge])
             }
 
-            guard isAuthorized else {
-                return false
-            }
-
-            // Create notification content (UC-4 S#3: payload with medicationId)
-            let content = UNMutableNotificationContent()
-            content.title = "تذكير بموعد دواء: \(item.name)"
-            content.body = "حان موعد تناول الجرعة (\(item.dosage)) - \(item.timeString)"
-            if let instructions = item.instructions, !instructions.isEmpty {
-                content.body += "\nتعليمات: \(instructions)"
-            }
-            content.sound = .default
-            content.categoryIdentifier = Self.doseReminderCategoryIdentifier
-            content.userInfo = [
-                "medicationId": item.id.uuidString,
-                "type": "dose_reminder"
-            ]
-
-            // Parse time trigger
-            var dateComponents = DateComponents()
-            if let date = item.scheduledDate {
-                dateComponents = Calendar.current.dateComponents([.hour, .minute], from: date)
-            } else {
-                dateComponents.hour = 12
-                dateComponents.minute = 0
-            }
-
-            let trigger = UNCalendarNotificationTrigger(dateMatching: dateComponents, repeats: true)
-            let request = UNNotificationRequest(
-                identifier: "medication_reminder_\(item.id.uuidString)",
-                content: content,
-                trigger: trigger
+            await removePendingRequests(
+                matchingPrefixes: ["medication_reminder_\(item.id.uuidString)"],
+                center: center
             )
 
-            try await center.add(request)
+            // 2. If AlarmKit is not active/authorized on this device, schedule standard local notification reminders.
+            if !usedAlarmKit {
+                guard isAuthorized else {
+                    return false
+                }
 
-            // UC-5 S#2 & S#3: Schedule Missed-Dose Alert for Caregiver (30 minutes after scheduled time)
-            await scheduleMissedDoseAlert(for: item)
+                let plans = plannedReminders(for: item)
+                for plan in plans {
+                    let slotTime = formattedTimeString(forSlotMinutes: plan.slotMinutes)
+                    let content = UNMutableNotificationContent()
+                    content.title = "تذكير بموعد دواء: \(item.name)"
+                    content.body = "حان موعد تناول الجرعة (\(item.dosage)) - \(slotTime)"
+                    if let instructions = item.instructions, !instructions.isEmpty {
+                        content.body += "\nتعليمات: \(instructions)"
+                    }
+                    content.sound = .default
+                    content.categoryIdentifier = Self.doseReminderCategoryIdentifier
+                    content.userInfo = [
+                        "medicationId": item.id.uuidString,
+                        "slotMinutes": plan.slotMinutes,
+                        "timeString": slotTime,
+                        "type": "dose_reminder"
+                    ]
 
-            return true
+                    let trigger = UNCalendarNotificationTrigger(dateMatching: plan.dateComponents, repeats: plan.repeats)
+                    let request = UNNotificationRequest(
+                        identifier: plan.identifier,
+                        content: content,
+                        trigger: trigger
+                    )
+                    try await center.add(request)
+                }
+            }
+
+            // UC-5 S#2 & S#3: Schedule Missed-Dose Alert for Caregiver (30 minutes after each scheduled dose time)
+            if isAuthorized {
+                await scheduleMissedDoseAlert(for: item)
+            }
+
+            return usedAlarmKit || isAuthorized
         } catch {
-            return false
+            return usedAlarmKit
         }
     }
 
-    /// UC-5 S#2 & S#3: Schedules the repeating missed-dose alert 30 minutes after `item`'s scheduled time.
+    /// UC-5 S#2 & S#3: Schedules missed-dose alerts 30 minutes after each scheduled slot of `item`.
     /// Does nothing when reminders are switched off in Settings or notifications are not authorized.
-    public func scheduleMissedDoseAlert(for item: MedicationItem) async {
+    public func scheduleMissedDoseAlert(for item: MedicationItem, skippingToday: Bool? = nil) async {
+        guard schedulesSystemNotifications else { return }
         let enabled = UserDefaults.standard.object(forKey: "dawai_notifications_enabled") as? Bool ?? true
         guard enabled else { return }
 
@@ -1059,56 +2255,65 @@ public final class MedicationService: ObservableObject {
         let settings = await center.notificationSettings()
         guard settings.authorizationStatus == .authorized || settings.authorizationStatus == .provisional else { return }
 
-        let missedContent = UNMutableNotificationContent()
-        missedContent.title = "تنبيه تأخر جرعة: \(item.name)"
-        missedContent.body = "لم يتم تأكيد أخذ جرعة \(item.name) (\(item.dosage)) بعد مرور 30 دقيقة من موعدها."
-        missedContent.sound = .default
-        missedContent.userInfo = [
-            "medicationId": item.id.uuidString,
-            "medicationName": item.name,
-            "dosage": item.dosage,
-            "patientId": item.patientId,
-            "type": "missed_dose_alert"
-        ]
-
-        var missedComps = DateComponents()
-        let schedMinutes = scheduledMinutes(for: item)
-        let alertMinutes = (schedMinutes + DoseWindowConfig.lateThresholdMinutes) % 1440
-        missedComps.hour = alertMinutes / 60
-        missedComps.minute = alertMinutes % 60
-
-        let missedTrigger = UNCalendarNotificationTrigger(dateMatching: missedComps, repeats: true)
-        let missedRequest = UNNotificationRequest(
-            identifier: "medication_missed_dose_\(item.id.uuidString)",
-            content: missedContent,
-            trigger: missedTrigger
+        await removePendingRequests(
+            matchingPrefixes: ["medication_missed_dose_\(item.id.uuidString)"],
+            center: center
         )
-        try? await center.add(missedRequest)
+
+        let plans = plannedMissedDoseAlerts(for: item, skippingToday: skippingToday)
+        for plan in plans {
+            let slotTime = formattedTimeString(forSlotMinutes: plan.slotMinutes)
+            let missedContent = UNMutableNotificationContent()
+            missedContent.title = "تنبيه تأخر جرعة: \(item.name)"
+            missedContent.body = "لم يتم تأكيد أخذ جرعة \(item.name) (\(item.dosage)) بعد مرور \(DoseWindowConfig.lateThresholdMinutes) دقيقة من موعدها (\(slotTime))."
+            missedContent.sound = .default
+            missedContent.userInfo = [
+                "medicationId": item.id.uuidString,
+                "slotMinutes": plan.slotMinutes,
+                "medicationName": item.name,
+                "dosage": item.dosage,
+                "timeString": slotTime,
+                "patientId": item.patientId,
+                "type": "missed_dose_alert"
+            ]
+
+            let missedTrigger = UNCalendarNotificationTrigger(dateMatching: plan.dateComponents, repeats: plan.repeats)
+            let missedRequest = UNNotificationRequest(
+                identifier: plan.identifier,
+                content: missedContent,
+                trigger: missedTrigger
+            )
+            try? await center.add(missedRequest)
+        }
     }
 
     public func cancelReminder(id: UUID) {
-        UNUserNotificationCenter.current().removePendingNotificationRequests(
-            withIdentifiers: [
-                "medication_reminder_\(id.uuidString)",
-                "medication_missed_dose_\(id.uuidString)"
-            ]
-        )
-        UNUserNotificationCenter.current().removeDeliveredNotifications(
-            withIdentifiers: [
-                "medication_reminder_\(id.uuidString)",
-                "medication_missed_dose_\(id.uuidString)"
-            ]
-        )
+        guard schedulesSystemNotifications else { return }
+        MedicationAlarmService.shared.cancelAlarms(forMedicationId: id)
+        let center = UNUserNotificationCenter.current()
+        let identifiers = knownNotificationIdentifiers(for: id)
+        center.removePendingNotificationRequests(withIdentifiers: identifiers)
+        center.removeDeliveredNotifications(withIdentifiers: identifiers)
+        let prefixes = [
+            "medication_reminder_\(id.uuidString)",
+            "medication_missed_dose_\(id.uuidString)"
+        ]
+        Task {
+            await removePendingRequests(matchingPrefixes: prefixes, center: center)
+        }
     }
 
-    /// UC-5: Cancels pending and delivered missed dose alert when dose is confirmed
+    /// UC-5: Cancels pending and delivered missed dose alerts for `id`
     public func cancelMissedDoseAlert(id: UUID) {
-        UNUserNotificationCenter.current().removePendingNotificationRequests(
-            withIdentifiers: ["medication_missed_dose_\(id.uuidString)"]
-        )
-        UNUserNotificationCenter.current().removeDeliveredNotifications(
-            withIdentifiers: ["medication_missed_dose_\(id.uuidString)"]
-        )
+        guard schedulesSystemNotifications else { return }
+        let center = UNUserNotificationCenter.current()
+        let identifiers = knownNotificationIdentifiers(for: id).filter { $0.hasPrefix("medication_missed_dose_") }
+        center.removePendingNotificationRequests(withIdentifiers: identifiers)
+        center.removeDeliveredNotifications(withIdentifiers: identifiers)
+        let prefixes = ["medication_missed_dose_\(id.uuidString)"]
+        Task {
+            await removePendingRequests(matchingPrefixes: prefixes, center: center)
+        }
     }
 
     /// Proactively requests notification permissions if not yet determined (e.g. on first Home view appearance)
@@ -1173,6 +2378,7 @@ public final class MedicationService: ObservableObject {
             "medicationId": item.id.uuidString,
             "medicationName": item.name,
             "dosage": item.dosage,
+            "timeString": item.timeString,
             "patientId": item.patientId,
             "type": "missed_dose_alert"
         ]
@@ -1215,6 +2421,8 @@ public final class MedicationService: ObservableObject {
         if !enabled {
             center.removeAllPendingNotificationRequests()
             center.removeAllDeliveredNotifications()
+            MedicationAlarmService.shared.cancelAllAlarms()
+            DoseLiveActivityManager.shared.endAllActivities()
             UserDefaults.standard.set(false, forKey: "dawai_notifications_enabled")
             showToast("تم إيقاف تنبيهات مواعيد الأدوية")
             return .disabled
@@ -1242,9 +2450,9 @@ public final class MedicationService: ObservableObject {
 
             UserDefaults.standard.set(true, forKey: "dawai_notifications_enabled")
 
-            // Reschedule reminders for all upcoming medications
+            // Reschedule reminders for all medications
             var scheduledCount = 0
-            for med in allMedications where !med.isTaken {
+            for med in allMedications {
                 let success = await scheduleReminder(for: med)
                 if success { scheduledCount += 1 }
             }
@@ -1263,6 +2471,32 @@ public final class MedicationService: ObservableObject {
         _ = await setNotificationsEnabled(enabled)
     }
 
+    /// Toggles iOS 26+ AlarmKit full-screen alarms on or off and reschedules all patient medications accordingly.
+    @discardableResult
+    public func setAlarmKitEnabled(_ enabled: Bool) async -> Bool {
+        MedicationAlarmService.shared.isUserEnabled = enabled
+        if !enabled {
+            MedicationAlarmService.shared.cancelAllAlarms()
+            for med in medications {
+                _ = await scheduleReminder(for: med)
+            }
+            showToast("تم إيقاف المنبّه القوي والعودة للإشعارات العادية")
+            return false
+        }
+
+        let authorized = await MedicationAlarmService.shared.requestAuthorizationIfNeeded()
+        guard authorized else {
+            MedicationAlarmService.shared.isUserEnabled = false
+            return false
+        }
+
+        for med in medications {
+            _ = await scheduleReminder(for: med)
+        }
+        showToast("تم تفعيل منبّه الدواء القوي بملء الشاشة")
+        return true
+    }
+
     // MARK: - Toast helper
     public func showToast(_ message: String) {
         withAnimation(.spring(response: 0.35, dampingFraction: 0.75)) {
@@ -1278,10 +2512,13 @@ public final class MedicationService: ObservableObject {
 }
 
 // MARK: - UC-4 S#4: Notification Center Delegate
+@MainActor
 public final class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate, @unchecked Sendable {
     public static let shared = NotificationDelegate()
 
     public weak var appState: AppState?
+    private var pendingBeneficiary: BeneficiarySummary?
+    private var pendingDoseAction: (medicationId: UUID, slotMinutes: Int?, actionIdentifier: String)?
 
     private override init() {
         super.init()
@@ -1290,9 +2527,105 @@ public final class NotificationDelegate: NSObject, UNUserNotificationCenterDeleg
     public func configure(with appState: AppState) {
         self.appState = appState
         UNUserNotificationCenter.current().delegate = self
+
+        if let pending = pendingBeneficiary {
+            self.pendingBeneficiary = nil
+            appState.openCaregiverPatientDetail(for: pending)
+        }
+        if let pendingAction = pendingDoseAction {
+            self.pendingDoseAction = nil
+            MedicationService.shared.handleNotificationAction(
+                medicationId: pendingAction.medicationId,
+                slotMinutes: pendingAction.slotMinutes,
+                actionIdentifier: pendingAction.actionIdentifier,
+                appState: appState
+            )
+        }
     }
 
-    public func userNotificationCenter(
+    @MainActor
+    public func openDoseFromAlarm(medicationId: UUID, slotMinutes: Int?) {
+        if let appState {
+            appState.openDoseConfirmation(for: medicationId, slotMinutes: slotMinutes)
+        } else {
+            pendingDoseAction = (
+                medicationId: medicationId,
+                slotMinutes: slotMinutes,
+                actionIdentifier: UNNotificationDefaultActionIdentifier
+            )
+        }
+    }
+
+    private func resolveBeneficiaryForMissedDoseAlert(
+        medicationId: UUID?,
+        medicationName: String,
+        dosage: String,
+        timeString: String?,
+        payloadPatientId: String?
+    ) -> BeneficiarySummary {
+        let med = medicationId.flatMap { id in
+            MedicationService.shared.allMedications.first(where: { $0.id == id })
+        }
+        let rawPatientId = payloadPatientId ?? med?.patientId
+
+        let relationship: ActiveRelationship?
+        if let currentId = appState?.currentIdentity?.id,
+           let pid = rawPatientId,
+           let matched = RelationshipService.shared.activeRelationships.first(where: {
+               $0.caregiverId == currentId && $0.patientId == pid && $0.isActive
+           }) {
+            relationship = matched
+        } else if let pid = rawPatientId,
+                  let matched = RelationshipService.shared.activeRelationships.first(where: {
+                      $0.patientId == pid && $0.isActive
+                  }) {
+            relationship = matched
+        } else if appState?.currentIdentity?.role == .caregiver,
+                  let currentId = appState?.currentIdentity?.id,
+                  let matched = RelationshipService.shared.activeRelationships.first(where: {
+                      $0.caregiverId == currentId && $0.isActive
+                  }) {
+            relationship = matched
+        } else {
+            relationship = nil
+        }
+
+        let resolvedPatientId = relationship?.patientId ?? rawPatientId
+        let demoMatch = DemoModeService.shared.beneficiaries.first(where: { $0.patientId == resolvedPatientId })
+            ?? (resolvedPatientId == nil ? DemoModeService.shared.beneficiaries.first : nil)
+        let storedPatient = KeychainService.shared.loadUserIdentity(forRole: .patient)
+
+        let resolvedName: String =
+            relationship?.patientDisplayName
+            ?? demoMatch?.name
+            ?? (storedPatient?.id == resolvedPatientId ? storedPatient?.displayName : nil)
+            ?? (appState?.currentIdentity?.role == .patient && appState?.currentIdentity?.id == resolvedPatientId ? appState?.currentIdentity?.displayName : nil)
+            ?? "المستفيد"
+
+        let resolvedMedName = medicationName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? (med?.name ?? "الدواء")
+            : medicationName
+        let resolvedDosage = dosage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? med?.dosage
+            : dosage
+        let resolvedTimeString = (timeString?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false ? timeString : nil)
+            ?? med?.timeString
+
+        return BeneficiarySummary(
+            id: relationship?.id ?? demoMatch?.id ?? UUID(),
+            patientId: resolvedPatientId ?? demoMatch?.patientId,
+            name: resolvedName,
+            hasDelayAlert: true,
+            delayNotice: "\(DoseWindowConfig.lateThresholdMinutes) د تأخير، \(resolvedMedName)",
+            scheduledTime: resolvedTimeString,
+            isInvitation: false,
+            delayedMedicationName: resolvedMedName,
+            delayedDosage: resolvedDosage,
+            phoneNumber: demoMatch?.phoneNumber ?? "0501234567"
+        )
+    }
+
+    nonisolated public func userNotificationCenter(
         _ center: UNUserNotificationCenter,
         didReceive response: UNNotificationResponse,
         withCompletionHandler completionHandler: @escaping () -> Void
@@ -1304,37 +2637,40 @@ public final class NotificationDelegate: NSObject, UNUserNotificationCenterDeleg
             // UC-5 S#5: Caregiver opens missed-dose notification -> system routes directly to patient detail
             let medName = userInfo["medicationName"] as? String ?? "الدواء"
             let dosage = userInfo["dosage"] as? String ?? ""
+            let payloadTimeString = userInfo["timeString"] as? String
             let payloadPatientId = userInfo["patientId"] as? String
             let medicationId = (userInfo["medicationId"] as? String).flatMap(UUID.init(uuidString:))
             Task { @MainActor in
-                // Resolve the real patient: from the payload, or (for alerts scheduled before the
-                // payload carried it) from the medication's owner.
-                let patientId = payloadPatientId
-                    ?? medicationId.flatMap { id in MedicationService.shared.allMedications.first(where: { $0.id == id })?.patientId }
-                let relationship = RelationshipService.shared.activeRelationships.first { $0.patientId == patientId && $0.isActive }
-                let beneficiary = BeneficiarySummary(
-                    id: relationship?.id ?? UUID(),
-                    patientId: patientId,
-                    name: relationship?.patientDisplayName ?? "المستفيد",
-                    hasDelayAlert: true,
-                    delayNotice: "30 د تأخير، \(medName)",
-                    scheduledTime: nil,
-                    isInvitation: false,
-                    delayedMedicationName: medName,
-                    delayedDosage: dosage,
-                    phoneNumber: "0501234567"
+                let beneficiary = self.resolveBeneficiaryForMissedDoseAlert(
+                    medicationId: medicationId,
+                    medicationName: medName,
+                    dosage: dosage,
+                    timeString: payloadTimeString,
+                    payloadPatientId: payloadPatientId
                 )
-                self.appState?.openCaregiverPatientDetail(for: beneficiary)
+                if let appState = self.appState {
+                    appState.openCaregiverPatientDetail(for: beneficiary)
+                } else {
+                    self.pendingBeneficiary = beneficiary
+                }
+                completionHandler()
             }
+            return
         } else if let medIdString = userInfo["medicationId"] as? String,
                   let medId = UUID(uuidString: medIdString) {
             let actionId = response.actionIdentifier
+            let slotMinutes = userInfo["slotMinutes"] as? Int
             Task { @MainActor in
-                MedicationService.shared.handleNotificationAction(
-                    medicationId: medId,
-                    actionIdentifier: actionId,
-                    appState: self.appState
-                )
+                if self.appState == nil && actionId == UNNotificationDefaultActionIdentifier {
+                    self.pendingDoseAction = (medId, slotMinutes, actionId)
+                } else {
+                    MedicationService.shared.handleNotificationAction(
+                        medicationId: medId,
+                        slotMinutes: slotMinutes,
+                        actionIdentifier: actionId,
+                        appState: self.appState
+                    )
+                }
                 completionHandler()
             }
             return
@@ -1342,7 +2678,7 @@ public final class NotificationDelegate: NSObject, UNUserNotificationCenterDeleg
         completionHandler()
     }
 
-    public func userNotificationCenter(
+    nonisolated public func userNotificationCenter(
         _ center: UNUserNotificationCenter,
         willPresent notification: UNNotification,
         withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void

@@ -11,7 +11,7 @@ import Foundation
 import SwiftUI
 
 // MARK: - Dose Status Lifecycle
-public enum DoseStatus: String, Codable, CaseIterable {
+public enum DoseStatus: String, Codable, CaseIterable, Sendable {
     case takenOnTime = "taken_on_time"
     case takenLate = "taken_late"
     case missed = "missed"
@@ -71,7 +71,7 @@ public enum DoseStatus: String, Codable, CaseIterable {
 }
 
 // MARK: - Single Dose Record (Historical Dose Log)
-public struct DoseRecord: Identifiable, Codable, Equatable {
+public struct DoseRecord: Identifiable, Codable, Equatable, Sendable {
     public let id: UUID
     public let patientId: String
     public let medicationId: UUID
@@ -224,8 +224,15 @@ public enum AdherenceTier {
     }
 
     public var messageArabic: String {
+        messageArabic(lateCount: 0, missedCount: 0)
+    }
+
+    public func messageArabic(lateCount: Int, missedCount: Int = 0) -> String {
         switch self {
         case .excellent:
+            if lateCount > 0 {
+                return "التزام ممتاز بأخذ الجرعات، مع وجود \(lateCount) جرعة متأخرة عن موعدها."
+            }
             return "التزام رائع بمواعيد الأدوية المحددة بدون تأخير ملحوظ."
         case .good:
             return "التزام جيد بمعظم الجرعات مع بعض التأخيرات البسيطة."
@@ -276,6 +283,10 @@ public struct WeeklyAdherenceReport: Equatable {
         } else {
             return .low
         }
+    }
+
+    public var tierMessageArabic: String {
+        tier.messageArabic(lateCount: totalTakenLate, missedCount: totalMissed)
     }
 
     public init(

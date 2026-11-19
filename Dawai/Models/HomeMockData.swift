@@ -8,8 +8,77 @@
 
 import Foundation
 
+// MARK: - Medication Weekday Model
+/// Gregorian weekday values matching `Calendar.current.component(.weekday, from:)` (1 = Sunday ... 7 = Saturday).
+public enum MedicationWeekday: Int, CaseIterable, Codable, Hashable, Comparable, Identifiable {
+    case sunday = 1
+    case monday = 2
+    case tuesday = 3
+    case wednesday = 4
+    case thursday = 5
+    case friday = 6
+    case saturday = 7
+
+    public var id: Int { rawValue }
+
+    public static func < (lhs: MedicationWeekday, rhs: MedicationWeekday) -> Bool {
+        lhs.rawValue < rhs.rawValue
+    }
+
+    public var optionTitle: String {
+        switch self {
+        case .sunday: return "كل الاحد"
+        case .monday: return "كل الاثنين"
+        case .tuesday: return "كل الثلاثاء"
+        case .wednesday: return "كل الاربعاء"
+        case .thursday: return "كل الخميس"
+        case .friday: return "كل الجمعه"
+        case .saturday: return "كل السبت"
+        }
+    }
+
+    private var keywords: [String] {
+        switch self {
+        case .sunday: return ["الاحد", "الأحد"]
+        case .monday: return ["الاثنين", "الإثنين"]
+        case .tuesday: return ["الثلاثاء"]
+        case .wednesday: return ["الاربعاء", "الأربعاء"]
+        case .thursday: return ["الخميس"]
+        case .friday: return ["الجمعه", "الجمعة"]
+        case .saturday: return ["السبت"]
+        }
+    }
+
+    /// Parses legacy Arabic day labels into Gregorian weekday numbers (`1...7`).
+    /// Returns an empty set when the schedule repeats every day (all 7 days or `"كل يوم"`).
+    public static func parseWeekdayNumbers(from days: [String]) -> Set<Int> {
+        if days.isEmpty || days.contains("كل يوم") || days.contains("يومياً") || days.contains("دائم") {
+            return []
+        }
+        var result = Set<Int>()
+        for weekday in MedicationWeekday.allCases {
+            let isSelected = days.contains { day in
+                weekday.keywords.contains { keyword in day.contains(keyword) }
+            }
+            if isSelected {
+                result.insert(weekday.rawValue)
+            }
+        }
+        return result.count == 7 ? [] : result
+    }
+
+    /// Converts structured weekday numbers (`1...7`) into display labels for the UI.
+    public static func displayDays(from weekdays: Set<Int>) -> [String] {
+        let valid = weekdays.filter { (1...7).contains($0) }
+        if valid.isEmpty || valid.count == 7 {
+            return ["كل يوم"]
+        }
+        return valid.sorted().compactMap { MedicationWeekday(rawValue: $0)?.optionTitle }
+    }
+}
+
 // MARK: - Medication Item Model
-public struct MedicationItem: Identifiable, Codable, Equatable {
+public struct MedicationItem: Identifiable, Codable, Equatable, Sendable {
     public let id: UUID
     /// Identity id of the patient who owns this medication. Medication lists, missed-dose checks
     /// and caregiver screens all filter by this value. It is also the ownership key for future sync.
@@ -19,34 +88,42 @@ public struct MedicationItem: Identifiable, Codable, Equatable {
     public var timeString: String
     public var scheduledDate: Date?
     public var days: [String]
+    /// Structured Gregorian weekday numbers (`1 = Sunday ... 7 = Saturday`). Empty means every day.
+    public var selectedWeekdays: Set<Int>
     public var frequency: String
     public var duration: String
     public var instructions: String?
     public var imageData: Data?
     public var isTaken: Bool
     public var takenAt: Date?
+    /// Maps slot time in minutes from midnight (0..<1440) to the confirmation timestamp on the current day.
+    public var takenSlotsToday: [Int: Date]
     public var createdAt: Date
+    public var scheduleUpdatedAt: Date
     public var isPendingDeletion: Bool
 
     enum CodingKeys: String, CodingKey {
-        case id, patientId, name, dosage, timeString, scheduledDate, days, frequency, duration, instructions, imageData, isTaken, takenAt, createdAt, isPendingDeletion
+        case id, patientId, name, dosage, timeString, scheduledDate, days, selectedWeekdays, frequency, duration, instructions, imageData, isTaken, takenAt, takenSlotsToday, createdAt, scheduleUpdatedAt, isPendingDeletion
     }
 
     public init(
         id: UUID = UUID(),
-        patientId: String,
+        patientId: String = MedicationItem.currentIdentityPatientId,
         name: String,
         dosage: String,
         timeString: String,
         scheduledDate: Date? = nil,
         days: [String] = ["كل يوم"],
+        selectedWeekdays: Set<Int>? = nil,
         frequency: String = "مرة يوميًا",
         duration: String = "دائم",
         instructions: String? = nil,
         imageData: Data? = nil,
         isTaken: Bool = false,
         takenAt: Date? = nil,
-        createdAt: Date = Date(),
+        takenSlotsToday: [Int: Date] = [:],
+        createdAt: Date = AppClock.shared.now,
+        scheduleUpdatedAt: Date? = nil,
         isPendingDeletion: Bool = false
     ) {
         self.id = id
@@ -55,14 +132,25 @@ public struct MedicationItem: Identifiable, Codable, Equatable {
         self.dosage = dosage
         self.timeString = timeString
         self.scheduledDate = scheduledDate
-        self.days = days
+        if let selectedWeekdays {
+            let normalized = Set(selectedWeekdays.filter { (1...7).contains($0) })
+            self.selectedWeekdays = normalized.count == 7 ? [] : normalized
+            self.days = (days == ["كل يوم"] && !self.selectedWeekdays.isEmpty)
+                ? MedicationWeekday.displayDays(from: self.selectedWeekdays)
+                : days
+        } else {
+            self.days = days
+            self.selectedWeekdays = MedicationWeekday.parseWeekdayNumbers(from: days)
+        }
         self.frequency = frequency
         self.duration = duration
         self.instructions = instructions
         self.imageData = imageData
         self.isTaken = isTaken
         self.takenAt = takenAt
+        self.takenSlotsToday = takenSlotsToday
         self.createdAt = createdAt
+        self.scheduleUpdatedAt = scheduleUpdatedAt ?? createdAt
         self.isPendingDeletion = isPendingDeletion
     }
 
@@ -77,14 +165,27 @@ public struct MedicationItem: Identifiable, Codable, Equatable {
         dosage = try container.decode(String.self, forKey: .dosage)
         timeString = try container.decode(String.self, forKey: .timeString)
         scheduledDate = try container.decodeIfPresent(Date.self, forKey: .scheduledDate)
-        days = try container.decodeIfPresent([String].self, forKey: .days) ?? ["كل يوم"]
+        let decodedDays = try container.decodeIfPresent([String].self, forKey: .days) ?? ["كل يوم"]
+        if let decodedWeekdays = try container.decodeIfPresent(Set<Int>.self, forKey: .selectedWeekdays) {
+            let normalized = Set(decodedWeekdays.filter { (1...7).contains($0) })
+            selectedWeekdays = normalized.count == 7 ? [] : normalized
+            days = (decodedDays == ["كل يوم"] && !selectedWeekdays.isEmpty)
+                ? MedicationWeekday.displayDays(from: selectedWeekdays)
+                : decodedDays
+        } else {
+            days = decodedDays
+            selectedWeekdays = MedicationWeekday.parseWeekdayNumbers(from: decodedDays)
+        }
         frequency = try container.decodeIfPresent(String.self, forKey: .frequency) ?? "مرة يوميًا"
         duration = try container.decodeIfPresent(String.self, forKey: .duration) ?? "دائم"
         instructions = try container.decodeIfPresent(String.self, forKey: .instructions)
         imageData = try container.decodeIfPresent(Data.self, forKey: .imageData)
         isTaken = try container.decodeIfPresent(Bool.self, forKey: .isTaken) ?? false
         takenAt = try container.decodeIfPresent(Date.self, forKey: .takenAt)
-        createdAt = try container.decodeIfPresent(Date.self, forKey: .createdAt) ?? Date()
+        takenSlotsToday = try container.decodeIfPresent([Int: Date].self, forKey: .takenSlotsToday) ?? [:]
+        let decodedCreatedAt = try container.decodeIfPresent(Date.self, forKey: .createdAt) ?? Date()
+        createdAt = decodedCreatedAt
+        scheduleUpdatedAt = try container.decodeIfPresent(Date.self, forKey: .scheduleUpdatedAt) ?? decodedCreatedAt
         isPendingDeletion = try container.decodeIfPresent(Bool.self, forKey: .isPendingDeletion) ?? false
     }
 
@@ -102,7 +203,7 @@ public struct MedicationItem: Identifiable, Codable, Equatable {
 }
 
 // MARK: - Use-Case 11 (UC-11): Medication Deletion Request Model
-public struct MedicationDeletionRequest: Identifiable, Codable, Equatable {
+public struct MedicationDeletionRequest: Identifiable, Codable, Equatable, Sendable {
     public let id: UUID
     public let medicationId: UUID
     public let medicationName: String
@@ -115,7 +216,7 @@ public struct MedicationDeletionRequest: Identifiable, Codable, Equatable {
     public let requestedAt: Date
     public var status: RequestStatus
 
-    public enum RequestStatus: String, Codable {
+    public enum RequestStatus: String, Codable, Sendable {
         case pending
         case approved
         case rejected
@@ -189,23 +290,76 @@ public struct MedicationDeletionRequest: Identifiable, Codable, Equatable {
 // MARK: - Upcoming Dose Model
 public struct UpcomingDose: Identifiable, Codable, Equatable {
     public let id: UUID
+    public var medicationId: UUID
+    public var slotMinutes: Int?
     public var name: String
     public var timeString: String
     public var dosage: String
     public var isTaken: Bool
+    public var imageData: Data?
+
+    enum CodingKeys: String, CodingKey {
+        case id, medicationId, slotMinutes, name, timeString, dosage, isTaken, imageData
+    }
 
     public init(
         id: UUID = UUID(),
+        medicationId: UUID? = nil,
+        slotMinutes: Int? = nil,
         name: String,
         timeString: String,
         dosage: String = "جرعة مجدولة",
-        isTaken: Bool = false
+        isTaken: Bool = false,
+        imageData: Data? = nil
     ) {
         self.id = id
+        self.medicationId = medicationId ?? id
+        self.slotMinutes = slotMinutes
         self.name = name
         self.timeString = timeString
         self.dosage = dosage
         self.isTaken = isTaken
+        self.imageData = imageData
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let decodedId = try container.decode(UUID.self, forKey: .id)
+        id = decodedId
+        medicationId = try container.decodeIfPresent(UUID.self, forKey: .medicationId) ?? decodedId
+        slotMinutes = try container.decodeIfPresent(Int.self, forKey: .slotMinutes)
+        name = try container.decode(String.self, forKey: .name)
+        timeString = try container.decode(String.self, forKey: .timeString)
+        dosage = try container.decode(String.self, forKey: .dosage)
+        isTaken = try container.decodeIfPresent(Bool.self, forKey: .isTaken) ?? false
+        imageData = try container.decodeIfPresent(Data.self, forKey: .imageData)
+    }
+}
+
+// MARK: - Scheduled Dose Occurrence Model (Multi-Dose Per Day Support)
+public struct ScheduledDose: Identifiable, Equatable {
+    public let medication: MedicationItem
+    public let slotMinutes: Int
+    public let occurrenceDate: Date
+    public let timeString: String
+    public let isCarryoverFromYesterday: Bool
+
+    public var id: String {
+        "\(medication.id.uuidString)_\(slotMinutes)_\(isCarryoverFromYesterday ? "y" : "t")"
+    }
+
+    public init(
+        medication: MedicationItem,
+        slotMinutes: Int,
+        occurrenceDate: Date,
+        timeString: String,
+        isCarryoverFromYesterday: Bool = false
+    ) {
+        self.medication = medication
+        self.slotMinutes = slotMinutes
+        self.occurrenceDate = occurrenceDate
+        self.timeString = timeString
+        self.isCarryoverFromYesterday = isCarryoverFromYesterday
     }
 }
 
@@ -230,7 +384,7 @@ public struct CaregiverLink: Identifiable {
 }
 
 // MARK: - Beneficiary Summary Model (For Caregiver View)
-public struct BeneficiarySummary: Identifiable, Equatable {
+public struct BeneficiarySummary: Identifiable, Equatable, Hashable {
     /// Identity of this list row only (for a linked patient, the relationship id). Never use it as a patient id.
     public let id: UUID
     /// The patient's identity id (`ActiveRelationship.patientId`). Use this for permission checks,
@@ -273,7 +427,6 @@ public struct BeneficiarySummary: Identifiable, Equatable {
 // MARK: - Centralized Dummy Data Store (Debug builds only)
 // This data is compiled out of TestFlight and App Store builds. In Debug it is loaded
 // only when demo mode is switched on from Settings (see DemoModeService).
-#if DEBUG
 public enum HomeMockData {
     public static let activeMedication = MedicationItem(
         patientId: MedicationItem.fallbackPatientId,
@@ -330,4 +483,3 @@ public enum HomeMockData {
         )
     ]
 }
-#endif

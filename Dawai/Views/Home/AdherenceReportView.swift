@@ -16,6 +16,7 @@ public struct AdherenceReportView: View {
     let initialPatientName: String?
 
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.scenePhase) private var scenePhase
     @ObservedObject private var adherenceService = AdherenceService.shared
     @ObservedObject private var relationshipService = RelationshipService.shared
     @ObservedObject private var themeService = ThemeService.shared
@@ -76,10 +77,11 @@ public struct AdherenceReportView: View {
             ZStack {
                 Color.dawaiBackground.ignoresSafeArea()
 
-                ScrollView {
+                ScrollView(.vertical, showsIndicators: true) {
                     VStack(spacing: 20) {
-                        // 1. Patient Selector Header (if Caregiver)
-                        if currentUser.role == .caregiver {
+                        // 1. Patient Selector Header (only when Caregiver has linked or demo beneficiaries)
+                        if currentUser.role == .caregiver &&
+                            (!relationshipService.activeRelationships.filter({ $0.caregiverId == currentUser.id && $0.isActive }).isEmpty || !demoMode.beneficiaries.isEmpty) {
                             caregiverPatientSelector
                         }
 
@@ -125,42 +127,41 @@ public struct AdherenceReportView: View {
             .navigationTitle("تقرير الالتزام الدوائي")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button("إغلاق") {
                         dismiss()
-                    } label: {
-                        HStack(spacing: 4) {
-                            Image(systemName: "xmark.circle.fill")
-                                .font(.system(size: 16))
-                            Text("إغلاق")
-                                .font(.system(size: 15, weight: .bold))
-                        }
-                        .foregroundStyle(Color.dawaiPrimary)
                     }
+                    .dawaiFont(size: 16, weight: .semibold)
+                    .foregroundStyle(Color.dawaiPrimary)
                 }
 
-                ToolbarItem(placement: .confirmationAction) {
+                ToolbarItem(placement: .topBarTrailing) {
                     if accessVerification.isAuthorized && report.hasSufficientData {
-                        Button {
-                            prepareShareText()
-                            showingShareSheet = true
-                        } label: {
+                        ShareLink(
+                            item: generatedReportShareText,
+                            subject: Text("تقرير الالتزام الدوائي الأسبوعي")
+                        ) {
                             Image(systemName: "square.and.arrow.up")
-                                .font(.system(size: 16, weight: .semibold))
+                                .dawaiFont(size: 16, weight: .semibold)
                                 .foregroundStyle(Color.dawaiPrimary)
                         }
                         .accessibilityLabel("مشاركة التقرير")
                     }
                 }
             }
-            .sheet(isPresented: $showingShareSheet) {
-                ShareActivityView(activityItems: [shareText])
-            }
             .onAppear {
+                MedicationService.shared.refreshDerivedState()
                 setupInitialPatient()
+            }
+            .onChange(of: scenePhase) { newPhase in
+                if newPhase == .active {
+                    MedicationService.shared.refreshDerivedState()
+                }
             }
             .preferredColorScheme(themeService.colorScheme)
         }
+        .environment(\.layoutDirection, .rightToLeft)
+        .environment(\.locale, Locale.dawaiArabic)
     }
 
     // MARK: - Patient Initialization
@@ -174,11 +175,11 @@ public struct AdherenceReportView: View {
             if let pid = initialPatientId, !pid.isEmpty {
                 selectedPatientId = pid
                 selectedPatientName = initialPatientName ?? "المستفيد"
-            } else if let firstActive = relationshipService.activeRelationships.first(where: { $0.caregiverId == currentUser.id }) {
+            } else if let firstActive = relationshipService.activeRelationships.first(where: { $0.caregiverId == currentUser.id && $0.isActive }) {
                 selectedPatientId = firstActive.patientId
                 selectedPatientName = firstActive.patientDisplayName
             } else if let demoFirst = demoMode.beneficiaries.first {
-                selectedPatientId = demoFirst.id.uuidString
+                selectedPatientId = demoFirst.patientId ?? demoFirst.id.uuidString
                 selectedPatientName = demoFirst.name
             } else {
                 selectedPatientId = ""
@@ -190,25 +191,25 @@ public struct AdherenceReportView: View {
     // MARK: - 1. Caregiver Patient Selector (UC-7 S#2)
     @ViewBuilder
     private var caregiverPatientSelector: some View {
-        let activeRels = relationshipService.activeRelationships.filter { $0.caregiverId == currentUser.id }
+        let activeRels = relationshipService.activeRelationships.filter { $0.caregiverId == currentUser.id && $0.isActive }
         let demoBeneficiaries = demoMode.beneficiaries
 
         VStack(alignment: .leading, spacing: 8) {
             HStack {
                 Label("المستفيد المحدد", systemImage: "person.circle.fill")
-                    .font(.system(size: 14, weight: .semibold))
+                    .dawaiFont(size: 14, weight: .semibold)
                     .foregroundStyle(.secondary)
                 Spacer()
                 if accessVerification.isAuthorized {
                     Label("مصرح بالاطلاع", systemImage: "checkmark.seal.fill")
-                        .font(.system(size: 12, weight: .bold))
+                        .dawaiFont(size: 12, weight: .bold)
                         .foregroundStyle(Color.dawaiTaken)
                 }
             }
 
             if activeRels.isEmpty && demoBeneficiaries.isEmpty {
                 Text("لا يوجد مستفيدون مرتبطون لعرض تقاريرهم حالياً.")
-                    .font(.system(size: 13, weight: .medium))
+                    .dawaiFont(size: 13, weight: .medium)
                     .foregroundStyle(.secondary)
                     .padding(.vertical, 4)
             } else {
@@ -222,7 +223,7 @@ public struct AdherenceReportView: View {
                         // Demo beneficiaries if enabled in DEBUG and no active relationship is available
                         if activeRels.isEmpty {
                             ForEach(demoBeneficiaries) { ben in
-                                patientChip(id: ben.id.uuidString, name: ben.name, isConnected: true)
+                                patientChip(id: ben.patientId ?? ben.id.uuidString, name: ben.name, isConnected: true)
                             }
                         }
                     }
@@ -251,9 +252,9 @@ public struct AdherenceReportView: View {
         } label: {
             HStack(spacing: 6) {
                 Image(systemName: isSelected ? "checkmark.circle.fill" : "person.fill")
-                    .font(.system(size: 13))
+                    .dawaiFont(size: 13)
                 Text(name)
-                    .font(.system(size: 14, weight: isSelected ? .bold : .medium))
+                    .dawaiFont(size: 14, weight: isSelected ? .bold : .medium)
             }
             .padding(.horizontal, 14)
             .padding(.vertical, 8)
@@ -275,15 +276,15 @@ public struct AdherenceReportView: View {
     private var noLinkedBeneficiariesCard: some View {
         VStack(spacing: 14) {
             Image(systemName: "person.2.slash")
-                .font(.system(size: 42))
+                .dawaiFont(size: 42)
                 .foregroundStyle(Color.secondary.opacity(0.75))
 
             Text("لا يوجد مستفيدون مرتبطون")
-                .font(.system(size: 18, weight: .bold))
+                .dawaiFont(size: 18, weight: .bold)
                 .foregroundStyle(.primary)
 
             Text("يرجى إرسال دعوة ربط لمستفيد وقبولها أولاً لتتمكن من متابعة تقارير الالتزام الدوائي الخاصة به.")
-                .font(.system(size: 14))
+                .dawaiFont(size: 14)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
                 .padding(.horizontal, 16)
@@ -292,12 +293,19 @@ public struct AdherenceReportView: View {
         .padding(.horizontal, 20)
         .frame(maxWidth: .infinity)
         .background(
+            ZStack {
+                RoundedRectangle(cornerRadius: 18, style: .continuous)
+                    .fill(.ultraThinMaterial)
+                RoundedRectangle(cornerRadius: 18, style: .continuous)
+                    .fill(Color.dawaiGlassFill)
+                RoundedRectangle(cornerRadius: 18, style: .continuous)
+                    .fill(Color.dawaiGlassTint)
+            }
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .overlay(
             RoundedRectangle(cornerRadius: 18, style: .continuous)
-                .fill(.ultraThinMaterial)
-                .overlay(
-                    RoundedRectangle(cornerRadius: 18, style: .continuous)
-                        .stroke(Color.dawaiGlassBorder, lineWidth: 1)
-                )
+                .stroke(Color.dawaiGlassBorder, lineWidth: 1)
         )
     }
 
@@ -305,15 +313,15 @@ public struct AdherenceReportView: View {
     private var unauthorizedAccessCard: some View {
         VStack(spacing: 12) {
             Image(systemName: "lock.trianglebadge.exclamationmark.fill")
-                .font(.system(size: 40))
+                .dawaiFont(size: 40)
                 .foregroundStyle(Color.dawaiWarning)
 
             Text("غير مصرح بالاطلاع على التقرير")
-                .font(.system(size: 18, weight: .bold))
+                .dawaiFont(size: 18, weight: .bold)
                 .foregroundStyle(.primary)
 
             Text(accessVerification.errorReason ?? "لا تملك الصلاحية للوصول إلى هذا التقرير.")
-                .font(.system(size: 14))
+                .dawaiFont(size: 14)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
         }
@@ -346,7 +354,7 @@ public struct AdherenceReportView: View {
                         }
                     } label: {
                         Text(period.titleArabic)
-                            .font(.system(size: 13, weight: isSelected ? .bold : .medium))
+                            .dawaiFont(size: 13, weight: isSelected ? .bold : .medium)
                             .frame(maxWidth: .infinity)
                             .padding(.vertical, 8)
                             .background(
@@ -375,7 +383,7 @@ public struct AdherenceReportView: View {
                     }
                 } label: {
                     Image(systemName: "chevron.right")
-                        .font(.system(size: 14, weight: .bold))
+                        .dawaiFont(size: 14, weight: .bold)
                         .foregroundStyle(selectedPeriodIndex < availablePeriods.count - 1 ? Color.dawaiPrimary : Color.secondary.opacity(0.3))
                         .frame(width: 32, height: 32)
                 }
@@ -385,10 +393,10 @@ public struct AdherenceReportView: View {
 
                 HStack(spacing: 6) {
                     Image(systemName: "calendar")
-                        .font(.system(size: 14))
+                        .dawaiFont(size: 14)
                         .foregroundStyle(Color.dawaiPrimary)
                     Text(currentPeriod.dateRangeString)
-                        .font(.system(size: 14, weight: .semibold))
+                        .dawaiFont(size: 14, weight: .semibold)
                         .foregroundStyle(.primary)
                 }
 
@@ -403,7 +411,7 @@ public struct AdherenceReportView: View {
                     }
                 } label: {
                     Image(systemName: "chevron.left")
-                        .font(.system(size: 14, weight: .bold))
+                        .dawaiFont(size: 14, weight: .bold)
                         .foregroundStyle(selectedPeriodIndex > 0 ? Color.dawaiPrimary : Color.secondary.opacity(0.3))
                         .frame(width: 32, height: 32)
                 }
@@ -418,29 +426,40 @@ public struct AdherenceReportView: View {
     private var insufficientDataView: some View {
         VStack(spacing: 14) {
             Image(systemName: "chart.bar.doc.horizontal")
-                .font(.system(size: 44))
-                .foregroundStyle(Color.secondary.opacity(0.7))
+                .dawaiFont(size: 44)
+                .foregroundStyle(Color.secondary.opacity(0.75))
 
-            Text("لا تتوفر بيانات كافية")
-                .font(.system(size: 19, weight: .bold))
+            Text("لا توجد بيانات للتقرير بعد")
+                .dawaiFont(size: 19, weight: .bold)
                 .foregroundStyle(.primary)
 
-            Text("لم يتم تسجيل أي جرعات مجدولة للمستفيد خلال فترة \(currentPeriod.titleArabic) (\(currentPeriod.dateRangeString)).")
-                .font(.system(size: 14))
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-                .padding(.horizontal, 20)
+            Text(
+                currentUser.role == .patient
+                    ? "لم يتم تسجيل أي جرعات خلال فترة \(currentPeriod.titleArabic) (\(currentPeriod.dateRangeString)). ستظهر إحصائيات التزامك هنا تلقائياً بعد تسجيل جرعاتك."
+                    : "لم يتم تسجيل أي جرعات لـ \(selectedPatientName) خلال فترة \(currentPeriod.titleArabic) (\(currentPeriod.dateRangeString)) حتى الآن."
+            )
+            .dawaiFont(size: 14)
+            .foregroundStyle(.secondary)
+            .multilineTextAlignment(.center)
+            .padding(.horizontal, 20)
         }
         .padding(.vertical, 40)
         .padding(.horizontal, 20)
         .frame(maxWidth: .infinity)
         .background(
+            ZStack {
+                RoundedRectangle(cornerRadius: 20, style: .continuous)
+                    .fill(.ultraThinMaterial)
+                RoundedRectangle(cornerRadius: 20, style: .continuous)
+                    .fill(Color.dawaiGlassFill)
+                RoundedRectangle(cornerRadius: 20, style: .continuous)
+                    .fill(Color.dawaiGlassTint)
+            }
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
+        .overlay(
             RoundedRectangle(cornerRadius: 20, style: .continuous)
-                .fill(.ultraThinMaterial)
-                .overlay(
-                    RoundedRectangle(cornerRadius: 20, style: .continuous)
-                        .stroke(Color.dawaiGlassBorder, lineWidth: 1)
-                )
+                .stroke(Color.dawaiGlassBorder, lineWidth: 1)
         )
     }
 
@@ -471,10 +490,10 @@ public struct AdherenceReportView: View {
 
                     VStack(spacing: 0) {
                         Text("\(Int(round(report.adherencePercentage)))%")
-                            .font(.system(size: 24, weight: .heavy, design: .rounded))
+                            .dawaiFont(size: 24, weight: .heavy, design: .rounded)
                             .foregroundStyle(.primary)
                         Text("الالتزام")
-                            .font(.system(size: 11, weight: .medium))
+                            .dawaiFont(size: 11, weight: .medium)
                             .foregroundStyle(.secondary)
                     }
                 }
@@ -483,7 +502,7 @@ public struct AdherenceReportView: View {
                 VStack(alignment: .leading, spacing: 6) {
                     HStack(spacing: 6) {
                         Text(report.tier.titleArabic)
-                            .font(.system(size: 18, weight: .bold))
+                            .dawaiFont(size: 18, weight: .bold)
                             .foregroundStyle(report.tier.color)
 
                         Spacer()
@@ -493,14 +512,20 @@ public struct AdherenceReportView: View {
                         }
                     }
 
-                    Text(report.tier.messageArabic)
-                        .font(.system(size: 13))
+                    Text(report.tierMessageArabic)
+                        .dawaiFont(size: 13)
                         .foregroundStyle(.secondary)
                         .lineLimit(3)
 
-                    Text("تم تناول \(report.totalTaken) من أصل \(report.totalScheduled) جرعة مجدولة")
-                        .font(.system(size: 12, weight: .bold))
-                        .foregroundStyle(.primary.opacity(0.85))
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("تم تناول \(report.totalTaken) من أصل \(report.totalScheduled) جرعة مجدولة")
+                            .dawaiFont(size: 12, weight: .bold)
+                            .foregroundStyle(.primary.opacity(0.85))
+
+                        Text("منها \(report.totalTakenLate) متأخرة و \(report.totalMissed) فائتة")
+                            .dawaiFont(size: 12, weight: .semibold)
+                            .foregroundStyle(.secondary)
+                    }
                 }
             }
         }
@@ -520,9 +545,9 @@ public struct AdherenceReportView: View {
         let isPositive = trend >= 0
         HStack(spacing: 3) {
             Image(systemName: isPositive ? "arrow.up.right" : "arrow.down.right")
-                .font(.system(size: 10, weight: .bold))
+                .dawaiFont(size: 10, weight: .bold)
             Text("\(isPositive ? "+" : "")\(Int(round(trend)))%")
-                .font(.system(size: 11, weight: .bold))
+                .dawaiFont(size: 11, weight: .bold)
         }
         .padding(.horizontal, 7)
         .padding(.vertical, 3)
@@ -536,12 +561,13 @@ public struct AdherenceReportView: View {
     // MARK: - 5. Metric Counters Row
     @ViewBuilder
     private var metricCountersRow: some View {
-        HStack(spacing: 8) {
+        HStack(spacing: 6) {
             metricItem(title: "في الموعد", count: report.totalTakenOnTime, color: Color.dawaiTaken, icon: "checkmark.circle.fill")
             metricItem(title: "متأخرة", count: report.totalTakenLate, color: Color.dawaiWarning, icon: "clock.badge.exclamationmark.fill")
             metricItem(title: "فائتة", count: report.totalMissed, color: Color(red: 220.0 / 255.0, green: 53.0 / 255.0, blue: 69.0 / 255.0), icon: "xmark.circle.fill")
             metricItem(title: "الإجمالي", count: report.totalScheduled, color: Color.dawaiPrimary, icon: "pills.fill")
         }
+        .frame(maxWidth: .infinity)
     }
 
     @ViewBuilder
@@ -549,14 +575,14 @@ public struct AdherenceReportView: View {
         VStack(spacing: 4) {
             HStack(spacing: 3) {
                 Image(systemName: icon)
-                    .font(.system(size: 11))
+                    .dawaiFont(size: 11)
                 Text(title)
-                    .font(.system(size: 11, weight: .medium))
+                    .dawaiFont(size: 11, weight: .medium)
             }
             .foregroundStyle(.secondary)
 
             Text("\(count)")
-                .font(.system(size: 20, weight: .bold, design: .rounded))
+                .dawaiFont(size: 20, weight: .bold, design: .rounded)
                 .foregroundStyle(color)
         }
         .frame(maxWidth: .infinity)
@@ -578,10 +604,10 @@ public struct AdherenceReportView: View {
             HStack {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("الرسم البياني للالتزام اليومي")
-                        .font(.system(size: 16, weight: .bold))
+                        .dawaiFont(size: 16, weight: .bold)
                         .foregroundStyle(.primary)
                     Text("اضغط على أي يوم لعرض تفاصيل جرعاته")
-                        .font(.system(size: 12))
+                        .dawaiFont(size: 12)
                         .foregroundStyle(.secondary)
                 }
 
@@ -592,25 +618,34 @@ public struct AdherenceReportView: View {
                         .fill(Color.dawaiTaken)
                         .frame(width: 8, height: 8)
                     Text("الهدف 80%")
-                        .font(.system(size: 11, weight: .semibold))
+                        .dawaiFont(size: 11, weight: .semibold)
                         .foregroundStyle(.secondary)
                 }
             }
 
+            // Legend for stacked bar segments
+            HStack(spacing: 14) {
+                barLegendItem(title: "في الموعد", color: Color.dawaiTaken)
+                barLegendItem(title: "متأخرة", color: Color.dawaiWarning)
+                barLegendItem(title: "فائتة", color: DoseStatus.missed.color)
+                Spacer()
+            }
+
             // Interactive Weekly Bar Graph
-            HStack(alignment: .bottom, spacing: 8) {
+            HStack(alignment: .bottom, spacing: 4) {
                 ForEach(report.dailySummaries) { day in
                     dayBarView(day: day)
                 }
             }
-            .frame(height: 140)
-            .padding(.top, 10)
+            .frame(maxWidth: .infinity)
+            .frame(height: 180)
+            .padding(.top, 8)
             .padding(.bottom, 4)
 
             // Dotted 80% line explanation
             HStack {
                 Text("المعدل الأسبوعي العام: \(Int(round(report.adherencePercentage)))%")
-                    .font(.system(size: 12, weight: .bold))
+                    .dawaiFont(size: 12, weight: .bold)
                     .foregroundStyle(report.tier.color)
 
                 Spacer()
@@ -622,7 +657,7 @@ public struct AdherenceReportView: View {
                         }
                     } label: {
                         Text("عرض الأسبوع بالكامل")
-                            .font(.system(size: 11, weight: .bold))
+                            .dawaiFont(size: 11, weight: .bold)
                             .foregroundStyle(Color.dawaiPrimary)
                     }
                 }
@@ -640,9 +675,21 @@ public struct AdherenceReportView: View {
     }
 
     @ViewBuilder
+    private func barLegendItem(title: String, color: Color) -> some View {
+        HStack(spacing: 5) {
+            Circle()
+                .fill(color)
+                .frame(width: 8, height: 8)
+            Text(title)
+                .dawaiFont(size: 11, weight: .semibold)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    @ViewBuilder
     private func dayBarView(day: DailyAdherenceSummary) -> some View {
         let isSelected = selectedDayDate != nil && Calendar.current.isDate(day.date, inSameDayAs: selectedDayDate!)
-        let barHeight = day.isFuture ? 6.0 : max(8.0, CGFloat(day.percentage / 100.0) * 85.0)
+        let segments = dayBarSegments(for: day, totalHeight: 85.0)
 
         Button {
             withAnimation(.spring(response: 0.3, dampingFraction: 0.7)) {
@@ -653,55 +700,73 @@ public struct AdherenceReportView: View {
                 }
             }
         } label: {
-            VStack(spacing: 6) {
+            VStack(spacing: 5) {
                 // Top percentage label
-                if !day.isFuture {
+                if !day.isFuture && day.scheduledCount > 0 {
                     Text("\(Int(round(day.percentage)))%")
-                        .font(.system(size: 9, weight: .bold, design: .rounded))
+                        .dawaiFont(size: 9, weight: .bold, design: .rounded)
                         .foregroundStyle(isSelected ? Color.dawaiPrimary : Color.secondary)
+                        .frame(height: 12)
                 } else {
                     Text("-")
-                        .font(.system(size: 9, weight: .medium))
+                        .dawaiFont(size: 9, weight: .medium)
                         .foregroundStyle(Color.secondary.opacity(0.4))
+                        .frame(height: 12)
                 }
 
-                Spacer(minLength: 0)
-
-                // Bar capsule
+                // Segmented vertical bar capsule (On-time Green / Late Orange / Missed Red)
                 ZStack(alignment: .bottom) {
-                    // Background track
                     Capsule()
                         .fill(Color(uiColor: .tertiarySystemGroupedBackground).opacity(0.6))
                         .frame(width: 22, height: 85)
 
-                    // Filled value
-                    Capsule()
-                        .fill(
-                            LinearGradient(
-                                colors: dayBarColors(for: day),
-                                startPoint: .top,
-                                endPoint: .bottom
-                            )
-                        )
-                        .frame(width: 22, height: barHeight)
+                    if day.isFuture || day.scheduledCount == 0 || segments.isEmpty {
+                        Capsule()
+                            .fill(Color.secondary.opacity(day.isFuture ? 0.16 : 0.22))
+                            .frame(width: 22, height: 6)
+                    } else {
+                        VStack(spacing: 0) {
+                            ForEach(segments) { segment in
+                                Rectangle()
+                                    .fill(segment.color)
+                                    .frame(width: 22, height: segment.height)
+                            }
+                        }
+                        .frame(width: 22, height: 85)
+                        .clipShape(Capsule())
+                    }
                 }
+                .frame(width: 22, height: 85)
 
                 // Day name & indicator
                 VStack(spacing: 2) {
                     Text(day.dayShortArabic)
-                        .font(.system(size: 12, weight: isSelected || day.isToday ? .bold : .medium))
+                        .dawaiFont(size: 12, weight: isSelected || day.isToday ? .bold : .medium)
                         .foregroundStyle(isSelected ? Color.dawaiPrimary : (day.isToday ? Color.primary : Color.secondary))
 
-                    if day.isToday {
-                        Circle()
-                            .fill(Color.dawaiPrimary)
-                            .frame(width: 4, height: 4)
-                    } else {
-                        Circle()
-                            .fill(Color.clear)
-                            .frame(width: 4, height: 4)
+                    Circle()
+                        .fill(day.isToday ? Color.dawaiPrimary : Color.clear)
+                        .frame(width: 4, height: 4)
+                }
+
+                // Under-column Late & Missed count badges
+                VStack(spacing: 2) {
+                    if !day.isFuture {
+                        if day.takenLateCount > 0 {
+                            dayCountBadge(
+                                text: "\(day.takenLateCount) متأخرة",
+                                color: Color.dawaiWarning
+                            )
+                        }
+                        if day.missedCount > 0 {
+                            dayCountBadge(
+                                text: "\(day.missedCount) فائتة",
+                                color: DoseStatus.missed.color
+                            )
+                        }
                     }
                 }
+                .frame(height: 32, alignment: .top)
             }
             .frame(maxWidth: .infinity)
             .padding(.vertical, 4)
@@ -713,15 +778,43 @@ public struct AdherenceReportView: View {
         .buttonStyle(.plain)
     }
 
-    private func dayBarColors(for day: DailyAdherenceSummary) -> [Color] {
-        if day.isFuture {
-            return [Color.secondary.opacity(0.2), Color.secondary.opacity(0.1)]
-        } else if day.percentage >= 85.0 {
-            return [Color.dawaiTaken, Color.dawaiTaken.opacity(0.8)]
-        } else if day.percentage >= 50.0 {
-            return [Color.dawaiWarning, Color.dawaiWarning.opacity(0.8)]
-        } else {
-            return [Color(red: 220.0 / 255.0, green: 53.0 / 255.0, blue: 69.0 / 255.0), Color.red.opacity(0.7)]
+    @ViewBuilder
+    private func dayCountBadge(text: String, color: Color) -> some View {
+        Text(text)
+            .dawaiFont(size: 8.5, weight: .bold, design: .rounded)
+            .lineLimit(1)
+            .minimumScaleFactor(0.6)
+            .foregroundStyle(color)
+            .padding(.horizontal, 4)
+            .padding(.vertical, 2)
+            .background(color.opacity(0.14), in: Capsule())
+    }
+
+    private struct DayBarSegment: Identifiable {
+        let id: String
+        let count: Int
+        let color: Color
+        let height: CGFloat
+    }
+
+    private func dayBarSegments(for day: DailyAdherenceSummary, totalHeight: CGFloat) -> [DayBarSegment] {
+        let raw: [(id: String, count: Int, color: Color)] = [
+            ("missed", day.missedCount, DoseStatus.missed.color),
+            ("late", day.takenLateCount, Color.dawaiWarning),
+            ("onTime", day.takenOnTimeCount, Color.dawaiTaken)
+        ]
+        let active = raw.filter { $0.count > 0 }
+        guard !active.isEmpty else { return [] }
+
+        let totalCount = active.reduce(0) { $0 + $1.count }
+        let minSegmentHeight: CGFloat = 14.0
+        let reserved = minSegmentHeight * CGFloat(active.count)
+        let distributable = max(0, totalHeight - reserved)
+
+        return active.map { segment in
+            let share = CGFloat(segment.count) / CGFloat(max(totalCount, 1))
+            let height = minSegmentHeight + (distributable * share)
+            return DayBarSegment(id: segment.id, count: segment.count, color: segment.color, height: height)
         }
     }
 
@@ -730,7 +823,7 @@ public struct AdherenceReportView: View {
     private var medicationBreakdownCard: some View {
         VStack(alignment: .leading, spacing: 14) {
             Text("الالتزام حسب كل دواء")
-                .font(.system(size: 16, weight: .bold))
+                .dawaiFont(size: 16, weight: .bold)
                 .foregroundStyle(.primary)
 
             VStack(spacing: 12) {
@@ -739,10 +832,10 @@ public struct AdherenceReportView: View {
                         HStack {
                             VStack(alignment: .leading, spacing: 2) {
                                 Text(med.name)
-                                    .font(.system(size: 15, weight: .bold))
+                                    .dawaiFont(size: 15, weight: .bold)
                                     .foregroundStyle(.primary)
                                 Text(med.dosage)
-                                    .font(.system(size: 12))
+                                    .dawaiFont(size: 12)
                                     .foregroundStyle(.secondary)
                             }
 
@@ -750,10 +843,10 @@ public struct AdherenceReportView: View {
 
                             VStack(alignment: .trailing, spacing: 2) {
                                 Text("\(Int(round(med.percentage)))%")
-                                    .font(.system(size: 16, weight: .heavy, design: .rounded))
+                                    .dawaiFont(size: 16, weight: .heavy, design: .rounded)
                                     .foregroundStyle(med.percentage >= 80 ? Color.dawaiTaken : Color.dawaiWarning)
                                 Text("\(med.takenCount) من \(med.scheduledCount) جرعة")
-                                    .font(.system(size: 11))
+                                    .dawaiFont(size: 11)
                                     .foregroundStyle(.secondary)
                             }
                         }
@@ -797,7 +890,7 @@ public struct AdherenceReportView: View {
         VStack(alignment: .leading, spacing: 14) {
             HStack {
                 Text(selectedDayDate != nil ? "سجل جرعات اليوم المحدد" : "سجل الجرعات التفصيلي للأسبوع")
-                    .font(.system(size: 16, weight: .bold))
+                    .dawaiFont(size: 16, weight: .bold)
                     .foregroundStyle(.primary)
 
                 Spacer()
@@ -807,7 +900,7 @@ public struct AdherenceReportView: View {
                     let _ = f.locale = Locale.dawaiArabic
                     let _ = f.dateFormat = "EEEE d MMMM"
                     Text(f.string(from: sel).westernNumerals)
-                        .font(.system(size: 12, weight: .semibold))
+                        .dawaiFont(size: 12, weight: .semibold)
                         .foregroundStyle(Color.dawaiPrimary)
                 }
             }
@@ -825,10 +918,10 @@ public struct AdherenceReportView: View {
                     Spacer()
                     VStack(spacing: 6) {
                         Image(systemName: "tray")
-                            .font(.system(size: 24))
+                            .dawaiFont(size: 24)
                             .foregroundStyle(.secondary)
                         Text("لا توجد سجلات جرعات لهذا اليوم")
-                            .font(.system(size: 13))
+                            .dawaiFont(size: 13)
                             .foregroundStyle(.secondary)
                     }
                     .padding(.vertical, 20)
@@ -838,16 +931,32 @@ public struct AdherenceReportView: View {
                 VStack(spacing: 12) {
                     ForEach(daysToDisplay) { day in
                         VStack(alignment: .leading, spacing: 8) {
-                            HStack {
-                                Text("\(day.dayNameArabic) • \(formatShortDate(day.date))")
-                                    .font(.system(size: 13, weight: .bold))
-                                    .foregroundStyle(Color.dawaiPrimary)
+                            VStack(alignment: .leading, spacing: 4) {
+                                HStack {
+                                    Text("\(day.dayNameArabic) • \(formatShortDate(day.date))")
+                                        .dawaiFont(size: 13, weight: .bold)
+                                        .foregroundStyle(Color.dawaiPrimary)
 
-                                Spacer()
+                                    Spacer()
 
-                                Text("\(day.takenCount)/\(day.scheduledCount) جرعة")
-                                    .font(.system(size: 12, weight: .semibold))
-                                    .foregroundStyle(.secondary)
+                                    Text("\(day.takenCount)/\(day.scheduledCount) جرعة")
+                                        .dawaiFont(size: 12, weight: .semibold)
+                                        .foregroundStyle(.secondary)
+                                }
+
+                                HStack(spacing: 10) {
+                                    Text("في الموعد: \(day.takenOnTimeCount)")
+                                        .foregroundStyle(Color.dawaiTaken)
+                                    Text("•")
+                                        .foregroundStyle(.secondary)
+                                    Text("متأخرة: \(day.takenLateCount)")
+                                        .foregroundStyle(Color.dawaiWarning)
+                                    Text("•")
+                                        .foregroundStyle(.secondary)
+                                    Text("فائتة: \(day.missedCount)")
+                                        .foregroundStyle(DoseStatus.missed.color)
+                                }
+                                .dawaiFont(size: 11, weight: .semibold)
                             }
 
                             ForEach(day.records) { record in
@@ -878,16 +987,16 @@ public struct AdherenceReportView: View {
     private func doseRecordRow(record: DoseRecord) -> some View {
         HStack(spacing: 12) {
             Image(systemName: record.status.systemIcon)
-                .font(.system(size: 18))
+                .dawaiFont(size: 18)
                 .foregroundStyle(record.status.color)
 
             VStack(alignment: .leading, spacing: 2) {
                 Text(record.medicationName)
-                    .font(.system(size: 14, weight: .bold))
+                    .dawaiFont(size: 14, weight: .bold)
                     .foregroundStyle(.primary)
 
                 Text(record.dosage)
-                    .font(.system(size: 12))
+                    .dawaiFont(size: 12)
                     .foregroundStyle(.secondary)
             }
 
@@ -896,16 +1005,16 @@ public struct AdherenceReportView: View {
             VStack(alignment: .trailing, spacing: 2) {
                 HStack(spacing: 4) {
                     Text(record.status.titleArabic)
-                        .font(.system(size: 11, weight: .bold))
+                        .dawaiFont(size: 11, weight: .bold)
                     if record.delayMinutes > 0 && record.status == .takenLate {
                         Text("(\(record.delayMinutes) د تأخير)")
-                            .font(.system(size: 10))
+                            .dawaiFont(size: 10)
                     }
                 }
                 .foregroundStyle(record.status.color)
 
                 Text(formatTime(record.scheduledDate))
-                    .font(.system(size: 11))
+                    .dawaiFont(size: 11)
                     .foregroundStyle(.secondary)
             }
         }
@@ -927,7 +1036,7 @@ public struct AdherenceReportView: View {
         return formatter.string(from: date).westernNumerals
     }
 
-    private func prepareShareText() {
+    private var generatedReportShareText: String {
         var text = "📊 تقرير الالتزام الدوائي الأسبوعي - تطبيق دواء\n"
         text += "المستفيد: \(report.patientDisplayName)\n"
         text += "الفترة: \(report.period.titleArabic) (\(report.period.dateRangeString))\n"
@@ -938,7 +1047,7 @@ public struct AdherenceReportView: View {
             text += "- \(med.name) (\(med.dosage)): \(Int(round(med.percentage)))% (\(med.takenCount)/\(med.scheduledCount))\n"
         }
         text += "\nتم إنشاء التقرير عبر تطبيق دواء لسلامة ومتابعة الأدوية."
-        self.shareText = text
+        return text
     }
 }
 

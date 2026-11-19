@@ -11,21 +11,24 @@ import SwiftUI
 
 public struct CaregiverHomeView: View {
     let identity: UserIdentity
+    @Environment(\.scenePhase) private var scenePhase
     @EnvironmentObject private var appState: AppState
     @ObservedObject private var relationshipService = RelationshipService.shared
     @ObservedObject private var medicationService = MedicationService.shared
     @ObservedObject private var themeService = ThemeService.shared
     @ObservedObject private var demoMode = DemoModeService.shared
     @State private var showingCreateInvitationSheet = false
+    @State private var showingReceiveInvitationSheet = false
     @State private var showingSettingsSheet = false
     @State private var showingReportSheet = false
+    @State private var navigationPath: [BeneficiarySummary] = []
 
     public init(identity: UserIdentity) {
         self.identity = identity
     }
 
     public var body: some View {
-        NavigationStack {
+        NavigationStack(path: $navigationPath) {
             ZStack(alignment: .top) {
                 // Native iOS System List
                 List {
@@ -52,6 +55,9 @@ public struct CaregiverHomeView: View {
                 .compactListTopMargin()
                 .scrollContentBackground(.hidden)
                 .background(Color.dawaiBackground.ignoresSafeArea())
+                .refreshable {
+                    await CloudKitSyncManager.shared.syncNow(silent: false)
+                }
 
                 // Notification Toast (UC-2 S#8 & UC-11)
                 if let toastMessage = medicationService.toastMessage ?? relationshipService.notificationToastMessage {
@@ -68,6 +74,10 @@ public struct CaregiverHomeView: View {
                 CreateInvitationSheet(currentUser: identity)
                     .preferredColorScheme(ThemeService.shared.colorScheme)
             }
+            .sheet(isPresented: $showingReceiveInvitationSheet) {
+                ReceiveInvitationSheet(currentUser: identity)
+                    .preferredColorScheme(themeService.colorScheme)
+            }
             .sheet(isPresented: $showingSettingsSheet) {
                 IdentityDetailsSheet(identity: identity)
                     .preferredColorScheme(themeService.colorScheme)
@@ -78,9 +88,38 @@ public struct CaregiverHomeView: View {
             }
             .onAppear {
                 themeService.applyThemeToApp()
+                consumePendingBeneficiaryIfNeeded()
+                Task {
+                    await medicationService.requestNotificationPermissionIfNeeded()
+                    await CloudKitSyncManager.shared.syncNow(silent: true)
+                }
+            }
+            .onChange(of: appState.pendingCaregiverBeneficiaryToOpen) { _ in
+                consumePendingBeneficiaryIfNeeded()
+            }
+            .onChange(of: scenePhase) { newPhase in
+                if newPhase == .active {
+                    medicationService.refreshDerivedState()
+                    Task {
+                        await CloudKitSyncManager.shared.syncNow(silent: true)
+                    }
+                }
+            }
+            .navigationDestination(for: BeneficiarySummary.self) { beneficiary in
+                CaregiverPatientDetailView(beneficiary: beneficiary)
             }
             .preferredColorScheme(themeService.colorScheme)
         }
+    }
+
+    private func consumePendingBeneficiaryIfNeeded() {
+        guard let beneficiary = appState.pendingCaregiverBeneficiaryToOpen else { return }
+        showingCreateInvitationSheet = false
+        showingReceiveInvitationSheet = false
+        showingSettingsSheet = false
+        showingReportSheet = false
+        navigationPath = [beneficiary]
+        appState.pendingCaregiverBeneficiaryToOpen = nil
     }
 
     // MARK: - 1. Top Header View
@@ -88,7 +127,7 @@ public struct CaregiverHomeView: View {
     private var headerView: some View {
         HStack(alignment: .center) {
             Text(identity.displayName)
-                .font(.system(size: 34, weight: .bold, design: .rounded))
+                .dawaiFont(size: 34, weight: .bold, design: .rounded)
                 .foregroundStyle(.primary)
 
             Spacer()
@@ -98,7 +137,7 @@ public struct CaregiverHomeView: View {
                 showingReportSheet = true
             } label: {
                 Image(systemName: "chart.bar.xaxis")
-                    .font(.system(size: 18, weight: .semibold))
+                    .dawaiFont(size: 18, weight: .semibold)
                     .foregroundStyle(Color.dawaiPrimary)
                     .frame(width: 44, height: 44)
                     .background(.ultraThinMaterial, in: Circle())
@@ -113,7 +152,7 @@ public struct CaregiverHomeView: View {
                 showingSettingsSheet = true
             } label: {
                 Image(systemName: "gearshape.fill")
-                    .font(.system(size: 18, weight: .semibold))
+                    .dawaiFont(size: 18, weight: .semibold)
                     .foregroundStyle(Color.dawaiPrimary)
                     .frame(width: 44, height: 44)
                     .background(.ultraThinMaterial, in: Circle())
@@ -130,9 +169,9 @@ public struct CaregiverHomeView: View {
     // MARK: - 2. Section Header
     @ViewBuilder
     private var sectionHeaderView: some View {
-        HStack {
+        HStack(spacing: 8) {
             Text("المستفيدين")
-                .font(.system(size: 20, weight: .bold))
+                .dawaiFont(size: 20, weight: .bold)
                 .foregroundStyle(.primary)
                 .textCase(nil)
 
@@ -142,7 +181,7 @@ public struct CaregiverHomeView: View {
                 showingCreateInvitationSheet = true
             } label: {
                 Image(systemName: "plus")
-                    .font(.system(size: 15, weight: .bold))
+                    .dawaiFont(size: 15, weight: .bold)
                     .foregroundStyle(Color.dawaiPrimary)
                     .frame(width: 32, height: 32)
                     .background(.ultraThinMaterial, in: Circle())
@@ -164,18 +203,18 @@ public struct CaregiverHomeView: View {
                     HStack {
                         VStack(alignment: .leading, spacing: 2) {
                             Text("طلب حذف: \(req.medicationName)")
-                                .font(.system(size: 16, weight: .bold))
+                                .dawaiFont(size: 16, weight: .bold)
                                 .foregroundStyle(.primary)
                             Text("من: \(req.patientDisplayName) • \(req.dosage)")
-                                .font(.system(size: 13, weight: .medium))
+                                .dawaiFont(size: 13, weight: .medium)
                                 .foregroundStyle(.secondary)
                         }
                         Spacer()
                         HStack(spacing: 4) {
                             Image(systemName: "hourglass")
-                                .font(.system(size: 10, weight: .bold))
+                                .dawaiFont(size: 10, weight: .bold)
                             Text("بانتظار موافقتك")
-                                .font(.system(size: 11, weight: .bold))
+                                .dawaiFont(size: 11, weight: .bold)
                         }
                         .foregroundStyle(Color.dawaiWarning)
                         .padding(.horizontal, 8)
@@ -183,21 +222,21 @@ public struct CaregiverHomeView: View {
                         .background(Color.dawaiWarningBackground, in: Capsule())
                     }
 
-                    HStack(spacing: 12) {
+                    HStack(spacing: 10) {
                         Button {
                             withAnimation {
                                 medicationService.approveDeletionRequest(requestId: req.id, by: identity)
                             }
                         } label: {
-                            HStack(spacing: 4) {
+                            HStack(spacing: 5) {
                                 Image(systemName: "trash.fill")
-                                    .font(.system(size: 12, weight: .bold))
+                                    .dawaiFont(size: 12, weight: .bold)
                                 Text("قبول وحذف")
-                                    .font(.system(size: 13, weight: .bold))
+                                    .dawaiFont(size: 13, weight: .bold)
                             }
                             .frame(maxWidth: .infinity)
-                            .padding(.vertical, 8)
-                            .background(Color.red.opacity(0.12))
+                            .padding(.vertical, 9)
+                            .background(Color.red.opacity(0.1))
                             .foregroundStyle(Color.red)
                             .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
                         }
@@ -208,30 +247,30 @@ public struct CaregiverHomeView: View {
                                 medicationService.rejectDeletionRequest(requestId: req.id, by: identity)
                             }
                         } label: {
-                            HStack(spacing: 4) {
+                            HStack(spacing: 5) {
                                 Image(systemName: "arrow.counterclockwise")
-                                    .font(.system(size: 12, weight: .bold))
+                                    .dawaiFont(size: 12, weight: .bold)
                                 Text("رفض والاحتفاظ")
-                                    .font(.system(size: 13, weight: .bold))
+                                    .dawaiFont(size: 13, weight: .bold)
                             }
                             .frame(maxWidth: .infinity)
-                            .padding(.vertical, 8)
-                            .background(Color.dawaiPrimary.opacity(0.12))
-                            .foregroundStyle(Color.dawaiPrimary)
+                            .padding(.vertical, 9)
+                            .background(Color(uiColor: .tertiarySystemFill))
+                            .foregroundStyle(.primary)
                             .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
                         }
                         .buttonStyle(.plain)
                     }
                 }
                 .padding(.vertical, 6)
-                .listRowBackground(rowBackground(hasDelayAlert: true))
+                .listRowBackground(rowBackground(hasDelayAlert: false))
             }
         } header: {
             HStack(spacing: 6) {
                 Image(systemName: "exclamationmark.bubble.fill")
                     .foregroundStyle(Color.dawaiWarning)
                 Text("طلبات حذف الأدوية من المستفيدين")
-                    .font(.system(size: 15, weight: .bold))
+                    .dawaiFont(size: 15, weight: .bold)
                     .foregroundStyle(.primary)
             }
         }
@@ -240,28 +279,28 @@ public struct CaregiverHomeView: View {
     // MARK: - 3. Beneficiaries Section (Native iOS System List)
     @ViewBuilder
     private var beneficiariesSection: some View {
-        let activeRels = relationshipService.activeRelationships.filter { $0.caregiverId == identity.id }
+        let activeRels = relationshipService.activeRelationships.filter { $0.caregiverId == identity.id && $0.isActive }
         let demoItems = demoMode.beneficiaries
 
         Section {
             if !activeRels.isEmpty {
                 ForEach(activeRels, id: \.id) { rel in
                     activePatientRow(rel: rel)
-                        .listRowBackground(rowBackground(hasDelayAlert: medicationService.daySchedule(forPatient: rel.patientId).hasMissedDoses))
+                        .listRowBackground(rowBackground(hasDelayAlert: medicationService.daySchedule(forPatient: rel.patientId, at: medicationService.lastEvaluatedAt).hasMissedDoses))
                 }
             } else if !demoItems.isEmpty {
                 ForEach(demoItems, id: \.id) { item in
                     demoItemRow(item: item)
                 }
-            } else if !relationshipService.outgoingInvitations.isEmpty || !relationshipService.incomingInvitations.isEmpty {
+            } else if !relationshipService.outgoingInvitations(for: identity).isEmpty || !relationshipService.incomingInvitations(for: identity).isEmpty {
                 HStack {
                     Spacer()
                     VStack(spacing: 8) {
                         Image(systemName: "person.2.badge.gearshape")
-                            .font(.system(size: 26))
+                            .dawaiFont(size: 26)
                             .foregroundStyle(Color.secondary)
                         Text("بانتظار اكتمال الارتباط")
-                            .font(.system(size: 14, weight: .medium))
+                            .dawaiFont(size: 14, weight: .medium)
                             .foregroundStyle(.secondary)
                     }
                     .padding(.vertical, 16)
@@ -271,15 +310,15 @@ public struct CaregiverHomeView: View {
             } else {
                 VStack(spacing: 12) {
                     Image(systemName: "person.2.slash")
-                        .font(.system(size: 32, weight: .regular))
+                        .dawaiFont(size: 32, weight: .regular)
                         .foregroundStyle(Color.dawaiPrimary.opacity(0.75))
 
                     Text("لا يوجد مستفيدون مرتبطون حالياً")
-                        .font(.system(size: 16, weight: .bold))
+                        .dawaiFont(size: 16, weight: .bold)
                         .foregroundStyle(.primary)
 
                     Text("اضغط على زر (+) أعلى القائمة لإرسال دعوة ربط لمستفيد ومتابعة جدول أدويته.")
-                        .font(.system(size: 13))
+                        .dawaiFont(size: 13)
                         .foregroundStyle(.secondary)
                         .multilineTextAlignment(.center)
                         .padding(.horizontal, 12)
@@ -289,11 +328,11 @@ public struct CaregiverHomeView: View {
                     } label: {
                         HStack(spacing: 6) {
                             Image(systemName: "link.badge.plus")
-                                .font(.system(size: 14, weight: .bold))
+                                .dawaiFont(size: 13, weight: .bold)
                             Text("إرسال دعوة ربط")
-                                .font(.system(size: 14, weight: .bold))
+                                .dawaiFont(size: 13, weight: .bold)
                         }
-                        .padding(.horizontal, 16)
+                        .padding(.horizontal, 14)
                         .padding(.vertical, 9)
                         .background(Color.dawaiPrimary)
                         .foregroundStyle(.white)
@@ -314,9 +353,7 @@ public struct CaregiverHomeView: View {
     // MARK: - Demo Beneficiary Row
     @ViewBuilder
     private func demoItemRow(item: BeneficiarySummary) -> some View {
-        NavigationLink {
-            CaregiverPatientDetailView(beneficiary: item)
-        } label: {
+        NavigationLink(value: item) {
             if item.hasDelayAlert {
                 latePatientRow(item: item)
             } else {
@@ -355,17 +392,17 @@ public struct CaregiverHomeView: View {
     private func latePatientRow(item: BeneficiarySummary) -> some View {
         HStack(spacing: 12) {
             Image(systemName: "exclamationmark.triangle.fill")
-                .font(.system(size: 18))
+                .dawaiFont(size: 18)
                 .foregroundStyle(Color.dawaiWarning)
 
             VStack(alignment: .leading, spacing: 3) {
                 Text(item.name)
-                    .font(.system(size: 17, weight: .bold))
+                    .dawaiFont(size: 17, weight: .bold)
                     .foregroundStyle(.primary)
 
                 if let notice = item.delayNotice {
                     Text(notice)
-                        .font(.system(size: 13, weight: .medium))
+                        .dawaiFont(size: 13, weight: .medium)
                         .foregroundStyle(Color.dawaiWarning)
                 }
             }
@@ -373,7 +410,7 @@ public struct CaregiverHomeView: View {
             Spacer()
 
             Text("متأخر")
-                .font(.system(size: 11, weight: .bold))
+                .dawaiFont(size: 11, weight: .bold)
                 .foregroundStyle(Color.dawaiWarning)
                 .padding(.horizontal, 9)
                 .padding(.vertical, 3.5)
@@ -390,7 +427,7 @@ public struct CaregiverHomeView: View {
     private func demoPatientRow(item: BeneficiarySummary) -> some View {
         HStack {
             Text(item.name)
-                .font(.system(size: 17, weight: .semibold))
+                .dawaiFont(size: 17, weight: .semibold)
                 .foregroundStyle(.primary)
 
             Spacer()
@@ -402,9 +439,10 @@ public struct CaregiverHomeView: View {
     @ViewBuilder
     private func activePatientRow(rel: ActiveRelationship) -> some View {
         // Delay alerts come only from this linked patient's own medications.
-        let schedule = medicationService.daySchedule(forPatient: rel.patientId)
+        let schedule = medicationService.daySchedule(forPatient: rel.patientId, at: medicationService.lastEvaluatedAt)
         let hasDelay = schedule.hasMissedDoses
-        let missedMed = schedule.missedMedications.first
+        let missedDose = schedule.missedDoses.first
+        let missedMed = missedDose?.medication ?? schedule.missedMedications.first
         let delayNoticeText = missedMed != nil ? "30 د تأخير، \(missedMed!.name)" : nil
         let summary = BeneficiarySummary(
             id: rel.id,
@@ -412,28 +450,26 @@ public struct CaregiverHomeView: View {
             name: rel.patientDisplayName,
             hasDelayAlert: hasDelay,
             delayNotice: delayNoticeText,
-            scheduledTime: missedMed?.timeString,
+            scheduledTime: missedDose?.timeString ?? missedMed?.timeString,
             isInvitation: false,
             delayedMedicationName: missedMed?.name,
             delayedDosage: missedMed?.dosage,
             phoneNumber: "0501234567"
         )
 
-        NavigationLink {
-            CaregiverPatientDetailView(beneficiary: summary)
-        } label: {
+        NavigationLink(value: summary) {
             if hasDelay {
                 latePatientRow(item: summary)
             } else {
                 HStack(spacing: 12) {
                     Text(rel.patientDisplayName)
-                        .font(.system(size: 17, weight: .semibold))
+                        .dawaiFont(size: 17, weight: .semibold)
                         .foregroundStyle(.primary)
 
                     Spacer()
 
                     Text("نشط")
-                        .font(.system(size: 11, weight: .bold))
+                        .dawaiFont(size: 11, weight: .bold)
                         .foregroundStyle(Color.dawaiTaken)
                         .padding(.horizontal, 7)
                         .padding(.vertical, 3)
@@ -447,9 +483,9 @@ public struct CaregiverHomeView: View {
     // MARK: - 4. Invitations Section (System List)
     @ViewBuilder
     private var invitationsSection: some View {
-        let acceptedInvites = deduplicateInvitations(relationshipService.outgoingInvitations.filter { $0.status == .accepted })
-        let incomingInvites = deduplicateInvitations(relationshipService.incomingInvitations.filter { $0.status == .pending })
-        let pendingInvites = deduplicateInvitations(relationshipService.outgoingInvitations.filter { $0.status == .pending })
+        let acceptedInvites = deduplicateInvitations(relationshipService.outgoingInvitations(for: identity, status: .accepted))
+        let incomingInvites = deduplicateInvitations(relationshipService.incomingInvitations(for: identity))
+        let pendingInvites = deduplicateInvitations(relationshipService.outgoingInvitations(for: identity, status: .pending))
 
         if !acceptedInvites.isEmpty || !incomingInvites.isEmpty || !pendingInvites.isEmpty {
             Section {
@@ -466,7 +502,7 @@ public struct CaregiverHomeView: View {
                 }
             } header: {
                 Text("طلبات الارتباط والدعوات")
-                    .font(.system(size: 15, weight: .semibold))
+                    .dawaiFont(size: 15, weight: .semibold)
                     .foregroundStyle(.secondary)
                     .textCase(nil)
             }
@@ -490,18 +526,18 @@ public struct CaregiverHomeView: View {
                     .fill(Color.dawaiTaken.opacity(0.12))
                     .frame(width: 36, height: 36)
                 Image(systemName: "checkmark.circle.fill")
-                    .font(.system(size: 16, weight: .semibold))
+                    .dawaiFont(size: 16, weight: .semibold)
                     .foregroundStyle(Color.dawaiTaken)
             }
 
             VStack(alignment: .leading, spacing: 2) {
                 Text(cleanDisplayName(invite.recipientDisplayName ?? "المستفيد"))
-                    .font(.system(size: 16, weight: .semibold))
+                    .dawaiFont(size: 16, weight: .semibold)
                     .foregroundStyle(.primary)
                     .lineLimit(1)
 
-                Text("تم القبول • كود: \(cleanToken(invite.token))")
-                    .font(.system(size: 13))
+                Text("تم القبول • بانتظار التأكيد")
+                    .dawaiFont(size: 13)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
             }
@@ -513,7 +549,7 @@ public struct CaregiverHomeView: View {
                     handleConfirmConnection(invite: invite)
                 } label: {
                     Text("تأكيد")
-                        .font(.system(size: 13, weight: .bold))
+                        .dawaiFont(size: 13, weight: .bold)
                         .padding(.horizontal, 14)
                         .padding(.vertical, 6)
                         .background(Color.dawaiPrimary, in: Capsule())
@@ -527,7 +563,7 @@ public struct CaregiverHomeView: View {
                     }
                 } label: {
                     Image(systemName: "xmark")
-                        .font(.system(size: 11, weight: .bold))
+                        .dawaiFont(size: 11, weight: .bold)
                         .foregroundStyle(.secondary)
                         .frame(width: 26, height: 26)
                         .background(Color(uiColor: .tertiarySystemFill), in: Circle())
@@ -556,18 +592,18 @@ public struct CaregiverHomeView: View {
                     .fill(Color.dawaiPrimary.opacity(0.12))
                     .frame(width: 36, height: 36)
                 Image(systemName: "person.badge.plus")
-                    .font(.system(size: 16, weight: .semibold))
+                    .dawaiFont(size: 16, weight: .semibold)
                     .foregroundStyle(Color.dawaiPrimary)
             }
 
             VStack(alignment: .leading, spacing: 2) {
                 Text(cleanDisplayName(incoming.initiatorDisplayName))
-                    .font(.system(size: 16, weight: .semibold))
+                    .dawaiFont(size: 16, weight: .semibold)
                     .foregroundStyle(.primary)
                     .lineLimit(1)
 
-                Text("طلب ارتباط • كود: \(cleanToken(incoming.token))")
-                    .font(.system(size: 13))
+                Text("طلب ارتباط وارد")
+                    .dawaiFont(size: 13)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
             }
@@ -579,7 +615,7 @@ public struct CaregiverHomeView: View {
                     handleAcceptInvitation(incoming: incoming)
                 } label: {
                     Text("قبول")
-                        .font(.system(size: 13, weight: .bold))
+                        .dawaiFont(size: 13, weight: .bold)
                         .padding(.horizontal, 14)
                         .padding(.vertical, 6)
                         .background(Color.dawaiPrimary, in: Capsule())
@@ -591,7 +627,7 @@ public struct CaregiverHomeView: View {
                     handleRejectInvitation(incoming: incoming)
                 } label: {
                     Image(systemName: "xmark")
-                        .font(.system(size: 11, weight: .bold))
+                        .dawaiFont(size: 11, weight: .bold)
                         .foregroundStyle(.secondary)
                         .frame(width: 26, height: 26)
                         .background(Color(uiColor: .tertiarySystemFill), in: Circle())
@@ -613,39 +649,47 @@ public struct CaregiverHomeView: View {
     @ViewBuilder
     private func pendingPatientCard(invite: ConnectionInvitation) -> some View {
         HStack(spacing: 12) {
-            ZStack {
-                Circle()
-                    .fill(Color(uiColor: .systemGray5))
-                    .frame(width: 36, height: 36)
-                Image(systemName: "envelope.badge")
-                    .font(.system(size: 16, weight: .medium))
-                    .foregroundStyle(Color.dawaiPrimary)
+            Button {
+                showingCreateInvitationSheet = true
+            } label: {
+                HStack(spacing: 12) {
+                    ZStack {
+                        Circle()
+                            .fill(Color(uiColor: .systemGray5))
+                            .frame(width: 36, height: 36)
+                        Image(systemName: "link.badge.plus")
+                            .dawaiFont(size: 16, weight: .medium)
+                            .foregroundStyle(Color.dawaiPrimary)
+                    }
+
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("دعوة مستفيد")
+                            .dawaiFont(size: 16, weight: .semibold)
+                            .foregroundStyle(.primary)
+                            .lineLimit(1)
+
+                        Text("بانتظار القبول")
+                            .dawaiFont(size: 13)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+
+                    Spacer()
+                }
+                .contentShape(Rectangle())
             }
-
-            VStack(alignment: .leading, spacing: 2) {
-                Text("دعوة مستفيد")
-                    .font(.system(size: 16, weight: .semibold))
-                    .foregroundStyle(.primary)
-                    .lineLimit(1)
-
-                Text("معلقة • كود: \(cleanToken(invite.token))")
-                    .font(.system(size: 13))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-            }
-
-            Spacer()
+            .buttonStyle(.plain)
 
             HStack(spacing: 6) {
                 Button {
-                    UIPasteboard.general.string = invite.token
-                    relationshipService.notificationToastMessage = "تم نسخ رمز الدعوة بنجاح"
+                    UIPasteboard.general.string = invite.webInviteURL.absoluteString
+                    relationshipService.notificationToastMessage = "تم نسخ رابط الدعوة بنجاح"
                 } label: {
                     HStack(spacing: 3) {
                         Image(systemName: "doc.on.doc")
-                            .font(.system(size: 11, weight: .semibold))
-                        Text("نسخ")
-                            .font(.system(size: 12, weight: .semibold))
+                            .dawaiFont(size: 11, weight: .semibold)
+                        Text("نسخ الرابط")
+                            .dawaiFont(size: 12, weight: .semibold)
                     }
                     .foregroundStyle(Color.dawaiPrimary)
                     .padding(.horizontal, 9)
@@ -653,7 +697,7 @@ public struct CaregiverHomeView: View {
                     .background(Color.dawaiPrimary.opacity(0.12), in: Capsule())
                 }
                 .buttonStyle(.plain)
-                .accessibilityLabel("نسخ رمز الدعوة")
+                .accessibilityLabel("نسخ رابط الدعوة")
 
                 Button {
                     withAnimation(.easeInOut(duration: 0.25)) {
@@ -661,7 +705,7 @@ public struct CaregiverHomeView: View {
                     }
                 } label: {
                     Image(systemName: "xmark")
-                        .font(.system(size: 11, weight: .bold))
+                        .dawaiFont(size: 11, weight: .bold)
                         .foregroundStyle(.secondary)
                         .frame(width: 26, height: 26)
                         .background(Color(uiColor: .tertiarySystemFill), in: Circle())
@@ -720,7 +764,7 @@ public struct CaregiverHomeView: View {
                     recipient: identity
                 )
             } catch {
-                // Toast notification is managed by relationshipService
+                relationshipService.showToast(error.localizedDescription)
             }
         }
     }

@@ -101,20 +101,118 @@ public struct ConnectionInvitation: Codable, Identifiable, Equatable {
         Date() > expiresAt
     }
 
-    /// Generates the standard deep link URI
+    /// Encodes this invitation into a URL-safe Base64 string so another device can validate and accept it without a server.
+    public var encodedPayload: String {
+        guard let data = try? JSONEncoder().encode(self) else { return "" }
+        return data.base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+    }
+
+    /// Decodes a `ConnectionInvitation` from a URL-safe Base64 string.
+    public static func decodeFromPayload(_ payload: String) -> ConnectionInvitation? {
+        var base64 = payload
+            .replacingOccurrences(of: "-", with: "+")
+            .replacingOccurrences(of: "_", with: "/")
+        let remainder = base64.count % 4
+        if remainder > 0 {
+            base64 += String(repeating: "=", count: 4 - remainder)
+        }
+        guard let data = Data(base64Encoded: base64) else { return nil }
+        return try? JSONDecoder().decode(ConnectionInvitation.self, from: data)
+    }
+
+    /// Generates the native custom-scheme deep link URI (`dawai://invite?token=...&payload=...`)
     public var deepLinkURL: URL {
-        URL(string: "dawai://invite?token=\(token)")!
+        var components = URLComponents()
+        components.scheme = "dawai"
+        components.host = "invite"
+        var items = [URLQueryItem(name: "token", value: token)]
+        let payload = encodedPayload
+        if !payload.isEmpty {
+            items.append(URLQueryItem(name: "payload", value: payload))
+        }
+        components.queryItems = items
+        return components.url ?? URL(string: "dawai://invite?token=\(token)")!
+    }
+
+    /// Generates an HTTPS invite URL (`https://...`) so WhatsApp, iMessage, and Telegram render it as a clickable link
+    /// that redirects into `dawai://invite?...` (and can also be pasted directly into the app).
+    public var webInviteURL: URL {
+        var components = URLComponents(string: "https://wajdwael.github.io/Dawai/invite/")!
+        var items = [URLQueryItem(name: "token", value: token)]
+        let payload = encodedPayload
+        if !payload.isEmpty {
+            items.append(URLQueryItem(name: "payload", value: payload))
+        }
+        components.queryItems = items
+        return components.url ?? deepLinkURL
     }
 
     /// Generates formatted shareable text for native iOS sharing options (S#3)
     public var shareableText: String {
         let roleName = initiatorRole == .patient ? "المستفيد" : "مقدم الرعاية"
-        return "دعوة اتصال آمنة من تطبيق دواء: يدعوك \(roleName) \(initiatorDisplayName) لربط الحسابين لمتابعة الأدوية.\nرابط الدعوة: dawai://invite?token=\(token)\nرمز الدعوة: \(token)"
+        return "دعوة اتصال آمنة من تطبيق دواي: يدعوك \(roleName) \(initiatorDisplayName) لربط الحسابين لمتابعة الأدوية.\n\(webInviteURL.absoluteString)"
+    }
+}
+
+// MARK: - Portable Cross-Device Sync Bundle
+public struct PortablePatientSyncBundle: Codable, Equatable {
+    public let patientId: String
+    public let patientDisplayName: String
+    public let relationship: ActiveRelationship?
+    public let medications: [MedicationItem]
+    public let deletionRequests: [MedicationDeletionRequest]
+    public let doseRecords: [DoseRecord]
+
+    public init(
+        patientId: String,
+        patientDisplayName: String,
+        relationship: ActiveRelationship?,
+        medications: [MedicationItem],
+        deletionRequests: [MedicationDeletionRequest],
+        doseRecords: [DoseRecord]
+    ) {
+        self.patientId = patientId
+        self.patientDisplayName = patientDisplayName
+        self.relationship = relationship
+        self.medications = medications
+        self.deletionRequests = deletionRequests
+        self.doseRecords = doseRecords
+    }
+
+    public var encodedPayload: String {
+        guard let data = try? JSONEncoder().encode(self) else { return "" }
+        return data.base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+    }
+
+    public static func decodeFromPayload(_ payload: String) -> PortablePatientSyncBundle? {
+        var base64 = payload
+            .replacingOccurrences(of: "-", with: "+")
+            .replacingOccurrences(of: "_", with: "/")
+        let remainder = base64.count % 4
+        if remainder > 0 {
+            base64 += String(repeating: "=", count: 4 - remainder)
+        }
+        guard let data = Data(base64Encoded: base64) else { return nil }
+        return try? JSONDecoder().decode(PortablePatientSyncBundle.self, from: data)
+    }
+
+    public var deepLinkURL: URL {
+        var components = URLComponents()
+        components.scheme = "dawai"
+        components.host = "sync"
+        components.queryItems = [URLQueryItem(name: "payload", value: encodedPayload)]
+        return components.url ?? URL(string: "dawai://sync")!
     }
 }
 
 // MARK: - Active Relationship Model (S#7)
-public struct ActiveRelationship: Codable, Identifiable, Equatable {
+public struct ActiveRelationship: Codable, Identifiable, Equatable, Sendable {
     public let id: UUID
     public let invitationId: UUID
     public let patientId: String

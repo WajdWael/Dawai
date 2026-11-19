@@ -2,7 +2,7 @@
 //  IdentityDetailsSheet.swift
 //  Dawai
 //
-//  Settings & Preferences (Role, Appearance, Notifications)
+//  Settings & Preferences (Role, CloudKit Sync, Appearance, Text Size, Notifications)
 //
 
 import SwiftUI
@@ -10,37 +10,50 @@ import UserNotifications
 
 public typealias SettingsSheet = IdentityDetailsSheet
 
-/// Modal sheet for App Settings (Role, Appearance, Notifications)
+/// Modal sheet for App Settings
 public struct IdentityDetailsSheet: View {
     let identity: UserIdentity
     @EnvironmentObject private var appState: AppState
     @Environment(\.dismiss) private var dismiss
 
     @ObservedObject private var themeService = ThemeService.shared
-    @ObservedObject private var demoMode = DemoModeService.shared
-    @ObservedObject private var appClock = AppClock.shared
-    @ObservedObject private var medicationService = MedicationService.shared
+    @ObservedObject private var cloudSync = CloudKitSyncManager.shared
     @State private var notificationsEnabled: Bool = UserDefaults.standard.object(forKey: "dawai_notifications_enabled") as? Bool ?? true
-    @State private var showingResetConfirmation = false
+    @State private var alarmKitEnabled: Bool = MedicationAlarmService.shared.isUserEnabled
+    @State private var liveActivityEnabled: Bool = DoseLiveActivityManager.shared.isUserEnabled
     @State private var showingPermissionDeniedAlert = false
+    @State private var showingAlarmPermissionDeniedAlert = false
+    @State private var showingResetConfirmAlert = false
     @State private var systemPermissionStatus: UNAuthorizationStatus = .authorized
-    @State private var showingReportSheet = false
 
     public init(identity: UserIdentity) {
         self.identity = identity
     }
 
+    private var textSizeSliderBinding: Binding<Double> {
+        Binding(
+            get: { Double(themeService.textSizeStep) },
+            set: { newValue in
+                let rounded = Int(newValue.rounded())
+                if themeService.textSizeStep != rounded {
+                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                    themeService.textSizeStep = rounded
+                }
+            }
+        )
+    }
+
     public var body: some View {
         NavigationStack {
             Form {
-                // MARK: - 1. Role Section (Only the role as requested)
+                // MARK: - 1. Role Section (Current Role Only)
                 Section {
                     HStack {
-                        Text("الدور")
-                            .font(.system(size: 16, weight: .medium))
+                        Text("الدور الحالي")
+                            .dawaiFont(size: 16, weight: .medium)
                         Spacer()
-                        Label(identity.role.titleArabic, systemImage: identity.role.systemImage)
-                            .font(.system(size: 15, weight: .bold))
+                        Label("\(identity.displayName) • \(identity.role.titleArabic)", systemImage: identity.role.systemImage)
+                            .dawaiFont(size: 15, weight: .bold)
                             .foregroundStyle(Color.dawaiPrimary)
                     }
                     .padding(.vertical, 2)
@@ -48,39 +61,55 @@ public struct IdentityDetailsSheet: View {
                     Text("الحساب")
                 }
 
-                // MARK: - 1.5 Reports Section (UC-7 S#1: Profile Area Access)
+                // MARK: - 2. CloudKit Sync Section
                 Section {
-                    Button {
-                        showingReportSheet = true
-                    } label: {
-                        HStack(spacing: 12) {
-                            Image(systemName: "chart.bar.xaxis")
-                                .font(.system(size: 18))
-                                .foregroundStyle(Color.dawaiPrimary)
+                    HStack(spacing: 12) {
+                        Image(systemName: cloudSync.isAccountAvailable ? "icloud.and.arrow.up.fill" : "icloud.slash.fill")
+                            .dawaiFont(size: 18)
+                            .foregroundStyle(cloudSync.isAccountAvailable ? Color.dawaiPrimary : .orange)
 
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text("تقرير الالتزام الدوائي الأسبوعي")
-                                    .font(.system(size: 15, weight: .semibold))
-                                    .foregroundStyle(.primary)
-                                Text("الرسوم البيانية ونسب الالتزام والجرعات")
-                                    .font(.system(size: 12))
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(cloudSync.statusMessage)
+                                .dawaiFont(size: 14, weight: .semibold)
+                                .foregroundStyle(.primary)
+
+                            if let lastSynced = cloudSync.lastSyncedAt {
+                                Text("آخر مزامنة: \(lastSynced.formatted(date: .omitted, time: .shortened))")
+                                    .dawaiFont(size: 12)
+                                    .foregroundStyle(.secondary)
+                            } else if cloudSync.pendingUploadCount > 0 {
+                                Text("بانتظار رفع \(cloudSync.pendingUploadCount) تحديثات")
+                                    .dawaiFont(size: 12)
                                     .foregroundStyle(.secondary)
                             }
+                        }
 
-                            Spacer()
+                        Spacer()
 
-                            Image(systemName: "chevron.left")
-                                .font(.system(size: 13, weight: .semibold))
-                                .foregroundStyle(.secondary)
+                        if cloudSync.isSyncing {
+                            ProgressView()
                         }
                     }
+
+                    Button {
+                        Task {
+                            await cloudSync.syncNow(silent: false)
+                        }
+                    } label: {
+                        HStack {
+                            Image(systemName: "arrow.triangle.2.circlepath")
+                                .foregroundStyle(Color.dawaiPrimary)
+                            Text("مزامنة الآن مع iCloud")
+                                .dawaiFont(size: 15, weight: .semibold)
+                                .foregroundStyle(Color.dawaiPrimary)
+                        }
+                    }
+                    .disabled(cloudSync.isSyncing)
                 } header: {
-                    Text("التقارير والإحصائيات")
-                } footer: {
-                    Text("يوفر التقرير الأسبوعي ملخصاً بصرياً لمتابعة انتظام أخذ الجرعات المجدولة.")
+                    Text("المزامنة السحابية (iCloud)")
                 }
 
-                // MARK: - 2. Appearance Section (Dark / Light / System Mode - Backend Connected)
+                // MARK: - 3. Appearance & iOS-Style Text Size Section
                 Section {
                     Picker("المظهر", selection: $themeService.appearanceRaw) {
                         ForEach(AppAppearance.allCases) { appearance in
@@ -89,25 +118,80 @@ public struct IdentityDetailsSheet: View {
                     }
                     .pickerStyle(.segmented)
                     .padding(.vertical, 4)
+
+                    VStack(alignment: .leading, spacing: 12) {
+                        HStack {
+                            Label("حجم الخط", systemImage: "textformat.size")
+                                .dawaiFont(size: 16, weight: .medium)
+                            Spacer()
+                            Text(themeService.currentTextSize.titleArabic)
+                                .dawaiFont(size: 14, weight: .bold)
+                                .foregroundStyle(Color.dawaiPrimary)
+                        }
+
+                        // Native iOS-style Text Size slider with small/large glyph anchors & step ticks
+                        VStack(spacing: 4) {
+                            HStack(spacing: 14) {
+                                Text("أ")
+                                    .font(.system(size: 13, weight: .semibold))
+                                    .foregroundStyle(.secondary)
+
+                                Slider(
+                                    value: textSizeSliderBinding,
+                                    in: Double(AppTextSize.small.rawValue)...Double(AppTextSize.maximum.rawValue),
+                                    step: 1
+                                )
+                                .tint(Color.dawaiPrimary)
+                                .accessibilityLabel("حجم الخط")
+                                .accessibilityValue(themeService.currentTextSize.titleArabic)
+
+                                Text("أ")
+                                    .font(.system(size: 24, weight: .bold))
+                                    .foregroundStyle(.primary)
+                            }
+
+                            // Step tick indicators matching iOS Display & Brightness -> Text Size
+                            HStack {
+                                ForEach(AppTextSize.allCases) { step in
+                                    Capsule()
+                                        .fill(
+                                            step.rawValue == themeService.textSizeStep
+                                                ? Color.dawaiPrimary
+                                                : Color.secondary.opacity(0.35)
+                                        )
+                                        .frame(width: step.rawValue == themeService.textSizeStep ? 3 : 2, height: step.rawValue == themeService.textSizeStep ? 10 : 7)
+                                    if step != AppTextSize.allCases.last {
+                                        Spacer()
+                                    }
+                                }
+                            }
+                            .padding(.horizontal, 34)
+                        }
+
+                        Text("معاينة حجم النص في مواعيد أدويتك وتنبيهات الجرعات.")
+                            .dawaiFont(size: 15, weight: .medium)
+                            .foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.top, 2)
+                    }
+                    .padding(.vertical, 6)
                 } header: {
-                    Text("المظهر")
-                } footer: {
-                    Text("اختر المظهر الفاتح أو الداكن، أو اجعله يتبع إعدادات الجهاز تلقائياً.")
+                    Text("المظهر وحجم الخط")
                 }
 
-                // MARK: - 3. Notifications Section (On / Off - Backend & System Connected)
+                // MARK: - 4. Notifications Section (On / Off - Backend & System Connected)
                 Section {
                     Toggle(isOn: $notificationsEnabled) {
                         HStack(spacing: 10) {
                             Image(systemName: notificationsEnabled ? "bell.badge.fill" : "bell.slash.fill")
-                                .font(.system(size: 18))
+                                .dawaiFont(size: 18)
                                 .foregroundStyle(notificationsEnabled ? Color.dawaiPrimary : .secondary)
 
                             VStack(alignment: .leading, spacing: 2) {
                                 Text("تنبيهات مواعيد الأدوية")
-                                    .font(.system(size: 16, weight: .medium))
+                                    .dawaiFont(size: 16, weight: .medium)
                                 Text(notificationsEnabled ? "مفعلة" : "متوقفة")
-                                    .font(.system(size: 12))
+                                    .dawaiFont(size: 12)
                                     .foregroundStyle(.secondary)
                             }
                         }
@@ -137,6 +221,63 @@ public struct IdentityDetailsSheet: View {
                         }
                     }
 
+                    if MedicationAlarmService.shared.isSupportedOnDevice && notificationsEnabled {
+                        Toggle(isOn: $alarmKitEnabled) {
+                            HStack(spacing: 10) {
+                                Image(systemName: alarmKitEnabled ? "alarm.waves.left.and.right.fill" : "alarm")
+                                    .dawaiFont(size: 18)
+                                    .foregroundStyle(alarmKitEnabled ? Color.dawaiPrimary : .secondary)
+
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text("منبّه الدواء القوي (ملء الشاشة)")
+                                        .dawaiFont(size: 16, weight: .medium)
+                                    Text("يرن بملء الشاشة ويتجاوز الصامت بدون غفوة")
+                                        .dawaiFont(size: 12)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                        }
+                        .tint(Color.dawaiPrimary)
+                        .onChange(of: alarmKitEnabled) { newValue in
+                            Task {
+                                let ok = await MedicationService.shared.setAlarmKitEnabled(newValue)
+                                if newValue && !ok {
+                                    await MainActor.run {
+                                        alarmKitEnabled = false
+                                        showingAlarmPermissionDeniedAlert = true
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if notificationsEnabled && identity.role == .patient {
+                        Toggle(isOn: $liveActivityEnabled) {
+                            HStack(spacing: 10) {
+                                Image(systemName: liveActivityEnabled ? "platter.filled.top.iphone" : "iphone")
+                                    .dawaiFont(size: 18)
+                                    .foregroundStyle(liveActivityEnabled ? Color.dawaiPrimary : .secondary)
+
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text("تنبيهات Dynamic Island وشاشة القفل")
+                                        .dawaiFont(size: 16, weight: .medium)
+                                    Text("يعرض الجرعة القادمة والمتأخرة في الجزيرة التفاعلية")
+                                        .dawaiFont(size: 12)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                        }
+                        .tint(Color.dawaiPrimary)
+                        .onChange(of: liveActivityEnabled) { newValue in
+                            DoseLiveActivityManager.shared.isUserEnabled = newValue
+                            if newValue {
+                                DoseLiveActivityManager.shared.sync(using: MedicationService.shared)
+                            } else {
+                                DoseLiveActivityManager.shared.endAllActivities()
+                            }
+                        }
+                    }
+
                     if systemPermissionStatus == .denied {
                         Button {
                             if let url = URL(string: UIApplication.openSettingsURLString),
@@ -148,198 +289,77 @@ public struct IdentityDetailsSheet: View {
                                 Image(systemName: "exclamationmark.triangle.fill")
                                     .foregroundStyle(Color.dawaiWarning)
                                 Text("الإشعارات متوقفة في إعدادات النظام • اضغط لفتح الإعدادات")
-                                    .font(.system(size: 12, weight: .semibold))
+                                    .dawaiFont(size: 12, weight: .semibold)
                                     .foregroundStyle(Color.dawaiWarning)
                             }
                         }
                     }
                 } header: {
                     Text("الإشعارات")
-                } footer: {
-                    Text(notificationsEnabled
-                         ? "ستصلك تنبيهات صوتية حقيقية عند حلول موعد أخذ كل جرعة دواء مجدولة."
-                         : "لن تتلقى أي إشعارات أو تذكيرات عند حلول مواعيد الأدوية.")
                 }
 
-                // MARK: - 4. Simulator Tools (Debug & TestFlight only)
-                if AppEnvironment.showsSimulatorTools {
-                    Section {
-                        Button {
-                            Task {
-                                let fallbackMed = MedicationItem(
-                                    patientId: identity.id,
-                                    name: "دواء تجريبي",
-                                    dosage: "حبة واحدة",
-                                    timeString: "12:00 م"
-                                )
-                                // A caregiver owns no medications; fall back to any medication stored on this device.
-                                let med = MedicationService.shared.medications.first
-                                    ?? MedicationService.shared.allMedications.first
-                                    ?? fallbackMed
-                                await MedicationService.shared.simulateInstantMissedDoseAlert(for: med, delaySeconds: 3)
-                            }
-                        } label: {
-                            HStack(spacing: 10) {
-                                Image(systemName: "exclamationmark.triangle.fill")
-                                    .font(.system(size: 18))
-                                    .foregroundStyle(Color.dawaiWarning)
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text("محاكاة تنبيه تأخر الجرعة 30 د (UC-5)")
-                                        .font(.system(size: 15, weight: .semibold))
-                                        .foregroundStyle(.primary)
-                                    Text("إرسال إشعار بعد 3 ثوانٍ لمقدم الرعاية بتأخر الجرعة وتجربة الاتصال")
-                                        .font(.system(size: 12))
-                                        .foregroundStyle(.secondary)
-                                }
-                            }
-                        }
-
-                        #if DEBUG
-                        Button {
-                            if demoMode.isActive {
-                                demoMode.disable()
+                // MARK: - 4.5 Testing / Demo Simulation Section
+                Section {
+                    Toggle(isOn: Binding(
+                        get: { DemoModeService.shared.isActive },
+                        set: { isEnabled in
+                            if isEnabled {
+                                DemoModeService.shared.enable()
                             } else {
-                                demoMode.enable()
-                            }
-                        } label: {
-                            HStack(spacing: 10) {
-                                Image(systemName: demoMode.isActive ? "trash.slash.fill" : "tray.and.arrow.down.fill")
-                                    .font(.system(size: 17))
-                                    .foregroundStyle(Color.dawaiPrimary)
-                                Text(demoMode.isActive ? "إيقاف ومسح البيانات التجريبية (DEBUG)" : "تحميل البيانات التجريبية (DEBUG)")
-                                    .font(.system(size: 15, weight: .semibold))
-                                    .foregroundStyle(.primary)
+                                DemoModeService.shared.disable()
                             }
                         }
-
-                        VStack(alignment: .leading, spacing: 6) {
-                            HStack {
-                                Label("الساعة الحالية للاختبار (DEBUG)", systemImage: "clock.badge.checkmark")
-                                    .font(.system(size: 14, weight: .semibold))
-                                    .foregroundStyle(.primary)
-                                Spacer()
-                                Text(appClock.isUsingSimulatedTime ? "محاكى" : "ساعة الجهاز")
-                                    .font(.system(size: 11, weight: .bold))
-                                    .padding(.horizontal, 8)
-                                    .padding(.vertical, 3)
-                                    .background(
-                                        (appClock.isUsingSimulatedTime ? Color.dawaiWarning : Color.secondary)
-                                            .opacity(0.15)
-                                    )
-                                    .foregroundStyle(appClock.isUsingSimulatedTime ? Color.dawaiWarning : Color.secondary)
-                                    .clipShape(Capsule())
-                            }
-                            Text(formattedSimulatedClock)
-                                .font(.system(size: 13, weight: .medium, design: .monospaced))
-                                .foregroundStyle(.secondary)
-                        }
-                        .padding(.vertical, 2)
-
-                        if let targetMed = medicationService.activeMedication ?? medicationService.medications.first {
-                            Text("الدواء المستهدف: \(targetMed.name) (\(targetMed.timeString.westernNumerals))")
-                                .font(.system(size: 12, weight: .medium))
-                                .foregroundStyle(.secondary)
-
-                            debugStageButton(
-                                title: "المرحلة 1: قبل النافذة (-30 د)",
-                                subtitle: "يعرض «الجرعة القادمة الساعة \(targetMed.timeString.westernNumerals)»",
-                                icon: "clock",
-                                tint: .secondary,
-                                deltaMinutes: -30,
-                                medication: targetMed
-                            )
-                            debugStageButton(
-                                title: "المرحلة 2: داخل النافذة (-10 د)",
-                                subtitle: "يفعّل زر «اخذت الدواء» (قبل \(DoseWindowConfig.preWindowMinutes) د من الموعد)",
-                                icon: "checkmark.circle",
-                                tint: Color.dawaiPrimary,
-                                deltaMinutes: -10,
-                                medication: targetMed
-                            )
-                            debugStageButton(
-                                title: "المرحلة 3: جرعة متأخرة (+45 د)",
-                                subtitle: "يعرض «• جرعة متأخرة» ويبقي زر التأكيد ظاهراً",
-                                icon: "exclamationmark.circle.fill",
-                                tint: Color.dawaiWarning,
-                                deltaMinutes: 45,
-                                medication: targetMed
-                            )
-                            debugStageButton(
-                                title: "المرحلة 4: جرعة فائتة (+130 د)",
-                                subtitle: "بعد \(DoseWindowConfig.missedCutoffMinutes) د — تسجّل «فائتة» ويختفي الزر",
-                                icon: "xmark.octagon.fill",
-                                tint: .red,
-                                deltaMinutes: 130,
-                                medication: targetMed
-                            )
-
-                            HStack(spacing: 8) {
-                                Button("+15 د") {
-                                    appClock.setSimulatedDate(appClock.now.addingTimeInterval(15 * 60))
-                                }
-                                .buttonStyle(.bordered)
-                                Button("+60 د") {
-                                    appClock.setSimulatedDate(appClock.now.addingTimeInterval(60 * 60))
-                                }
-                                .buttonStyle(.bordered)
-                                Button("+24 ساعة") {
-                                    appClock.setSimulatedDate(appClock.now.addingTimeInterval(24 * 60 * 60))
-                                }
-                                .buttonStyle(.bordered)
-                            }
-                            .font(.system(size: 12, weight: .semibold))
-                        } else {
-                            Text("أضف دواءً واحداً على الأقل لتجربة محاكاة المراحل الأربع للنافذة الزمنية.")
-                                .font(.system(size: 12))
-                                .foregroundStyle(.secondary)
-                        }
-
-                        if appClock.isUsingSimulatedTime {
-                            Button(role: .destructive) {
-                                appClock.reset()
-                            } label: {
-                                HStack(spacing: 8) {
-                                    Image(systemName: "arrow.uturn.backward.circle.fill")
-                                    Text("إعادة ضبط الوقت إلى ساعة الجهاز الحقيقية")
-                                        .font(.system(size: 14, weight: .semibold))
-                                }
+                    )) {
+                        HStack(spacing: 10) {
+                            Image(systemName: "wand.and.stars")
+                                .dawaiFont(size: 18)
+                                .foregroundStyle(Color.dawaiPrimary)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("محاكاة بيانات تجريبية (Demo Mode)")
+                                    .dawaiFont(size: 16, weight: .medium)
+                                Text("توليد أدوية وجرعات وتقارير جاهزة للاختبار والمعاينة")
+                                    .dawaiFont(size: 12)
+                                    .foregroundStyle(.secondary)
                             }
                         }
-                        #endif
-                    } header: {
-                        Text("وضع تجريبي")
-                    } footer: {
-                        Text("تظهر أدوات المحاكاة في نسخ التطوير و TestFlight فقط لتسهيل الاختبار، وتختفي في نسخة App Store.")
                     }
+                    .tint(Color.dawaiPrimary)
+                } header: {
+                    Text("أدوات التجربة والاختبار")
                 }
 
-                // MARK: - 5. Reset & Data Management
+                // MARK: - 5. Sign Out & Wipe Section
                 Section {
                     Button(role: .destructive) {
-                        showingResetConfirmation = true
+                        showingResetConfirmAlert = true
                     } label: {
-                        HStack {
-                            Image(systemName: "arrow.counterclockwise.circle")
-                            Text("إعادة ضبط الهوية")
+                        HStack(spacing: 10) {
+                            Image(systemName: "rectangle.portrait.and.arrow.right")
+                                .foregroundStyle(.red)
+                            Text("تسجيل الخروج وحذف البيانات")
+                                .dawaiFont(size: 16, weight: .bold)
+                                .foregroundStyle(.red)
+                            Spacer()
                         }
+                        .contentShape(Rectangle())
                     }
-                } header: {
-                    Text("إدارة البيانات")
                 } footer: {
-                    Text("إعادة ضبط الهوية تمسح جميع البيانات المحلية المحفوظة على هذا الجهاز للبدء من جديد.")
+                    Text("سيؤدي تسجيل الخروج إلى مسح جميع الأدوية وسجلات الجرعات والارتباطات المحفوظة محلياً على هذا الجهاز والعودة إلى شاشة البداية.")
                 }
             }
             .preferredColorScheme(themeService.colorScheme)
+            .environment(\.dawaiFontScale, themeService.fontScale)
+            .environment(\.dynamicTypeSize, themeService.dynamicTypeSize)
             .environment(\.layoutDirection, .rightToLeft)
             .environment(\.locale, Locale.dawaiArabic)
             .navigationTitle("الإعدادات")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("تم") {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button("إغلاق") {
                         dismiss()
                     }
-                    .font(.system(size: 16, weight: .bold))
+                    .dawaiFont(size: 16, weight: .semibold)
                     .foregroundStyle(Color.dawaiPrimary)
                 }
             }
@@ -363,63 +383,33 @@ public struct IdentityDetailsSheet: View {
             } message: {
                 Text("لتلقي تذكيرات بمواعيد أدويتك، يرجى السماح بالإشعارات لتطبيق دواء من إعدادات جهازك.")
             }
-            .sheet(isPresented: $showingReportSheet) {
-                AdherenceReportView(currentUser: identity)
-                    .preferredColorScheme(themeService.colorScheme)
+            .alert("إذن المنبّهات متوقف في إعدادات iPhone", isPresented: $showingAlarmPermissionDeniedAlert) {
+                Button("فتح الإعدادات") {
+                    if let url = URL(string: UIApplication.openSettingsURLString),
+                       UIApplication.shared.canOpenURL(url) {
+                        UIApplication.shared.open(url)
+                    }
+                }
+                Button("إلغاء", role: .cancel) {}
+            } message: {
+                Text("لتشغيل منبّه الدواء القوي بملء الشاشة، يرجى السماح بإذن المنبّهات لتطبيق دواء من إعدادات الجهاز.")
             }
-            .confirmationDialog(
-                "إعادة ضبط الهوية ومسح جميع البيانات؟",
-                isPresented: $showingResetConfirmation,
-                titleVisibility: .visible
-            ) {
-                Button("مسح جميع البيانات وإعادة الضبط", role: .destructive) {
+            .alert("تسجيل الخروج وحذف البيانات", isPresented: $showingResetConfirmAlert) {
+                Button("تسجيل الخروج وحذف البيانات", role: .destructive) {
                     dismiss()
                     appState.resetIdentityAndAllData()
                 }
                 Button("إلغاء", role: .cancel) {}
             } message: {
-                Text("سيؤدي هذا إلى مسح الهوية الحالية وجميع الأدوية وسجل الالتزام والارتباطات المحفوظة على هذا الجهاز نهائياً، وإعادتك لشاشة البداية.")
+                Text("هل أنت متأكد من رغبتك في تسجيل الخروج؟ سيتم مسح كافة الأدوية وسجلات الجرعات والارتباطات المحفوظة على هذا الجهاز والعودة إلى شاشة البداية.")
             }
         }
+        .environment(\.dawaiFontScale, themeService.fontScale)
+        .environment(\.dynamicTypeSize, themeService.dynamicTypeSize)
+        .environment(\.layoutDirection, .rightToLeft)
+        .environment(\.locale, Locale.dawaiArabic)
         .preferredColorScheme(themeService.colorScheme)
     }
-
-    #if DEBUG
-    private var formattedSimulatedClock: String {
-        let formatter = DateFormatter()
-        formatter.locale = Locale.dawaiArabic
-        formatter.dateFormat = "d MMM • hh:mm a"
-        return formatter.string(from: appClock.now).westernNumerals
-    }
-
-    @ViewBuilder
-    private func debugStageButton(
-        title: String,
-        subtitle: String,
-        icon: String,
-        tint: Color,
-        deltaMinutes: Int,
-        medication: MedicationItem
-    ) -> some View {
-        Button {
-            appClock.setStageForMedication(medication, deltaMinutesFromSchedule: deltaMinutes)
-        } label: {
-            HStack(spacing: 10) {
-                Image(systemName: icon)
-                    .font(.system(size: 16))
-                    .foregroundStyle(tint)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(title)
-                        .font(.system(size: 14, weight: .semibold))
-                        .foregroundStyle(.primary)
-                    Text(subtitle)
-                        .font(.system(size: 12))
-                        .foregroundStyle(.secondary)
-                }
-            }
-        }
-    }
-    #endif
 }
 
 struct IdentityDetailsSheet_Previews: PreviewProvider {

@@ -18,10 +18,15 @@ public final class AdherenceService: ObservableObject {
 
     /// Persistence for the dose log (UserDefaults today, replaceable later).
     private let store: any DoseRecordStore
+    private let relationshipService: RelationshipService
     private let calendar: Calendar
 
-    public init(store: any DoseRecordStore = UserDefaultsDoseRecordStore()) {
+    public init(
+        store: any DoseRecordStore = UserDefaultsDoseRecordStore(),
+        relationshipService: RelationshipService? = nil
+    ) {
         self.store = store
+        self.relationshipService = relationshipService ?? .shared
         var cal = Calendar(identifier: .gregorian)
         cal.locale = Locale.dawaiArabic
         cal.firstWeekday = 1 // Sunday as the start of the week in Arab region
@@ -42,12 +47,10 @@ public final class AdherenceService: ObservableObject {
         store.removeAll()
     }
 
-    #if DEBUG
-    // MARK: - Demo data (Debug builds only, loaded on request from Settings)
+    // MARK: - Demo data (Loaded on request from Settings for testing)
     public func loadDemoHistory() {
         seedRealisticDoseHistory()
     }
-    #endif
 
     /// A record belongs to a patient only when the ids match.
     /// Demo history (Debug builds with demo mode on) is stored under "default_patient" and shown to everyone.
@@ -58,6 +61,45 @@ public final class AdherenceService: ObservableObject {
 
     private func persistRecords() {
         store.saveDoseRecords(doseRecords)
+    }
+
+    public func records(forPatient patientId: String) -> [DoseRecord] {
+        doseRecords.filter { $0.patientId == patientId }
+    }
+
+    public func mergeImportedRecords(_ imported: [DoseRecord], forPatient patientId: String) {
+        applyRemoteDoseRecords(imported, forPatient: patientId)
+    }
+
+    /// Merges dose records pulled from CloudKit or sync bundles without downgrading taken records to missed/upcoming.
+    public func applyRemoteDoseRecords(_ imported: [DoseRecord], forPatient patientId: String) {
+        guard !imported.isEmpty else { return }
+        var changed = false
+        for rec in imported where rec.patientId == patientId {
+            if let existingIdx = doseRecords.firstIndex(where: {
+                $0.id == rec.id ||
+                ($0.medicationId == rec.medicationId &&
+                 calendar.isDate($0.scheduledDate, inSameDayAs: rec.scheduledDate) &&
+                 minuteOfDay(for: $0.scheduledDate) == minuteOfDay(for: rec.scheduledDate))
+            }) {
+                let existing = doseRecords[existingIdx]
+                let existingTaken = existing.status == .takenOnTime || existing.status == .takenLate
+                let incomingTaken = rec.status == .takenOnTime || rec.status == .takenLate
+                if existingTaken && !incomingTaken {
+                    continue
+                }
+                if existing != rec {
+                    doseRecords[existingIdx] = rec
+                    changed = true
+                }
+            } else {
+                doseRecords.append(rec)
+                changed = true
+            }
+        }
+        if changed {
+            persistRecords()
+        }
     }
 
     // MARK: - UC-7 S#2: Permission & Authorization Verification
@@ -72,7 +114,7 @@ public final class AdherenceService: ObservableObject {
         }
 
         // Caregivers: verify active relationship permissions
-        let activeRels = RelationshipService.shared.activeRelationships
+        let activeRels = relationshipService.activeRelationships
         let hasActiveRelation = activeRels.contains { rel in
             rel.caregiverId == actor.id && rel.patientId == targetPatientId && rel.isActive
         }
@@ -90,10 +132,30 @@ public final class AdherenceService: ObservableObject {
     }
 
     // MARK: - Dose Logging (Triggered by UC-6 Confirm Dose)
-    public func hasRecord(for medicationId: UUID, on dayDate: Date) -> Bool {
+    private func minuteOfDay(for date: Date) -> Int {
+        let comps = calendar.dateComponents([.hour, .minute], from: date)
+        return (comps.hour ?? 0) * 60 + (comps.minute ?? 0)
+    }
+
+    private func matchesSlot(_ record: DoseRecord, medicationId: UUID, on dayDate: Date, slotMinutes: Int?) -> Bool {
+        guard record.medicationId == medicationId,
+              calendar.isDate(record.scheduledDate, inSameDayAs: dayDate) else {
+            return false
+        }
+        guard let slotMinutes else { return true }
+        return minuteOfDay(for: record.scheduledDate) == slotMinutes
+    }
+
+    public func hasRecord(for medicationId: UUID, on dayDate: Date, slotMinutes: Int? = nil) -> Bool {
         doseRecords.contains { rec in
-            rec.medicationId == medicationId &&
-            calendar.isDate(rec.scheduledDate, inSameDayAs: dayDate)
+            matchesSlot(rec, medicationId: medicationId, on: dayDate, slotMinutes: slotMinutes)
+        }
+    }
+
+    public func hasTakenRecord(for medicationId: UUID, on dayDate: Date, slotMinutes: Int? = nil) -> Bool {
+        doseRecords.contains { rec in
+            matchesSlot(rec, medicationId: medicationId, on: dayDate, slotMinutes: slotMinutes) &&
+            (rec.status == .takenOnTime || rec.status == .takenLate)
         }
     }
 
@@ -101,15 +163,17 @@ public final class AdherenceService: ObservableObject {
         medication: MedicationItem,
         patientId: String,
         takenAt: Date? = nil,
-        scheduledDay: Date? = nil
+        scheduledDay: Date? = nil,
+        slotMinutes: Int? = nil
     ) {
         let effectiveTakenAt = takenAt ?? AppClock.shared.now
         let targetDay = calendar.startOfDay(for: scheduledDay ?? effectiveTakenAt)
+        let resolvedSlot = slotMinutes ?? minuteOfDay(for: scheduledDateTime(for: medication, on: targetDay))
 
-        // Find existing record for this medication on targetDay, or create new one
+        let savedRecord: DoseRecord
+        // Find existing record for this medication slot on targetDay, or create new one
         if let idx = doseRecords.firstIndex(where: {
-            $0.medicationId == medication.id &&
-            calendar.isDate($0.scheduledDate, inSameDayAs: targetDay)
+            matchesSlot($0, medicationId: medication.id, on: targetDay, slotMinutes: resolvedSlot)
         }) {
             // Prevent duplicate confirmation if already marked as taken on targetDay
             if doseRecords[idx].status == .takenOnTime || doseRecords[idx].status == .takenLate {
@@ -118,16 +182,17 @@ public final class AdherenceService: ObservableObject {
 
             let sched = doseRecords[idx].scheduledDate
             let delayMinutes = max(0, Int(effectiveTakenAt.timeIntervalSince(sched) / 60))
-            let isLate = delayMinutes > DoseWindowConfig.lateThresholdMinutes
+            let isLate = delayMinutes >= DoseWindowConfig.lateThresholdMinutes
 
             doseRecords[idx].takenDate = effectiveTakenAt
             doseRecords[idx].status = isLate ? .takenLate : .takenOnTime
             doseRecords[idx].delayMinutes = delayMinutes
+            savedRecord = doseRecords[idx]
         } else {
             // Create record
-            let sched = scheduledDateTime(for: medication, on: targetDay)
+            let sched = scheduledDateTime(for: medication, on: targetDay, slotMinutes: resolvedSlot)
             let delayMinutes = max(0, Int(effectiveTakenAt.timeIntervalSince(sched) / 60))
-            let isLate = delayMinutes > DoseWindowConfig.lateThresholdMinutes
+            let isLate = delayMinutes >= DoseWindowConfig.lateThresholdMinutes
 
             let record = DoseRecord(
                 patientId: patientId,
@@ -140,32 +205,36 @@ public final class AdherenceService: ObservableObject {
                 delayMinutes: delayMinutes
             )
             doseRecords.append(record)
+            savedRecord = record
         }
 
         persistRecords()
+        CloudKitSyncManager.shared.publishDoseRecord(savedRecord)
     }
 
-    /// Marks a scheduled dose as `.missed` ("فائتة") in the adherence log once its late confirmation window has expired without being taken.
+    /// Marks a scheduled dose slot as `.missed` ("فائتة") in the adherence log once its late confirmation window has expired without being taken.
     public func recordDoseMissedIfNeeded(
         medication: MedicationItem,
         patientId: String,
-        on date: Date? = nil
+        on date: Date? = nil,
+        slotMinutes: Int? = nil
     ) {
         let dayStart = calendar.startOfDay(for: date ?? AppClock.shared.now)
+        let resolvedSlot = slotMinutes ?? minuteOfDay(for: scheduledDateTime(for: medication, on: dayStart))
         if let idx = doseRecords.firstIndex(where: {
-            $0.medicationId == medication.id &&
-            calendar.isDate($0.scheduledDate, inSameDayAs: dayStart)
+            matchesSlot($0, medicationId: medication.id, on: dayStart, slotMinutes: resolvedSlot)
         }) {
             if doseRecords[idx].status == .upcoming {
                 doseRecords[idx].status = .missed
                 doseRecords[idx].takenDate = nil
                 doseRecords[idx].delayMinutes = 0
                 persistRecords()
+                CloudKitSyncManager.shared.publishDoseRecord(doseRecords[idx])
             }
             return
         }
 
-        let sched = scheduledDateTime(for: medication, on: dayStart)
+        let sched = scheduledDateTime(for: medication, on: dayStart, slotMinutes: resolvedSlot)
         let record = DoseRecord(
             patientId: patientId,
             medicationId: medication.id,
@@ -178,6 +247,7 @@ public final class AdherenceService: ObservableObject {
         )
         doseRecords.append(record)
         persistRecords()
+        CloudKitSyncManager.shared.publishDoseRecord(record)
     }
 
     // MARK: - UC-7 S#3: Available Week Periods
@@ -415,9 +485,11 @@ public final class AdherenceService: ObservableObject {
         }
     }
 
-    private func scheduledDateTime(for med: MedicationItem, on dayDate: Date) -> Date {
+    private func scheduledDateTime(for med: MedicationItem, on dayDate: Date, slotMinutes: Int? = nil) -> Date {
         let minutes: Int
-        if let date = med.scheduledDate {
+        if let slotMinutes {
+            minutes = slotMinutes
+        } else if let date = med.scheduledDate {
             let comps = calendar.dateComponents([.hour, .minute], from: date)
             minutes = (comps.hour ?? 0) * 60 + (comps.minute ?? 0)
         } else {
