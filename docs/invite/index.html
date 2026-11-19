@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>دعوة اتصال — تطبيق دواء | Dawai</title>
+  <style>
+    :root {
+      --primary: #007B78;
+      --bg: #F4F7F7;
+      --card: #FFFFFF;
+      --text: #1C2526;
+      --muted: #637375;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+      font-family: -apple-system, BlinkMacSystemFont, "SF Arabic", "Segoe UI", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+    }
+    .card {
+      background: var(--card);
+      max-width: 400px;
+      width: 100%;
+      border-radius: 24px;
+      padding: 28px 24px;
+      text-align: center;
+      box-shadow: 0 12px 32px rgba(0, 123, 120, 0.10);
+    }
+    .icon {
+      width: 68px;
+      height: 68px;
+      border-radius: 20px;
+      background: rgba(0, 123, 120, 0.12);
+      color: var(--primary);
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 32px;
+      margin-bottom: 16px;
+    }
+    h1 {
+      font-size: 22px;
+      margin: 0 0 8px;
+    }
+    p {
+      font-size: 14px;
+      line-height: 1.6;
+      color: var(--muted);
+      margin: 0 0 22px;
+    }
+    .btn {
+      display: block;
+      width: 100%;
+      padding: 15px 18px;
+      border-radius: 14px;
+      font-size: 16px;
+      font-weight: 700;
+      text-decoration: none;
+      border: none;
+      cursor: pointer;
+      margin-bottom: 10px;
+    }
+    .btn-primary {
+      background: var(--primary);
+      color: #fff;
+    }
+    .btn-secondary {
+      background: rgba(0, 123, 120, 0.10);
+      color: var(--primary);
+    }
+    .note {
+      font-size: 12px;
+      color: var(--muted);
+      margin-top: 12px;
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="icon">💊</div>
+    <h1>دعوة ربط حساب في تطبيق دواء</h1>
+    <p>اضغط على الزر أدناه لفتح الدعوة مباشرة داخل تطبيق دواء وإتمام الربط.</p>
+    <a id="openAppBtn" class="btn btn-primary" href="dawai://invite">فتح في تطبيق دواء</a>
+    <button id="copyBtn" class="btn btn-secondary" type="button">نسخ كود الدعوة</button>
+    <div id="statusNote" class="note">إذا لم يفتح التطبيق تلقائياً، انسخ الكود ثم افتح تطبيق دواء واضغط «إدخال رمز».</div>
+  </div>
+
+  <script>
+    (function () {
+      var search = window.location.search || "";
+      var deepLink = "dawai://invite" + search;
+      var openBtn = document.getElementById("openAppBtn");
+      var copyBtn = document.getElementById("copyBtn");
+      var statusNote = document.getElementById("statusNote");
+      openBtn.setAttribute("href", deepLink);
+
+      // Attempt immediate redirect into the Dawai iOS app
+      setTimeout(function () {
+        window.location.href = deepLink;
+      }, 150);
+
+      copyBtn.addEventListener("click", function () {
+        var textToCopy = window.location.href;
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(textToCopy).then(function () {
+            copyBtn.textContent = "تم نسخ الكود! افتح تطبيق دواء الآن";
+          });
+        }
+      });
+    })();
+  </script>
+</body>
+</html>
+
